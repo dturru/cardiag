@@ -1,0 +1,11 @@
+.pio/
+.vscode/
+__pycache__/
+*.pyc
+.venv/
+data/*
+!data/.gitkeep
+*.csv
+*.log
+secrets.h
+.env
