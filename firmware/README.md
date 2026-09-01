@@ -49,6 +49,67 @@ VIN. Ring the pigtail out with a meter; vendor wire colors are inconsistent.
 transmits and never emits ACK bits. It is provably passive — the correct way to
 meet a live vehicle bus for the first time.
 
+## Phase 1a — `MODE_POLL` (draft, not yet run)
+
+**This is the first mode that transmits.** Both Phase 0 modes are provably
+passive; this one is not. Do not reach for it until self-test has passed on the
+bench and `MODE_LISTEN` has shown real traffic on the car — that sequencing is
+the entire reason the passive modes exist.
+
+Sniffing shows you what the car broadcasts. It does not show fuel trims, oxygen
+sensor voltages, or misfire counters, because those are internal to the ECU and
+are never put on the bus. Getting them means asking, and asking means sending.
+
+```c
+#define CARDIAG_MODE MODE_POLL
+```
+
+What it does on boot:
+
+1. Queries PID `0x00` / `0x20` / `0x40` and decodes the bitmap of what **this
+   specific car** supports. Nothing is assumed to exist.
+2. Prints the supported subset it will poll, and separately names the PIDs it
+   wanted but the car does not support — so a missing signal shows up as a
+   stated gap rather than a silently absent column later.
+3. Sweeps that list once a second and prints decoded values.
+
+```
+[  4021]  LOAD 18.4%  COOLANT 89.0C  STFT 1.6%  LTFT 4.7%  RPM 812.0rpm
+-- 51 req | 51 ok | 0 timeout | 0 malformed | 0 multiframe | last 14 ms | ECUs 7E8
+```
+
+### Reading it
+
+- `timeout` climbing on every PID → not connected, key not in accessory, or the
+  bus is asleep. `MODE_LISTEN` should show traffic before this mode can work.
+- `timeout` on *some* PIDs only → normal-ish; that PID is advertised but slow or
+  unanswered. Worth noting, not worth fixing yet.
+- More than one ECU listed → expected. A functional request goes to every
+  emissions module and any of them may answer.
+- `MULTIFRAME` on a signal → the reply did not fit in one frame. Decoding those
+  needs flow control, which is deliberately not implemented here (it is Mode 06
+  and VIN territory). It is reported rather than silently dropped.
+
+### The bench test worth doing early
+
+`OBD_MULTI_PID_PER_REQUEST` in `config.h` is set to **1** and the current draft
+only implements single-PID requests. The standard allows six per request, and
+that is the difference between roughly 30 and 180 samples per second — it sets
+the ceiling on how much Tier B can ever hold.
+
+Not every ECU honours multi-PID requests, and one that refuses looks a lot like
+a dead bus. Test it deliberately, on a parked car, and write the answer into
+`docs/hardware.md` before building anything that depends on the faster number.
+
+### Deliberately not here
+
+Flash storage, WiFi, time sync, upload, Mode 06, ISO-TP multi-frame, sleep. Each
+belongs to a later phase. This draft exists to answer one question: **do this
+car's ECUs answer the way the spec says they will?**
+
+> Written 2026-08-26, before the board arrived. Never compiled against hardware,
+> never run against a vehicle.
+
 ## Reading the sniffer output
 
 On a running 2012 Civic expect a busy bus — hundreds to low thousands of frames

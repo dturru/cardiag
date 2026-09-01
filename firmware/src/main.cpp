@@ -5,6 +5,8 @@
 //                   toolchain, driver, timing config, and frame handling.
 //   MODE_LISTEN   : Listen-only sniffer. Never transmits, never ACKs.
 //                   Safe first contact with a live vehicle bus.
+//   MODE_POLL     : OBD-II Mode 01 polling (Phase 1a). *** TRANSMITS ***.
+//                   Run only after SELFTEST and LISTEN have both passed.
 //
 // API verified 2026-08-20 against ESP-IDF v5.x legacy TWAI driver docs and the
 // Autosport Labs reference example. Note the ESP-IDF v6 handle-based API
@@ -13,6 +15,10 @@
 #include <Arduino.h>
 #include "driver/twai.h"
 #include "config.h"
+
+#if CARDIAG_MODE == MODE_POLL
+#include "obd.h"
+#endif
 
 // ---------------------------------------------------------------------------
 // Rolling stats. On a live bus the useful first question is not "what does
@@ -27,6 +33,12 @@ static uint32_t g_lastStatsMs    = 0;
 // Distinct 11-bit standard IDs seen, as a bitmap. 2048 bits = 256 bytes.
 static uint8_t  g_seenStd[256]   = {0};
 static uint16_t g_uniqueIds      = 0;
+
+#if CARDIAG_MODE == MODE_POLL
+static uint32_t      g_supported[OBD_BITMAP_WORDS] = {0};
+static const ObdPid *g_pollList[16]                = {0};
+static uint8_t       g_pollCount                   = 0;
+#endif
 
 static void noteId(uint32_t id, bool extended) {
   if (extended || id >= 2048) return;   // Phase 0 tracks standard IDs only
@@ -107,16 +119,88 @@ void setup() {
   Serial.println("Bitrate: 500 kbit/s");
   if (!startTwai(TWAI_MODE_LISTEN_ONLY)) { while (true) delay(1000); }
 
+#elif CARDIAG_MODE == MODE_POLL
+  Serial.println("Mode: OBD-II POLL (Phase 1a)");
+  Serial.println("*** THIS MODE TRANSMITS. Bench or parked only. ***");
+  Serial.println("Bitrate: 500 kbit/s");
+  if (!startTwai(TWAI_MODE_NORMAL)) { while (true) delay(1000); }
+
 #else
-  #error "CARDIAG_MODE must be MODE_SELFTEST or MODE_LISTEN"
+  #error "CARDIAG_MODE must be MODE_SELFTEST, MODE_LISTEN, or MODE_POLL"
 #endif
 
   Serial.println("TWAI started.");
   Serial.println();
+
+#if CARDIAG_MODE == MODE_POLL
+  // Ask the car what it actually supports before asking for anything. A PID
+  // that is absent here will never answer, and polling it just spends the
+  // request budget on timeouts.
+  const uint8_t n = obdDiscoverSupported(g_supported);
+  Serial.printf("supported PIDs (0x01-0x60): %u\n", n);
+
+  if (n == 0) {
+    Serial.println("WARNING: discovery returned nothing.");
+    Serial.println("  Engine off / key not in accessory, wiring, or the bus is asleep.");
+    Serial.println("  MODE_LISTEN should show traffic before this mode can work.");
+  }
+
+  Serial.print("polling:");
+  g_pollCount = 0;
+  for (size_t i = 0; i < OBD_PID_TABLE_LEN; i++) {
+    if (obdPidSupported(g_supported, OBD_PID_TABLE[i].pid)) {
+      g_pollList[g_pollCount++] = &OBD_PID_TABLE[i];
+      Serial.printf(" %s", OBD_PID_TABLE[i].name);
+    }
+  }
+  Serial.println();
+
+  // Named so the gap is visible rather than silently absent from the data.
+  for (size_t i = 0; i < OBD_PID_TABLE_LEN; i++) {
+    if (!obdPidSupported(g_supported, OBD_PID_TABLE[i].pid)) {
+      Serial.printf("  (unsupported on this car: %s / PID 0x%02X)\n",
+                    OBD_PID_TABLE[i].name, OBD_PID_TABLE[i].pid);
+    }
+  }
+  Serial.println();
+#endif
+
   g_lastStatsMs = millis();
 }
 
 // ---------------------------------------------------------------------------
+
+#if CARDIAG_MODE == MODE_POLL
+
+// One sweep of the supported PID list, printed as a single line.
+//
+// Requests are strictly serialized -- send, wait, then send the next. That is
+// slower than pipelining and it is the right default: a flooded bus is a way
+// to annoy a real ECU, and the sweep rate is nowhere near the limit anyway.
+static void pollTick() {
+  Serial.printf("[%8lu]", (unsigned long)millis());
+
+  for (uint8_t i = 0; i < g_pollCount; i++) {
+    const ObdPid *p = g_pollList[i];
+    ObdResult r;
+
+    if (obdRequest(OBD_MODE_CURRENT_DATA, p->pid, &r) && r.len >= p->nbytes) {
+      // NOTE: %f needs full newlib formatting. Arduino-ESP32 ships with it
+      // enabled; if these ever print as garbage that is the reason, not the
+      // decode maths.
+      Serial.printf("  %s %.1f%s", p->name, p->decode(r.data), p->unit);
+    } else if (r.multiframe) {
+      Serial.printf("  %s MULTIFRAME", p->name);
+    } else {
+      Serial.printf("  %s --", p->name);
+    }
+
+    delay(OBD_INTER_REQUEST_MS);
+  }
+  Serial.println();
+}
+
+#endif
 
 #if CARDIAG_MODE == MODE_SELFTEST
 
@@ -145,6 +229,15 @@ static void selfTestTick() {
 #endif
 
 void loop() {
+#if CARDIAG_MODE == MODE_POLL
+  // MODE_POLL must NOT drain the RX queue here: obdRequest() is waiting on
+  // exactly those frames, and a second reader silently eats the replies.
+  static uint32_t lastPoll = 0;
+  if (millis() - lastPoll >= OBD_POLL_INTERVAL_MS) {
+    lastPoll = millis();
+    pollTick();
+  }
+#else
   // Drain everything currently queued. Zero timeout — never block the loop.
   twai_message_t rx;
   while (twai_receive(&rx, 0) == ESP_OK) {
@@ -152,6 +245,7 @@ void loop() {
     noteId(rx.identifier, rx.extd);
     printFrame(rx);
   }
+#endif
 
 #if CARDIAG_MODE == MODE_SELFTEST
   static uint32_t lastTx = 0;
@@ -163,6 +257,28 @@ void loop() {
 
   const uint32_t now = millis();
   if (now - g_lastStatsMs >= STATS_INTERVAL_MS) {
+#if CARDIAG_MODE == MODE_POLL
+    const ObdStats *s = obdStats();
+    Serial.printf("-- %lu req | %lu ok | %lu timeout | %lu malformed | "
+                  "%lu multiframe | last %lu ms | ECUs",
+                  (unsigned long)s->requests,
+                  (unsigned long)s->replies,
+                  (unsigned long)s->timeouts,
+                  (unsigned long)s->malformed,
+                  (unsigned long)s->multiframe,
+                  (unsigned long)s->lastLatencyMs);
+    if (s->respondersMask == 0) {
+      Serial.print(" none");
+    } else {
+      for (uint8_t i = 0; i < 8; i++) {
+        if (s->respondersMask & (1u << i)) Serial.printf(" %03X", OBD_RESP_ID_FIRST + i);
+      }
+    }
+    Serial.println();
+    g_lastStatsMs = now;
+    delay(1);
+    return;
+#else
     const uint32_t elapsed = now - g_lastStatsMs;
     const uint32_t fps     = (g_frames - g_framesLastTick) * 1000UL / elapsed;
 
@@ -183,6 +299,7 @@ void loop() {
 
     g_framesLastTick = g_frames;
     g_lastStatsMs    = now;
+#endif
   }
 
   delay(1);

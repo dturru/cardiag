@@ -27,8 +27,15 @@
 //                   This is the ONLY mode that should touch the car first.
 // ---------------------------------------------------------------------------
 
+//   MODE_POLL     - OBD-II polling (Phase 1a). ***THIS MODE TRANSMITS.***
+//                   Sends standard OBD-II Mode 01 requests and decodes the
+//                   replies. Only run it AFTER SELFTEST and LISTEN have both
+//                   passed -- that sequencing is the entire justification for
+//                   the passive modes existing.
+
 #define MODE_SELFTEST 0
 #define MODE_LISTEN   1
+#define MODE_POLL     2
 
 #ifndef CARDIAG_MODE
 #define CARDIAG_MODE MODE_SELFTEST
@@ -39,3 +46,28 @@
 
 // How often to print the rolling statistics line, milliseconds.
 #define STATS_INTERVAL_MS 1000
+
+// ---------------------------------------------------------------------------
+// MODE_POLL tuning. Unused by the Phase 0 modes.
+// ---------------------------------------------------------------------------
+
+// How long to wait for an ECU to answer one request. ECU response latency is
+// typically 10-30 ms; 100 ms is deliberately generous for first contact and
+// should be tightened once real numbers exist.
+#define OBD_RESPONSE_TIMEOUT_MS 100
+
+// Gap between consecutive requests. Requests are strictly serialized -- send,
+// wait for the reply or time out, then send the next. Never flood the bus.
+#define OBD_INTER_REQUEST_MS 5
+
+// How often to run a full sweep of the supported PID list, milliseconds.
+#define OBD_POLL_INTERVAL_MS 1000
+
+// PIDs packed into a single Mode 01 request. The standard permits up to 6, and
+// that is the difference between ~30 samples/s and ~180 samples/s -- the number
+// that sets this project's sampling ceiling.
+//
+// LEAVE THIS AT 1 until the 20-minute bench test says otherwise: not every ECU
+// honours multi-PID requests, and a rejected request looks like a dead bus.
+// Record the answer in docs/hardware.md when it is known.
+#define OBD_MULTI_PID_PER_REQUEST 1
