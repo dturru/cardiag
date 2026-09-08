@@ -5,6 +5,7 @@
 #include "freertos/semphr.h"
 
 #include "sniffer.h"
+#include "recorder.h"
 #include "config.h"
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,9 @@ static SemaphoreHandle_t g_lock = nullptr;
 static inline void lockTable()   { if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY); }
 static inline void unlockTable() { if (g_lock) xSemaphoreGive(g_lock); }
 
+// Defined below; needed by snifferNote to decide what counts as a real change.
+static bool isHeartbeatByte(const struct IdSlot &s, uint8_t i);
+
 void snifferBegin() {
   if (!g_lock) g_lock = xSemaphoreCreateMutex();
 }
@@ -78,6 +82,8 @@ void snifferClearMarks() {
 void snifferNote(const twai_message_t &msg) {
   if (msg.rtr) return;   // remote frames carry no payload to diff
 
+  uint8_t interesting = 0;
+
   lockTable();
 
   IdSlot *s = nullptr;
@@ -99,23 +105,51 @@ void snifferNote(const twai_message_t &msg) {
     s->firstMs = millis();
     memcpy(s->last, msg.data, msg.data_length_code);
     memcpy(s->base, msg.data, msg.data_length_code);
+
+    // First sight of an ID is a change from nothing, so the change log opens
+    // with a full picture of the bus instead of starting mid-stream.
+    interesting = (msg.data_length_code >= 8)
+                      ? 0xFF
+                      : (uint8_t)((1u << msg.data_length_code) - 1u);
   } else {
+    uint8_t delta = 0;
     for (uint8_t i = 0; i < msg.data_length_code; i++) {
-      if (msg.data[i] != s->last[i]) s->byteChanges[i]++;
+      if (msg.data[i] != s->last[i]) {
+        s->byteChanges[i]++;
+        delta |= (uint8_t)(1u << i);
+      }
       if (msg.data[i] != s->base[i]) s->changedMask |= (uint8_t)(1u << i);
     }
     memcpy(s->last, msg.data, msg.data_length_code);
+
+    // Rolling counters and checksums move on nearly every frame. Logging those
+    // would defeat the entire point of a change log, so they are masked out.
+    // Before SNIFF_MIN_SAMPLES there is no verdict yet and a little noise gets
+    // through; it is bounded and self-correcting.
+    uint8_t hb = 0;
+    for (uint8_t i = 0; i < msg.data_length_code; i++) {
+      if (isHeartbeatByte(*s, i)) hb |= (uint8_t)(1u << i);
+    }
+    interesting = (uint8_t)(delta & ~hb);
   }
 
   s->dlc    = msg.data_length_code;
   s->lastMs = millis();
   s->count++;
+
   unlockTable();
+
+  // Deliberately outside the table lock: the recorder takes its own, and never
+  // nesting the two removes the possibility of a lock-order bug later.
+  if (interesting) {
+    recorderNoteChange(msg.identifier, msg.extd, msg.data_length_code,
+                       msg.data, interesting);
+  }
 }
 
 // A byte counts as a heartbeat once there is enough evidence. Below
 // SNIFF_MIN_SAMPLES frames every byte looks volatile, so judge nothing yet.
-static bool isHeartbeatByte(const IdSlot &s, uint8_t i) {
+static bool isHeartbeatByte(const struct IdSlot &s, uint8_t i) {
   if (s.count < SNIFF_MIN_SAMPLES) return false;
   const uint32_t comparisons = s.count - 1;
   return (s.byteChanges[i] * 100UL) / comparisons >= SNIFF_HEARTBEAT_PCT;

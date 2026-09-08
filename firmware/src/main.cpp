@@ -28,6 +28,7 @@
 #include "config.h"
 #include "obd.h"
 #include "sniffer.h"
+#include "recorder.h"
 #include "webui.h"
 
 // ---------------------------------------------------------------------------
@@ -291,8 +292,13 @@ static void canTask(void *) {
 
     g_frames++;
     noteId(rx.identifier, rx.extd);
+
+    // The ring always rolls, in every passive mode. You cannot decide to keep
+    // the interesting thirty seconds after they have already gone past.
+    recorderNoteRaw(rx);
+
     if (g_mode == MODE_SNIFF) {
-      snifferNote(rx);
+      snifferNote(rx);   // also feeds the change log
     } else if (!g_paused) {
       printFrame(rx);
     }
@@ -307,6 +313,7 @@ static void printHelp() {
   Serial.println();
   Serial.println("keys:  1 listen   2 sniff   3 selftest*   4 poll*   (* transmits, asks to confirm)");
   Serial.println("       c clear marks   p pause   r reset table   w wifi ap   h help");
+  Serial.println("       l start/stop change log   k clear change log");
   Serial.println("button: short press cycles LISTEN <-> SNIFF (passive modes only)");
   Serial.println();
 }
@@ -368,6 +375,20 @@ static void handleKeys() {
           g_prefs.putBool("ap", true);
         }
         break;
+      case 'l': case 'L':
+        if (recorderRunning()) {
+          recorderStop();
+          Serial.printf("-- change log STOPPED, %lu entries --\n",
+                        (unsigned long)recorderChangeStored());
+        } else {
+          recorderStart();
+          Serial.println("-- change log RUNNING (needs SNIFF mode to fill) --");
+        }
+        break;
+      case 'k': case 'K':
+        recorderClear();
+        Serial.println("-- change log cleared --");
+        break;
       case 'h': case 'H': case '?':
         printHelp();
         break;
@@ -418,6 +439,7 @@ void setup() {
   Serial.println("cardiag");
 
   snifferBegin();
+  recorderBegin();
   g_prefs.begin("cardiag", false);
   uint8_t stored = g_prefs.getUChar("mode", CARDIAG_MODE);
   if (modeTransmits(stored)) {

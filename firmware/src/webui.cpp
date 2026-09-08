@@ -4,6 +4,7 @@
 
 #include "webui.h"
 #include "sniffer.h"
+#include "recorder.h"
 #include "config.h"
 
 static WebServer g_server(80);
@@ -46,6 +47,10 @@ td.meta{color:#666;font-size:11px;text-align:right}
 .hb{color:#3a3a3a}
 .chg{color:#111;background:#e5c04a;border-radius:3px;padding:0 2px;font-weight:700}
 #wrap{overflow-x:auto}
+#rec{margin-top:8px;color:#888;font-size:12px}
+a.dl{flex:1;min-width:80px;text-align:center;padding:12px 10px;background:#222;
+ color:#8ec;border:1px solid #444;border-radius:6px;text-decoration:none;font-weight:600}
+button.rec{background:#421;border-color:#a64;color:#fc9}
 #err{color:#e66;padding:10px 12px}
 </style></head><body>
 <header>
@@ -55,6 +60,15 @@ td.meta{color:#666;font-size:11px;text-align:right}
 <button id="clear">CLEAR MARKS</button>
 <button id="m2">SNIFF</button>
 <button id="m1">LISTEN</button>
+</div>
+<div id="rec">rec —</div>
+<div class="btns">
+<button id="log">START LOG</button>
+<button id="wipe">WIPE LOG</button>
+</div>
+<div class="btns">
+<a class="dl" href="/api/changes.csv" download>changes.csv</a>
+<a class="dl" href="/api/raw.csv" download>raw.csv</a>
 </div>
 </header>
 <div id="err"></div>
@@ -89,6 +103,11 @@ async function tick(){
       +'<td>'+cell(r)+'</td></tr>').join('');
     $('#m1').className=j.mode=='LISTEN'?'on':'';
     $('#m2').className=j.mode=='SNIFF'?'on':'';
+    $('#log').textContent=j.recOn?'STOP LOG':'START LOG';
+    $('#log').className=j.recOn?'rec':'';
+    $('#rec').textContent='log '+(j.recOn?'RUNNING':'stopped')+' · '+j.recN
+      +' changes'+(j.recDrop?' · DROPPED '+j.recDrop+' (full)':'')
+      +' · ring '+j.rawN+'/'+j.rawCap+(j.psram?'':' · NO PSRAM');
   }catch(e){ $('#err').textContent='lost the board — '+e; }
 }
 
@@ -96,6 +115,8 @@ const post=u=>fetch(u,{method:'POST'}).then(tick);
 $('#clear').onclick=()=>post('/api/clear');
 $('#m1').onclick=()=>post('/api/mode?m=1');
 $('#m2').onclick=()=>post('/api/mode?m=2');
+$('#log').onclick=()=>post('/api/rec?a=toggle');
+$('#wipe').onclick=()=>post('/api/rec?a=clear');
 
 tick(); setInterval(tick, POLLMS);
 </script></body></html>)HTML";
@@ -118,10 +139,19 @@ static void handleTable() {
                                        cardiagBusErr());
   (void)n;
 
-  // The snapshot is a bare object; splice the mode in without a JSON library.
+  // The snapshot is a bare object; splice the extra fields in at the front
+  // without pulling in a JSON library for what is one string concatenation.
+  String head = String("{\"mode\":\"") + cardiagModeName() + "\"" +
+                ",\"recOn\":"  + (recorderRunning() ? "true" : "false") +
+                ",\"recN\":"   + String(recorderChangeStored()) +
+                ",\"recDrop\":"+ String(recorderChangeDropped()) +
+                ",\"rawN\":"   + String(recorderRawStored()) +
+                ",\"rawCap\":" + String((uint32_t)recorderRawCapacity()) +
+                ",\"psram\":"  + (recorderHasPsram() ? "true" : "false") +
+                ",\"frames\"";
+
   String body = g_json;
-  body.replace("{\"frames\"",
-               String("{\"mode\":\"") + cardiagModeName() + "\",\"frames\"");
+  body.replace("{\"frames\"", head);
   g_server.send(200, "application/json", body);
 }
 
@@ -129,6 +159,42 @@ static void handleClear() {
   snifferClearMarks();
   g_server.send(200, "text/plain", "ok");
 }
+
+static void handleRec() {
+  const String a = g_server.arg("a");
+  if (a == "start")       recorderStart();
+  else if (a == "stop")   recorderStop();
+  else if (a == "toggle") recorderRunning() ? recorderStop() : recorderStart();
+  else if (a == "clear")  recorderClear();
+  else { g_server.send(400, "text/plain", "bad action"); return; }
+  g_server.send(200, "text/plain", "ok");
+}
+
+// Streams a CSV out in chunks. The whole file never exists in RAM: a full raw
+// ring is ~30 MB of text, which is far more than this chip has.
+static void streamCsv(size_t (*chunk)(char *, size_t, RecCsvCursor *),
+                      const char *filename, bool freezeRing) {
+  static char buf[REC_CSV_CHUNK];
+  RecCsvCursor cur = {0, false};
+
+  if (freezeRing) recorderFreezeRaw(true);
+
+  g_server.sendHeader("Content-Disposition",
+                      String("attachment; filename=\"") + filename + "\"");
+  g_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  g_server.send(200, "text/csv", "");
+
+  size_t n;
+  while ((n = chunk(buf, sizeof(buf), &cur)) > 0) {
+    g_server.sendContent(buf, n);
+  }
+  g_server.sendContent("");   // terminates the chunked response
+
+  if (freezeRing) recorderFreezeRaw(false);
+}
+
+static void handleRawCsv()    { streamCsv(recorderRawCsvChunk, "raw.csv", true); }
+static void handleChangeCsv() { streamCsv(recorderChangeCsvChunk, "changes.csv", false); }
 
 static void handleMode() {
   const uint8_t m = (uint8_t)g_server.arg("m").toInt();
@@ -157,6 +223,9 @@ void webuiStart() {
   g_server.on("/api/table", HTTP_GET, handleTable);
   g_server.on("/api/clear", HTTP_POST, handleClear);
   g_server.on("/api/mode", HTTP_POST, handleMode);
+  g_server.on("/api/rec", HTTP_POST, handleRec);
+  g_server.on("/api/raw.csv", HTTP_GET, handleRawCsv);
+  g_server.on("/api/changes.csv", HTTP_GET, handleChangeCsv);
   g_server.begin();
 
   g_running = true;

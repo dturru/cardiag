@@ -132,6 +132,24 @@
 #define CAN_TASK_STACK  4096
 #define CAN_RX_WAIT_MS  100
 
+// ---------------------------------------------------------------------------
+// Recorder buffers
+// ---------------------------------------------------------------------------
+
+// A record is 16 bytes. 4 MB of raw ring is ~262k frames, roughly four minutes
+// at the ~1000 fps a Civic idles at -- enough history to keep the interesting
+// thirty seconds after the fact.
+#define REC_RAW_BYTES_PSRAM (4u * 1024u * 1024u)
+#define REC_CHG_BYTES_PSRAM (2u * 1024u * 1024u)
+
+// Without PSRAM the feature shrinks rather than disappears, so a board that
+// fails to bring the octal RAM up is still usable and says so.
+#define REC_RAW_BYTES_FALLBACK (64u * 1024u)
+#define REC_CHG_BYTES_FALLBACK (32u * 1024u)
+
+// Chunk size for streaming a CSV download out of the web server.
+#define REC_CSV_CHUNK 2048
+
 // 2012 Civic HS-CAN. Standard for essentially all modern passenger vehicles.
 #define CAN_BITRATE_500K 1
 
