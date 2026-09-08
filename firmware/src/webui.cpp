@@ -58,8 +58,8 @@ button.rec{background:#421;border-color:#a64;color:#fc9}
 <div id="stat">connecting...</div>
 <div class="btns">
 <button id="clear">CLEAR MARKS</button>
-<button id="m2">SNIFF</button>
-<button id="m1">LISTEN</button>
+<button id="mSniff">SNIFF</button>
+<button id="mListen">LISTEN</button>
 </div>
 <div id="rec">rec —</div>
 <div class="btns">
@@ -113,8 +113,8 @@ async function tick(){
 
 const post=u=>fetch(u,{method:'POST'}).then(tick);
 $('#clear').onclick=()=>post('/api/clear');
-$('#m1').onclick=()=>post('/api/mode?m=1');
-$('#m2').onclick=()=>post('/api/mode?m=2');
+$('#mListen').onclick=()=>post('/api/mode?m=1');/*MODE_LISTEN*/
+$('#mSniff').onclick=()=>post('/api/mode?m=3');/*MODE_SNIFF*/
 $('#log').onclick=()=>post('/api/rec?a=toggle');
 $('#wipe').onclick=()=>post('/api/rec?a=clear');
 
