@@ -10,9 +10,10 @@
 #include "config.h"
 #include "obd.h"
 
-// The whole module is mode-gated so the Phase 0 binaries are unchanged by its
-// existence -- SELFTEST and LISTEN builds compile this file to nothing.
-#if CARDIAG_MODE == MODE_POLL
+// This module used to be mode-gated so Phase 0 binaries were unchanged by its
+// existence. That guard is gone: modes are now selected at RUNTIME, so every
+// mode must be linked into a single binary. MODE_POLL is still the only thing
+// that CALLS any of this, and entering that mode takes a confirmed keystroke.
 
 // ---------------------------------------------------------------------------
 // PID decoders
@@ -205,4 +206,3 @@ uint8_t obdDiscoverSupported(uint32_t *bitmap) {
   return count;
 }
 
-#endif  // CARDIAG_MODE == MODE_POLL

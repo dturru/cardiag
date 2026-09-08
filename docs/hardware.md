@@ -43,7 +43,8 @@ A vehicle HS-CAN bus is already terminated at both ends (120 Ω each → 60 Ω e
 | OBD pin | Signal | Goes to |
 |---|---|---|
 | 16 | +12 V (**always hot**) | inline 500 mA fuse → board VIN |
-| 4, 5 | Chassis / signal ground | board GND |
+| **5** | **Signal ground** | X1 pin 4 (GND) |
+| ~~4~~ | ~~Chassis ground~~ | **do NOT also connect** — see note below |
 | 6 | CAN-H | CAN1 H |
 | 14 | CAN-L | CAN1 L |
 
@@ -60,3 +61,31 @@ HS-CAN on this car runs **500 kbit/s**.
 - **Thermal:** a parked Texas cabin reaches 60–70 °C. No electrolytics, no LiPo, 85–105 °C rated parts.
 - **Mechanical:** the port sits at the driver's right knee and gets kicked. Low profile, or tuck the box and run a short pigtail.
 - **ESP32 TWAI RX queue is shallow.** Drain it in the ISR into your own ring buffer or you silently drop frames — which destroys exactly the intermittent-fault case Tier A exists for.
+
+### Board side — X1 / X2 (board side) connector pinout
+
+Confirmed against the vendor wiki 2026-09-07. **All four wires land on ONE connector — no soldering to the PCB.**
+
+| X1 pin | Signal |
+|---|---|
+| 1 | +12V_AUX |
+| 2 | CAN1H |
+| 3 | CAN1L |
+| 4 | GND |
+
+X2 is identical but CAN2H/CAN2L. **Use X1 only** — CAN2 is the MCP2515 and has no firmware.
+
+### ❗ Ground: use pin 5 ONLY, do not bridge 4 and 5
+
+OBD pin 4 is **chassis** ground, pin 5 is **signal** ground. Reference pin 5 — it is what the ECUs' own CAN
+transceivers use, which is what keeps you inside the transceiver **common-mode range**. Do not bond 4 and 5 at
+your connector: they are already bonded somewhere in the vehicle, and tying them at the OBD port routes any
+chassis-vs-signal potential difference through your thin fused pigtail. If `bus_err` climbs on an otherwise
+healthy bus, pin 4 is the fallback to try.
+
+### 🔴 UNRESOLVED: X1 pin 1 voltage rating contradicts the board spec
+
+The vendor wiki lists **X1 pin 1 as "6–12V input"** while describing the board as **"6–20V nominal, 40V max."**
+A running car sits at **~14.4V**, above 12. **Confirm with Autosport Labs whether X1 pin 1 is the same
+40V-tolerant rail as the main input BEFORE powering from the car.** Expecting it to be a doc error is not
+verifying it, and the cost of being wrong is the board.

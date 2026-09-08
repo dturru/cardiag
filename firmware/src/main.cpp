@@ -1,24 +1,34 @@
-// cardiag — Phase 0 bring-up
+// cardiag
 //
-// Two modes, selected in include/config.h:
-//   MODE_SELFTEST : TWAI internal loopback. Nothing connected. Proves the
-//                   toolchain, driver, timing config, and frame handling.
-//   MODE_LISTEN   : Listen-only sniffer. Never transmits, never ACKs.
-//                   Safe first contact with a live vehicle bus.
-//   MODE_POLL     : OBD-II Mode 01 polling (Phase 1a). *** TRANSMITS ***.
-//                   Run only after SELFTEST and LISTEN have both passed.
+// Four modes. The mode is chosen at RUNTIME -- serial key or the BOOT button --
+// and persisted in NVS, so changing it no longer means a reflash.
+//
+//   MODE_SELFTEST : TWAI internal loopback. *** TRANSMITS (NO_ACK) ***.
+//                   Bench only, nothing connected. Proves toolchain, driver,
+//                   timing config and frame handling.
+//   MODE_LISTEN   : Listen-only frame dump. Never transmits, never ACKs.
+//   MODE_SNIFF    : Listen-only per-ID table with sticky change marks. The
+//                   readable mode; use this on a live bus.
+//   MODE_POLL     : OBD-II Mode 01 polling. *** TRANSMITS ***.
+//
+// SAFETY: the two transmitting modes are reachable ONLY by a confirmed
+// keystroke. They are never restored from NVS at boot and the button never
+// selects them. SELFTEST counts as transmitting -- TWAI_MODE_NO_ACK still
+// drives the bus, so running it plugged into a car would put frames onto a
+// live vehicle bus.
 //
 // API verified 2026-08-20 against ESP-IDF v5.x legacy TWAI driver docs and the
 // Autosport Labs reference example. Note the ESP-IDF v6 handle-based API
-// (esp_twai.h / twai_new_node_onchip) is a DIFFERENT driver — not this one.
+// (esp_twai.h / twai_new_node_onchip) is a DIFFERENT driver -- not this one.
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include "driver/twai.h"
-#include "config.h"
 
-#if CARDIAG_MODE == MODE_POLL
+#include "config.h"
 #include "obd.h"
-#endif
+#include "sniffer.h"
+#include "webui.h"
 
 // ---------------------------------------------------------------------------
 // Rolling stats. On a live bus the useful first question is not "what does
@@ -26,7 +36,7 @@
 // are on it." That tells you immediately whether you're actually connected.
 // ---------------------------------------------------------------------------
 
-static uint32_t g_frames         = 0;   // frames since boot
+static uint32_t g_frames         = 0;   // frames since mode start
 static uint32_t g_framesLastTick = 0;   // for frames/sec
 static uint32_t g_lastStatsMs    = 0;
 
@@ -34,14 +44,28 @@ static uint32_t g_lastStatsMs    = 0;
 static uint8_t  g_seenStd[256]   = {0};
 static uint16_t g_uniqueIds      = 0;
 
-#if CARDIAG_MODE == MODE_POLL
 static uint32_t      g_supported[OBD_BITMAP_WORDS] = {0};
 static const ObdPid *g_pollList[16]                = {0};
 static uint8_t       g_pollCount                   = 0;
-#endif
+
+static uint8_t     g_mode    = CARDIAG_MODE;
+static bool        g_twaiUp  = false;
+static bool        g_paused  = false;
+static Preferences g_prefs;
+
+// A transmitting mode requested but not yet confirmed, and when it was asked.
+static uint8_t  g_pendingMode = 0xFF;
+static uint32_t g_pendingAtMs = 0;
+
+// The CAN drain runs in its own task so the web server's blocking client
+// handling cannot delay it. g_canPause / g_canIdle are a handshake: the driver
+// must not be uninstalled while the task sits inside twai_receive().
+static TaskHandle_t  g_canTask  = nullptr;
+static volatile bool g_canPause = false;
+static volatile bool g_canIdle  = false;
 
 static void noteId(uint32_t id, bool extended) {
-  if (extended || id >= 2048) return;   // Phase 0 tracks standard IDs only
+  if (extended || id >= 2048) return;   // standard IDs only
   const uint16_t byteIdx = id >> 3;
   const uint8_t  bitMask = 1 << (id & 0x7);
   if (!(g_seenStd[byteIdx] & bitMask)) {
@@ -68,15 +92,38 @@ static void printFrame(const twai_message_t &msg) {
 }
 
 // ---------------------------------------------------------------------------
-// Driver bring-up
+// Modes
 // ---------------------------------------------------------------------------
+
+static const char *modeName(uint8_t m) {
+  switch (m) {
+    case MODE_SELFTEST: return "SELFTEST";
+    case MODE_LISTEN:   return "LISTEN";
+    case MODE_POLL:     return "POLL";
+    case MODE_SNIFF:    return "SNIFF";
+    default:            return "?";
+  }
+}
+
+// The single place that decides whether a mode puts frames on the wire.
+static bool modeTransmits(uint8_t m) {
+  return m == MODE_SELFTEST || m == MODE_POLL;
+}
+
+static twai_mode_t twaiModeFor(uint8_t m) {
+  switch (m) {
+    case MODE_SELFTEST: return TWAI_MODE_NO_ACK;      // drives the bus
+    case MODE_POLL:     return TWAI_MODE_NORMAL;      // drives the bus
+    default:            return TWAI_MODE_LISTEN_ONLY; // provably passive
+  }
+}
 
 static bool startTwai(twai_mode_t mode) {
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
       (gpio_num_t)CAN1_TX_GPIO, (gpio_num_t)CAN1_RX_GPIO, mode);
 
   // The default RX queue is shallow. Deepening it buys headroom on a busy bus,
-  // but it is NOT the real fix — Phase 2 drains in an ISR into a ring buffer.
+  // but it is NOT the real fix -- Phase 2 drains in an ISR into a ring buffer.
   // Until then, a full queue shows up as rx_missed in the stats line, which is
   // exactly the signal we want to see rather than silently losing frames.
   g.rx_queue_len = 32;
@@ -99,40 +146,18 @@ static bool startTwai(twai_mode_t mode) {
   return true;
 }
 
-// ---------------------------------------------------------------------------
+static void blinkMode(uint8_t m) {
+  // Blocking, but only on a mode change -- and a mode change restarts the
+  // driver anyway, so no frames are lost that were not already lost.
+  for (uint8_t i = 0; i <= m; i++) {
+    digitalWrite(PIN_USER_LED, HIGH);
+    delay(120);
+    digitalWrite(PIN_USER_LED, LOW);
+    delay(120);
+  }
+}
 
-void setup() {
-  Serial.begin(115200);
-  delay(2000);   // let USB CDC enumerate before the first print
-
-  Serial.println();
-  Serial.println("cardiag — Phase 0");
-
-#if CARDIAG_MODE == MODE_SELFTEST
-  Serial.println("Mode: SELF-TEST (internal loopback, nothing need be connected)");
-  // NO_ACK lets the controller transmit without another node acknowledging.
-  // Combined with message.self below, the frame comes straight back to us.
-  if (!startTwai(TWAI_MODE_NO_ACK)) { while (true) delay(1000); }
-
-#elif CARDIAG_MODE == MODE_LISTEN
-  Serial.println("Mode: LISTEN-ONLY (passive — never transmits, never ACKs)");
-  Serial.println("Bitrate: 500 kbit/s");
-  if (!startTwai(TWAI_MODE_LISTEN_ONLY)) { while (true) delay(1000); }
-
-#elif CARDIAG_MODE == MODE_POLL
-  Serial.println("Mode: OBD-II POLL (Phase 1a)");
-  Serial.println("*** THIS MODE TRANSMITS. Bench or parked only. ***");
-  Serial.println("Bitrate: 500 kbit/s");
-  if (!startTwai(TWAI_MODE_NORMAL)) { while (true) delay(1000); }
-
-#else
-  #error "CARDIAG_MODE must be MODE_SELFTEST, MODE_LISTEN, or MODE_POLL"
-#endif
-
-  Serial.println("TWAI started.");
-  Serial.println();
-
-#if CARDIAG_MODE == MODE_POLL
+static void pollEnter() {
   // Ask the car what it actually supports before asking for anything. A PID
   // that is absent here will never answer, and polling it just spends the
   // request budget on timeouts.
@@ -163,14 +188,257 @@ void setup() {
     }
   }
   Serial.println();
-#endif
+}
 
+// Ask the receive task to step away from the driver, and wait for it to say it
+// has. Bounded: worst case is one twai_receive timeout.
+static void canPause() {
+  if (!g_canTask) return;
+  g_canPause = true;
+  const uint32_t t0 = millis();
+  while (!g_canIdle && millis() - t0 < CAN_RX_WAIT_MS * 3) delay(1);
+}
+
+static void canResume() { g_canPause = false; }
+
+static void applyMode(uint8_t m, bool persist) {
+  canPause();
+
+  if (g_twaiUp) {
+    twai_stop();
+    twai_driver_uninstall();
+    g_twaiUp = false;
+  }
+
+  g_mode           = m;
+  g_frames         = 0;
+  g_framesLastTick = 0;
+  g_uniqueIds      = 0;
+  memset(g_seenStd, 0, sizeof(g_seenStd));
+  snifferReset();
+
+  Serial.println();
+  Serial.printf("Mode: %s%s\n", modeName(m),
+                modeTransmits(m) ? "   *** TRANSMITS ***" : "  (passive)");
+
+  if (!startTwai(twaiModeFor(m))) {
+    Serial.println("TWAI did not start. Mode is inactive.");
+    return;
+  }
+  g_twaiUp = true;
+
+  // Only passive modes are remembered. A board that boots into a transmitting
+  // mode because of a setting made weeks ago is exactly the failure this
+  // avoids.
+  if (persist && !modeTransmits(m)) {
+    g_prefs.putUChar("mode", m);
+  }
+
+  if (m == MODE_POLL) pollEnter();
+
+  blinkMode(m);
   g_lastStatsMs = millis();
+  canResume();
+}
+
+// ---------------------------------------------------------------------------
+// Accessors for the web layer. Declared in webui.h so that layer can read
+// state and request a mode change without owning either.
+// ---------------------------------------------------------------------------
+
+uint32_t cardiagFrames() { return g_frames; }
+
+static uint32_t statusField(bool wantMissed) {
+  if (!g_twaiUp) return 0;
+  twai_status_info_t st;
+  twai_get_status_info(&st);
+  return wantMissed ? st.rx_missed_count : st.bus_error_count;
+}
+
+uint32_t    cardiagMissed()   { return statusField(true); }
+uint32_t    cardiagBusErr()   { return statusField(false); }
+const char *cardiagModeName() { return modeName(g_mode); }
+
+bool cardiagSetPassiveMode(uint8_t m) {
+  // The air gap: nothing arriving over Wi-Fi may select a transmitting mode.
+  if (m != MODE_LISTEN && m != MODE_SNIFF) return false;
+  if (m != g_mode) applyMode(m, true);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
 
-#if CARDIAG_MODE == MODE_POLL
+static void canTask(void *) {
+  twai_message_t rx;
+
+  for (;;) {
+    if (g_canPause || !g_twaiUp) {
+      g_canIdle = true;
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    g_canIdle = false;
+
+    // MODE_POLL must NOT drain here: obdRequest() is waiting on exactly those
+    // frames, and a second reader silently eats the replies.
+    if (g_mode == MODE_POLL) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Blocks rather than polls, so an idle bus costs nothing.
+    if (twai_receive(&rx, pdMS_TO_TICKS(CAN_RX_WAIT_MS)) != ESP_OK) continue;
+
+    g_frames++;
+    noteId(rx.identifier, rx.extd);
+    if (g_mode == MODE_SNIFF) {
+      snifferNote(rx);
+    } else if (!g_paused) {
+      printFrame(rx);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+
+static void printHelp() {
+  Serial.println();
+  Serial.println("keys:  1 listen   2 sniff   3 selftest*   4 poll*   (* transmits, asks to confirm)");
+  Serial.println("       c clear marks   p pause   r reset table   w wifi ap   h help");
+  Serial.println("button: short press cycles LISTEN <-> SNIFF (passive modes only)");
+  Serial.println();
+}
+
+static void requestMode(uint8_t m) {
+  if (m == g_mode) {
+    Serial.printf("already in %s\n", modeName(m));
+    return;
+  }
+  if (modeTransmits(m)) {
+    g_pendingMode = m;
+    g_pendingAtMs = millis();
+    Serial.printf("\n*** %s TRANSMITS onto the bus. Press 'y' within %us to confirm. ***\n",
+                  modeName(m), (unsigned)(POLL_CONFIRM_WINDOW_MS / 1000));
+    return;
+  }
+  applyMode(m, true);
+}
+
+static void handleKeys() {
+  while (Serial.available()) {
+    const int ch = Serial.read();
+
+    if (g_pendingMode != 0xFF) {
+      if (ch == 'y' || ch == 'Y') {
+        const uint8_t m = g_pendingMode;
+        g_pendingMode = 0xFF;
+        applyMode(m, true);
+      } else {
+        g_pendingMode = 0xFF;
+        Serial.println("cancelled.");
+      }
+      continue;
+    }
+
+    switch (ch) {
+      case '1': requestMode(MODE_LISTEN);   break;
+      case '2': requestMode(MODE_SNIFF);    break;
+      case '3': requestMode(MODE_SELFTEST); break;
+      case '4': requestMode(MODE_POLL);     break;
+      case 'c': case 'C':
+        snifferClearMarks();
+        Serial.println("-- marks cleared, baseline re-taken --");
+        break;
+      case 'r': case 'R':
+        snifferReset();
+        Serial.println("-- table reset --");
+        break;
+      case 'p': case 'P':
+        g_paused = !g_paused;
+        Serial.printf("-- %s --\n", g_paused ? "paused" : "resumed");
+        break;
+      case 'w': case 'W':
+        if (webuiRunning()) {
+          webuiStop();
+          g_prefs.putBool("ap", false);
+        } else {
+          webuiStart();
+          g_prefs.putBool("ap", true);
+        }
+        break;
+      case 'h': case 'H': case '?':
+        printHelp();
+        break;
+      default: break;
+    }
+  }
+
+  if (g_pendingMode != 0xFF &&
+      millis() - g_pendingAtMs > POLL_CONFIRM_WINDOW_MS) {
+    g_pendingMode = 0xFF;
+    Serial.println("confirm window expired; staying passive.");
+  }
+}
+
+static void handleButton() {
+  static bool     wasDown  = false;
+  static uint32_t lastEdge = 0;
+
+  const bool isDown = (digitalRead(PIN_MODE_BUTTON) == LOW);
+  if (isDown == wasDown) return;
+  if (millis() - lastEdge < BUTTON_DEBOUNCE_MS) return;
+
+  lastEdge = millis();
+  wasDown  = isDown;
+
+  // Act on release, so a long hold for the bootloader is not a mode change.
+  if (isDown) return;
+
+  // Passive modes only. The button must never be able to start transmitting.
+  applyMode(g_mode == MODE_SNIFF ? MODE_LISTEN : MODE_SNIFF, true);
+}
+
+// ---------------------------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  // Native USB CDC blocks on write when no host is draining the TX buffer.
+  // In the car there is no laptop attached, so an unguarded Serial.print can
+  // stall the whole loop. 0 = never block; drop instead.
+  Serial.setTxTimeoutMs(0);
+  delay(2000);   // let USB CDC enumerate before the first print
+
+  pinMode(PIN_USER_LED, OUTPUT);
+  digitalWrite(PIN_USER_LED, LOW);
+  pinMode(PIN_MODE_BUTTON, INPUT_PULLUP);
+
+  Serial.println();
+  Serial.println("cardiag");
+
+  snifferBegin();
+  g_prefs.begin("cardiag", false);
+  uint8_t stored = g_prefs.getUChar("mode", CARDIAG_MODE);
+  if (modeTransmits(stored)) {
+    // Refuse to resume a transmitting mode unattended.
+    Serial.printf("stored mode %s transmits; starting in LISTEN instead.\n",
+                  modeName(stored));
+    stored = MODE_LISTEN;
+  }
+
+  Serial.println("Bitrate: 500 kbit/s");
+  printHelp();
+
+  applyMode(stored, false);
+
+  xTaskCreatePinnedToCore(canTask, "can", CAN_TASK_STACK, nullptr,
+                          CAN_TASK_PRIO, &g_canTask, CAN_TASK_CORE);
+
+  // On by default: the whole point is that the board is usable with no laptop,
+  // and a board that needs one to switch its radio on would defeat that.
+  if (g_prefs.getBool("ap", true)) webuiStart();
+}
 
 // One sweep of the supported PID list, printed as a single line.
 //
@@ -200,13 +468,9 @@ static void pollTick() {
   Serial.println();
 }
 
-#endif
-
-#if CARDIAG_MODE == MODE_SELFTEST
-
 // Transmit a frame to ourselves once per second and verify it comes back.
 // If TX succeeds but nothing is received, the driver is running but the
-// self-reception request is not being honoured — a config problem, not wiring.
+// self-reception request is not being honoured -- a config problem, not wiring.
 static void selfTestTick() {
   static uint32_t seq = 0;
 
@@ -226,80 +490,80 @@ static void selfTestTick() {
   }
 }
 
-#endif
-
 void loop() {
-#if CARDIAG_MODE == MODE_POLL
-  // MODE_POLL must NOT drain the RX queue here: obdRequest() is waiting on
-  // exactly those frames, and a second reader silently eats the replies.
-  static uint32_t lastPoll = 0;
-  if (millis() - lastPoll >= OBD_POLL_INTERVAL_MS) {
-    lastPoll = millis();
-    pollTick();
-  }
-#else
-  // Drain everything currently queued. Zero timeout — never block the loop.
-  twai_message_t rx;
-  while (twai_receive(&rx, 0) == ESP_OK) {
-    g_frames++;
-    noteId(rx.identifier, rx.extd);
-    printFrame(rx);
-  }
-#endif
+  handleKeys();
+  handleButton();
+  webuiLoop();
 
-#if CARDIAG_MODE == MODE_SELFTEST
-  static uint32_t lastTx = 0;
-  if (millis() - lastTx >= 1000) {
-    lastTx = millis();
-    selfTestTick();
-  }
-#endif
+  if (!g_twaiUp) { delay(10); return; }
 
-  const uint32_t now = millis();
-  if (now - g_lastStatsMs >= STATS_INTERVAL_MS) {
-#if CARDIAG_MODE == MODE_POLL
-    const ObdStats *s = obdStats();
-    Serial.printf("-- %lu req | %lu ok | %lu timeout | %lu malformed | "
-                  "%lu multiframe | last %lu ms | ECUs",
-                  (unsigned long)s->requests,
-                  (unsigned long)s->replies,
-                  (unsigned long)s->timeouts,
-                  (unsigned long)s->malformed,
-                  (unsigned long)s->multiframe,
-                  (unsigned long)s->lastLatencyMs);
-    if (s->respondersMask == 0) {
-      Serial.print(" none");
-    } else {
-      for (uint8_t i = 0; i < 8; i++) {
-        if (s->respondersMask & (1u << i)) Serial.printf(" %03X", OBD_RESP_ID_FIRST + i);
-      }
+  // Receiving happens in canTask. This loop only transmits, prints and serves.
+  if (g_mode == MODE_POLL) {
+    static uint32_t lastPoll = 0;
+    if (millis() - lastPoll >= OBD_POLL_INTERVAL_MS) {
+      lastPoll = millis();
+      pollTick();
     }
-    Serial.println();
-    g_lastStatsMs = now;
-    delay(1);
-    return;
-#else
-    const uint32_t elapsed = now - g_lastStatsMs;
-    const uint32_t fps     = (g_frames - g_framesLastTick) * 1000UL / elapsed;
+  }
 
+  if (g_mode == MODE_SELFTEST) {
+    static uint32_t lastTx = 0;
+    if (millis() - lastTx >= 1000) {
+      lastTx = millis();
+      selfTestTick();
+    }
+  }
+
+  const uint32_t now      = millis();
+  const uint32_t interval =
+      (g_mode == MODE_SNIFF) ? SNIFF_PRINT_INTERVAL_MS : STATS_INTERVAL_MS;
+
+  if (now - g_lastStatsMs >= interval) {
     twai_status_info_t st;
     twai_get_status_info(&st);
 
-    Serial.printf(
-        "-- %lu fps | %lu total | %u unique IDs | rx_q=%lu missed=%lu "
-        "overrun=%lu bus_err=%lu tx_err=%lu\n",
-        (unsigned long)fps,
-        (unsigned long)g_frames,
-        g_uniqueIds,
-        (unsigned long)st.msgs_to_rx,
-        (unsigned long)st.rx_missed_count,
-        (unsigned long)st.rx_overrun_count,
-        (unsigned long)st.bus_error_count,
-        (unsigned long)st.tx_error_counter);
+    if (g_mode == MODE_POLL) {
+      const ObdStats *s = obdStats();
+      Serial.printf("-- %lu req | %lu ok | %lu timeout | %lu malformed | "
+                    "%lu multiframe | last %lu ms | ECUs",
+                    (unsigned long)s->requests,
+                    (unsigned long)s->replies,
+                    (unsigned long)s->timeouts,
+                    (unsigned long)s->malformed,
+                    (unsigned long)s->multiframe,
+                    (unsigned long)s->lastLatencyMs);
+      if (s->respondersMask == 0) {
+        Serial.print(" none");
+      } else {
+        for (uint8_t i = 0; i < 8; i++) {
+          if (s->respondersMask & (1u << i)) Serial.printf(" %03X", OBD_RESP_ID_FIRST + i);
+        }
+      }
+      Serial.println();
+    } else if (g_mode == MODE_SNIFF) {
+      if (!g_paused) {
+        snifferPrint(g_frames, st.rx_missed_count, st.bus_error_count);
+      }
+    } else {
+      const uint32_t elapsed = now - g_lastStatsMs;
+      const uint32_t fps     = (g_frames - g_framesLastTick) * 1000UL / elapsed;
 
-    g_framesLastTick = g_frames;
-    g_lastStatsMs    = now;
-#endif
+      Serial.printf(
+          "-- %lu fps | %lu total | %u unique IDs | rx_q=%lu missed=%lu "
+          "overrun=%lu bus_err=%lu tx_err=%lu\n",
+          (unsigned long)fps,
+          (unsigned long)g_frames,
+          g_uniqueIds,
+          (unsigned long)st.msgs_to_rx,
+          (unsigned long)st.rx_missed_count,
+          (unsigned long)st.rx_overrun_count,
+          (unsigned long)st.bus_error_count,
+          (unsigned long)st.tx_error_counter);
+
+      g_framesLastTick = g_frames;
+    }
+
+    g_lastStatsMs = now;
   }
 
   delay(1);
