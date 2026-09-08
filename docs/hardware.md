@@ -42,7 +42,7 @@ A vehicle HS-CAN bus is already terminated at both ends (120 Ω each → 60 Ω e
 
 | OBD pin | Signal | Goes to |
 |---|---|---|
-| 16 | +12 V (**always hot**) | inline 500 mA fuse → board VIN |
+| 16 | +12 V (**always hot**) | inline 500 mA fuse → **SV2 VIN (pins 19-20, "12 Vin")** — *not* X1 pin 1 |
 | **5** | **Signal ground** | X1 pin 4 (GND) |
 | ~~4~~ | ~~Chassis ground~~ | **do NOT also connect** — see note below |
 | 6 | CAN-H | CAN1 H |
@@ -83,9 +83,25 @@ your connector: they are already bonded somewhere in the vehicle, and tying them
 chassis-vs-signal potential difference through your thin fused pigtail. If `bus_err` climbs on an otherwise
 healthy bus, pin 4 is the fallback to try.
 
-### 🔴 UNRESOLVED: X1 pin 1 voltage rating contradicts the board spec
+### ✅ RESOLVED: power the board from SV2 VIN, not X1 pin 1
 
-The vendor wiki lists **X1 pin 1 as "6–12V input"** while describing the board as **"6–20V nominal, 40V max."**
-A running car sits at **~14.4V**, above 12. **Confirm with Autosport Labs whether X1 pin 1 is the same
-40V-tolerant rail as the main input BEFORE powering from the car.** Expecting it to be a doc error is not
-verifying it, and the cost of being wrong is the board.
+The board has **three** power inputs, and only one of them has a 12 V ceiling:
+
+| Input | Wiki rating | OK at a running car's ~14.4 V? |
+|---|---|---|
+| USB-C socket | 6-20 V nominal, 40 V max | yes |
+| **VIN — header SV2, pins 19-20, "12 Vin"** | **6-20 V nominal, 40 V max** | **yes** |
+| X1 / X2 pin 1 (+12V_AUX) | "6-12V Power Supply" | **no** |
+
+⇒ **Run OBD pin 16 through the 500 mA slow-blow fuse into SV2 VIN.** X1 then carries only CAN-H, CAN-L and
+ground.
+
+The vendor docs are internally inconsistent about X1 pin 1 — the pigtail is described as supplying "power +
+CAN data" into X1, which would mean feeding a running car into a pin labelled 6-12 V. That argument does not
+need settling: **SV2 VIN is explicitly rated to 40 V, so use the input whose rating is not in dispute.**
+
+⚠️ **Confirm the silkscreen at SV2 reads VIN / 12Vin before connecting.** This pin numbering comes from the
+vendor wiki, not from the board in hand, and 12 V into the wrong header pin destroys it.
+
+⚠️ **Pin 16 is always hot**, so the board runs with the key out. The `<1 mA` sleep budget is still unsolved
+— unplug after a session, and treat ignition-switched power as the real answer.
