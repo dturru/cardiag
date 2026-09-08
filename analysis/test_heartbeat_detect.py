@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Check the sniffer's heartbeat-byte heuristic against real Civic frames.
 
-This tests the ALGORITHM, not the compiled firmware -- it is a faithful Python
-port of isHeartbeatByte() in firmware/src/sniffer.cpp. If you change the C,
-change this too.
+This pins canlog.ByteStats.heartbeat, which is the Python mirror of
+isHeartbeatByte() in firmware/src/sniffer.cpp. Testing the shared module rather
+than a private copy means the diff tool and this test cannot disagree about what
+a heartbeat is. The C remains a separate implementation -- change one, change
+the other.
 
 Why it matters: the 2026-09-07 capture showed most Honda IDs carry a rolling
 counter plus a checksum in their last byte. Without suppressing those, every
@@ -14,27 +16,17 @@ frame is a heartbeat, not a signal.
 Payloads below are verbatim from the 2026-09-07 capture.
 """
 
-SNIFF_MIN_SAMPLES = 20
-SNIFF_HEARTBEAT_PCT = 90
+import canlog
+from canlog import SNIFF_MIN_SAMPLES
 
 
 def heartbeat_bytes(frames):
-    """Port of isHeartbeatByte(). Returns the set of byte indices judged
-    heartbeats after replaying `frames` (a list of equal-length byte lists)."""
-    count = len(frames)
-    if count < SNIFF_MIN_SAMPLES:
-        return set()
-
-    width = len(frames[0])
-    changes = [0] * width
-    for prev, cur in zip(frames, frames[1:]):
-        for i in range(width):
-            if cur[i] != prev[i]:
-                changes[i] += 1
-
-    comparisons = count - 1
-    return {i for i in range(width)
-            if (changes[i] * 100) // comparisons >= SNIFF_HEARTBEAT_PCT}
+    """Replays `frames` (a list of equal-length byte lists) through the shared
+    stats code and returns the byte indices judged heartbeats."""
+    recs = [canlog.Frame(ms=i * 10, id=0x100, ext=False, dlc=len(f), data=list(f))
+            for i, f in enumerate(frames)]
+    stats = canlog.per_byte_stats(recs)
+    return {i for (_id, i), st in stats.items() if st.heartbeat}
 
 
 def cycle(seq, n):
