@@ -57,15 +57,9 @@ size_t snifferSnapshotJson(char *out, size_t cap,
 // what a snapshot is, which is why the protocol was shaped around it.
 // ---------------------------------------------------------------------------
 
-struct SnifferRow {
-  uint32_t id;
-  uint32_t lastMs;       // when this id was last seen
-  uint32_t changedAtMs;  // when its payload last DIFFERED from the previous one
-  uint8_t  data[8];
-  uint8_t  dlc;
-  uint8_t  changedMask;
-  bool     ext;
-};
+// SnifferRow lives in snifferrow.h so the packet serialiser can be built on
+// the host: this header includes driver/twai.h and is therefore ESP32-only.
+#include "snifferrow.h"
 
 // Copies rows whose payload changed strictly after `sinceMs`. Pass 0 for a
 // full snapshot (every known id, changed or not). Returns rows written.

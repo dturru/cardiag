@@ -33,6 +33,10 @@
 #include "session.h"
 #include "hublink.h"
 #include "hubstream.h"
+#include "selftest_profile.h"
+#include "filestore.h"
+
+static void selfTestReset();
 
 // ---------------------------------------------------------------------------
 // Rolling stats. On a live bus the useful first question is not "what does
@@ -134,6 +138,12 @@ static bool startTwai(twai_mode_t mode) {
   // now share core 1 with the CAN task, so the queue has to absorb a
   // scheduling hiccup rather than drop frames. 128 x 16 B is ~2 kB.
   g.rx_queue_len = 128;
+
+  // Default is 5. SELFTEST now emits ~237 frames/s across 14 ids, and several
+  // can come due in the same loop pass, so a queue of 5 would refuse frames
+  // for scheduling reasons and the refusals would look like a driver problem.
+  // 32 x 16 B is ~512 B. Only SELFTEST and POLL ever transmit.
+  g.tx_queue_len = 32;
 
   twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
@@ -242,6 +252,29 @@ static void applyMode(uint8_t m, bool persist) {
   }
 
   if (m == MODE_POLL) pollEnter();
+
+  // Files are tagged with the mode that produced them and never span two, so
+  // a synthetic bench run cannot end up inside a real capture's file.
+  filestoreSetMode(m);
+  filestoreSetEnabled(true);
+
+  if (m == MODE_SELFTEST) {
+    selfTestReset();
+    // Seed the fast list so the bench exercises it without needing the hub to
+    // configure anything first. This is the ONE place firmware picks a fast id
+    // by itself, and it is gated on SELFTEST: on a real bus the list stays
+    // empty until the hub sets it, because the logger does not know what any
+    // id means and must not pretend to.
+    const uint32_t fast = SELFTEST_FAST_ID;
+    hubstreamSetFastIds(&fast, 1);
+    Serial.printf("[selftest] %u ids, ~%u frames/s, fast id 0x%03X @ %u Hz\n",
+                  (unsigned)SELFTEST_ID_COUNT, 237u,
+                  (unsigned)SELFTEST_FAST_ID, (unsigned)HUB_FAST_HZ);
+  } else {
+    // Leaving SELFTEST drops the synthetic fast id. Carrying a bench id into a
+    // live capture would stream a nonexistent signal at 20 Hz.
+    hubstreamSetFastIds(nullptr, 0);
+  }
 
   blinkMode(m);
   g_lastStatsMs = millis();
@@ -465,11 +498,18 @@ void setup() {
   Serial.println("Bitrate: 500 kbit/s");
   printHelp();
 
-  applyMode(stored, false);
-
-  // Identity first: boot_id and device_id must exist before any packet,
-  // log line or API response can reference them.
+  // Identity first: boot_id and device_id must exist before any packet, log
+  // line, file name or API response can reference them. This moved AHEAD of
+  // applyMode() in Phase B -- filenames carry boot_id, so the filestore cannot
+  // open anything until the session exists, and applyMode() now opens files.
   sessionBegin();
+
+  // Persistence. A mount failure is NOT fatal: rule 1 says the logger is
+  // standalone, and a board that refuses to log to PSRAM because its flash is
+  // unhappy would be worse than one that says so and carries on.
+  filestoreBegin();
+
+  applyMode(stored, false);
 
   xTaskCreatePinnedToCore(canTask, "can", CAN_TASK_STACK, nullptr,
                           CAN_TASK_PRIO, &g_canTask, CAN_TASK_CORE);
@@ -517,22 +557,92 @@ static void pollTick() {
 // Transmit a frame to ourselves once per second and verify it comes back.
 // If TX succeeds but nothing is received, the driver is running but the
 // self-reception request is not being honoured -- a config problem, not wiring.
+// ---------------------------------------------------------------------------
+// SELFTEST traffic generator.
+//
+// Emits the 14 ids from the 2026-09-08 Civic capture at their measured rates
+// (see selftest_profile.h for why those numbers and what they are not).
+//
+// PAYLOAD SHAPE, and why it is not just a counter:
+//
+//   d0            rolling counter, moves EVERY frame -> the sniffer classifies
+//                 it as a heartbeat and suppresses it
+//   d[dlc-1]      running checksum, also every frame -> also a heartbeat
+//   d1            steps once per SELFTEST_SIGNAL_STEP_MS -> the only byte that
+//                 survives the filter, so it is what reaches the change log
+//   rest          constant, per id
+//
+// That mix is the part that matters. A payload where every byte moves would
+// make the heartbeat filter look like it works while never testing that a real
+// signal gets through it; a payload where nothing moves would never populate
+// the change log at all. Both failures were reachable with the old one-id
+// workload and neither would have been visible.
+// ---------------------------------------------------------------------------
+
+static uint32_t g_stNext[SELFTEST_ID_COUNT];
+static uint8_t  g_stCounter[SELFTEST_ID_COUNT];
+static bool     g_stOnce[SELFTEST_ID_COUNT];
+static uint32_t g_stFrames  = 0;
+static uint32_t g_stTxFails = 0;
+static uint32_t g_stResyncs = 0;
+
+static void selfTestReset() {
+  const uint32_t now = millis();
+  for (uint16_t i = 0; i < SELFTEST_ID_COUNT; i++) {
+    // Stagger the phases. Starting every id at the same instant would put all
+    // 14 transmits in one loop pass forever, which is a burst pattern the real
+    // bus does not have and which would hide a tx-queue problem behind a
+    // permanent worst case.
+    g_stNext[i]    = now + (i * 7);
+    g_stCounter[i] = 0;
+    g_stOnce[i]    = false;
+  }
+  g_stFrames = g_stTxFails = g_stResyncs = 0;
+}
+
 static void selfTestTick() {
-  static uint32_t seq = 0;
+  const uint32_t now = millis();
 
-  twai_message_t tx = {};       // zero-init: clears extd/rtr/ss/dlc_non_comp
-  tx.identifier       = 0x100;
-  tx.self             = 1;      // self-reception request
-  tx.data_length_code = 4;
-  tx.data[0] = (uint8_t)(seq >> 24);
-  tx.data[1] = (uint8_t)(seq >> 16);
-  tx.data[2] = (uint8_t)(seq >> 8);
-  tx.data[3] = (uint8_t)(seq);
-  seq++;
+  for (uint16_t i = 0; i < SELFTEST_ID_COUNT; i++) {
+    const SelfTestId &p = SELFTEST_IDS[i];
 
-  esp_err_t err = twai_transmit(&tx, pdMS_TO_TICKS(100));
-  if (err != ESP_OK) {
-    Serial.printf("TX failed: %s\n", esp_err_to_name(err));
+    if (p.periodMs == 0) {
+      if (g_stOnce[i]) continue;      // emitted once per run, by design
+      g_stOnce[i] = true;
+    } else {
+      if ((int32_t)(now - g_stNext[i]) < 0) continue;
+      g_stNext[i] += p.periodMs;
+      // If the scheduler fell behind (a long web request, a Wi-Fi transition),
+      // do NOT try to catch up: replaying the backlog would emit a burst that
+      // never happens on a real bus and would misrepresent the rate. Resync
+      // and count it, so the log says how often it happened.
+      if ((int32_t)(now - g_stNext[i]) > (int32_t)p.periodMs) {
+        g_stNext[i] = now + p.periodMs;
+        g_stResyncs++;
+      }
+    }
+
+    twai_message_t tx = {};     // zero-init: clears extd/rtr/ss/dlc_non_comp
+    tx.identifier       = p.id;
+    tx.self             = 1;    // self-reception request
+    tx.data_length_code = p.dlc;
+
+    const uint8_t ctr = g_stCounter[i]++;
+    tx.data[0] = ctr;
+    if (p.dlc > 2) tx.data[1] = (uint8_t)((now / SELFTEST_SIGNAL_STEP_MS) + i);
+    for (uint8_t b = 2; b + 1 < p.dlc; b++) tx.data[b] = (uint8_t)(p.id + b);
+    if (p.dlc > 1) {
+      uint8_t sum = 0;
+      for (uint8_t b = 0; b + 1 < p.dlc; b++) sum = (uint8_t)(sum + tx.data[b]);
+      tx.data[p.dlc - 1] = (uint8_t)(~sum);
+    }
+
+    // Non-blocking. At ~237 frames/s a blocking transmit would stall loop()
+    // behind the tx queue, which would slow the web server and the UDP stream
+    // -- the very things this workload exists to exercise. A refused frame is
+    // counted instead, and a rising count is a real finding.
+    if (twai_transmit(&tx, 0) != ESP_OK) g_stTxFails++;
+    else g_stFrames++;
   }
 }
 
@@ -542,6 +652,7 @@ void loop() {
   webuiLoop();
   hublinkLoop();
   hubstreamLoop();
+  filestoreLoop();
   // millis() wraps at ~49.7 d; this closes the session and starts a new
   // boot_id so relative time stays monotonic within a session.
   if (sessionTick()) hubstreamRequestFullSnapshot();
@@ -557,13 +668,7 @@ void loop() {
     }
   }
 
-  if (g_mode == MODE_SELFTEST) {
-    static uint32_t lastTx = 0;
-    if (millis() - lastTx >= 1000) {
-      lastTx = millis();
-      selfTestTick();
-    }
-  }
+  if (g_mode == MODE_SELFTEST) selfTestTick();
 
   const uint32_t now      = millis();
   const uint32_t interval =
@@ -610,6 +715,18 @@ void loop() {
           (unsigned long)st.rx_overrun_count,
           (unsigned long)st.bus_error_count,
           (unsigned long)st.tx_error_counter);
+
+      if (g_mode == MODE_SELFTEST) {
+        Serial.printf("-- selftest tx=%lu txfail=%lu resync=%lu | "
+                      "udp pkts=%lu recs=%lu fast_pkts=%lu fast_recs=%lu\n",
+                      (unsigned long)g_stFrames,
+                      (unsigned long)g_stTxFails,
+                      (unsigned long)g_stResyncs,
+                      (unsigned long)hubstreamPacketsSent(),
+                      (unsigned long)hubstreamRecordsSent(),
+                      (unsigned long)hubstreamFastPacketsSent(),
+                      (unsigned long)hubstreamFastRecordsSent());
+      }
 
       g_framesLastTick = g_frames;
     }

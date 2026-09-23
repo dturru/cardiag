@@ -100,6 +100,32 @@ No CAN wiring, no car.
 
 ## Phase B — needs the file store
 
+> ✅ **IMPLEMENTED 2026-09-23 as `src/filestore.cpp`** (one module, not the split
+> `filestore_lfs.cpp` / `filestore_sd.cpp` the plan sketched — the backend swap in B5 is
+> a change of four LittleFS calls, and two files would have been two copies of the
+> tier/retention/HTTP logic). **Builds clean; UNVERIFIED on hardware.**
+>
+> | Plan item | Where it landed |
+> |---|---|
+> | B1 rotation + monotonic index | `FS_FILE_MAX_BYTES` 64 KB; index is an NVS counter (`cardiagfs/idx`) |
+> | B2 sha256 at close | running `mbedtls_sha256` context per open file; digest written to a `.meta` sidecar **before** the `.part`→`.log` rename, so a `.log` always has one |
+> | B3 files / Range / ack | `UriBraces` route; watermark in NVS (`cardiagfs/ack`), never moves backwards |
+> | B3.5 snapshot log | `"CDGS"` v1, 16 B header + `u32 ms | u16 count | N×13`; **bit 31 of the id carries EXTENDED** |
+> | B4 tiered retention | acked → unacked A → unacked B → unacked C, **plus a 40% hard cap on Tier A** |
+>
+> **Three things the plan did not anticipate:**
+> 0. **TIER and KIND are different things.** A first pass called the change log
+>    "Tier C" — wrong; Tier C is the trip bookends and the change log is deduplicated
+>    raw frames, i.e. **Tier A**. Tier A therefore holds two *kinds* (`raw`,
+>    `changes`), so files carry both a tier letter (retention) and a kind letter
+>    (parsing): `NNNNNN_TK_BBBBBBBB.log`. Canonical table: `docs/hardware.md`.
+> 1. **Ordering alone does not protect Tier B.** Tier A outruns it ~50:1, so it would
+>    fill the partition between two snapshot blocks. Hence `FS_TIER_A_MAX_PCT` and a
+>    `projected_seconds` that reports Tier B's *guaranteed floor*, not the whole disk.
+> 2. **The logger cannot publish to `hub/health`** — it has no MQTT client. It reports
+>    under `storage` on `/api/v1/session` and the hub's sync loop publishes. Protocol
+>    §2.3 has been corrected to say so.
+
 **B1 `filestore_lfs.cpp`** — LittleFS backing, rotation by size/time, monotonic index.
 **B2 sha256 at close, not on demand.** Computing digests when `/api/v1/files` is
 requested would re-read every file on every poll. Compute once at rotation, store in a
@@ -115,8 +141,8 @@ the snapshot keeps trends (long). Full budget in `docs/hardware.md` §Storage bu
 🔴 ID count is UNVERIFIED (14 measured, changes-only). One 60 s `MODE_LISTEN` capture
 settles it — do that before sizing.
 
-**B4 Tiered retention** — delete acked → **change log before snapshot log** → snapshot last,
-with the `hub/health` usage warning *before* any deletion.
+**B4 Tiered retention** — delete acked → **Tier A (change log) before Tier B (snapshot)** →
+Tier C last, with the `hub/health` usage warning *before* any deletion.
 **B5** Swap to `filestore_sd.cpp` when the carrier arrives. No protocol change.
 
 ---

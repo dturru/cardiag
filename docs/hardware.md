@@ -49,14 +49,40 @@ A vehicle HS-CAN bus is already terminated at both ends (120 Ω each → 60 Ω e
 **Available filesystem: 3.875 MB LittleFS (≈ 3.565 MB usable after LittleFS overhead)**,
 per `firmware/partitions_cardiag_8mb.csv` — 2 MB × 2 OTA app slots leaves the rest.
 
-### What each tier actually costs
+### 🔑 TIER vs KIND — the canonical table
 
-| Tier | What it is | Rate | 3.565 MB holds |
-|---|---|---|---|
-| **A — raw ring** | every frame, pre-trigger | ~16 kB/s | **RAM ONLY.** Under 4 min on flash, and it would burn write cycles doing it. Stays in PSRAM until SD exists |
-| **change log** | frame appended when a non-heartbeat byte moves | **9,450 B/s** measured · 3,789 B/s if binary | **7 min** · 16 min |
-| **snapshot log (NEW)** | latest frame per ID, **1 Hz**, no decoding | 186 B/s @ 14 IDs · 537 B/s @ 41 | **5.6 h** · 116 min |
-| ~~"Tier B" 80 B/s~~ | decoded signals @ 1 Hz | — | **the logger never writes this** |
+> ⚠ **This table is the single source of truth for tier naming.** It is repeated
+> nowhere else; `firmware/include/filestore.h`, `carhub/docs/protocol.md` and the
+> `files.tier` column all defer to it.
+>
+> **TIER = the retention class** (what gets deleted first). **KIND = what is in the
+> file** (how it parses). They are not the same thing, and a tier can hold more than
+> one kind — **Tier A holds two**, which is exactly why one letter was not enough.
+>
+> ❌ **Corrections folded in here:** an earlier Phase B draft called the change log
+> **"Tier C"** — wrong, Tier C is the trip bookends. `recorder.h` called it
+> **"tier 1"** — also wrong. The change log is *deduplicated raw frames*, so it has
+> always been **Tier A**. This file never assigned it a letter at all, which is how
+> the drift went unnoticed.
+
+| Tier | Kind | What it is | Rate | 3.565 MB holds | Phase B |
+|---|---|---|---|---|---|
+| **A** | `raw` | every frame, pre-trigger ring | ~16 kB/s | **RAM ONLY** — under 4 min on flash, and it would burn write cycles doing it. PSRAM until SD exists | ✗ |
+| **A** | `changes` | frame appended when a non-heartbeat byte moves | **9,450 B/s** measured · 3,789 B/s if binary | **7 min** · 16 min | ✅ CSV |
+| **B** | `snapshot` | latest frame per ID, **1 Hz**, no decoding | 186 B/s @ 14 IDs · 537 B/s @ 41 | **5.6 h** · 116 min | ✅ binary `CDGS` |
+| **C** | `bookend` | trip bookends — DTCs, Mode 06 at trip start/end | bytes per trip | effectively unbounded | ✗ not implemented |
+| ~~"Tier B" 80 B/s~~ | — | decoded signals @ 1 Hz | — | **the logger never writes this** | — |
+
+**On disk:** `NNNNNN_TK_BBBBBBBB.{part,log,meta}` — `T` is the tier letter, `K` the kind
+letter (`r c s b`). The **tier is derived from the kind**, never stored twice: a file
+whose two letters disagree was written by a version with the mapping wrong, and the
+kind is the fact.
+
+**Deletion order** — by freeable bytes × replaceability, not by sentiment:
+**acked → unacked A → unacked B → unacked C.** C is last and it is mostly a formality:
+bookends are bytes per trip, so deleting one frees nothing. Tier A is additionally
+**capped at `FS_TIER_A_MAX_PCT` (40%)**, because ordering alone cannot protect Tier B
+from something that outruns it fifty to one.
 
 Change-log rate is measured from `analysis/captures_2026-09-08_civic_stimulus1.csv`:
 33,911 rows / 143.2 s = **237 rows/s at 39.9 B/row**.
@@ -88,7 +114,7 @@ principle is not abandoned, it is **tiered**:
 | change log | every transient | — | short |
 | snapshot log | trends at the 1 Hz the baselining layer needs | transients between samples | long |
 
-🔑 **Retention deletes the change log BEFORE the snapshot log.** Under pressure the
+🔑 **Retention deletes Tier A (the change log) BEFORE Tier B (the snapshot log).** Under pressure the
 device keeps hours of trend data and loses sub-second detail — the right trade for
 self-baselining, which compares operating points across months.
 

@@ -8,7 +8,11 @@
 // when nothing came of it. At ~1000 fps and 16 bytes a frame, 4 MB is roughly
 // four minutes of history at full fidelity.
 //
-// CHANGE LOG -- tier 1, the continuous record. A frame is appended only when a
+// CHANGE LOG -- TIER A, the continuous record. (Earlier drafts called this
+// "tier 1", and Phase B briefly called it "Tier C". Both were wrong. It is
+// deduplicated RAW FRAMES, so it shares Tier A with the raw ring; Tier C is
+// the trip bookends. See filestore.h for the tier/kind table.)
+// A frame is appended only when a
 // non-heartbeat byte differs from the previous frame of the same ID. The bus is
 // overwhelmingly repetition: most IDs resend an identical payload every 10 ms,
 // so this is lossless for state changes while writing a small fraction of the
@@ -88,3 +92,22 @@ struct RecCsvCursor {
 
 size_t recorderRawCsvChunk(char *out, size_t cap, RecCsvCursor *cur);
 size_t recorderChangeCsvChunk(char *out, size_t cap, RecCsvCursor *cur);
+
+// ---------------------------------------------------------------------------
+// Drain support for the Phase B filestore.
+//
+// The change log is append-and-stop, not a ring: when it fills it refuses
+// appends and counts them (recorderChangeDropped) rather than overwriting
+// history. That is the right behaviour for a download-it-later workflow and
+// the wrong behaviour once something is continuously copying it to flash,
+// because the copy reclaims nothing and the log still fills in ~3.5 minutes.
+//
+// This drops rows the filestore has already written. It is deliberately NOT
+// called on every flush: it memmoves the tail down, so it is worth doing
+// rarely and in bulk. filestore.cpp compacts once the consumed prefix passes a
+// fraction of capacity.
+//
+// Returns the number of rows discarded. Any cursor the caller holds must be
+// decremented by that amount -- the rows below it have gone.
+// ---------------------------------------------------------------------------
+uint32_t recorderChangeDiscardThrough(uint32_t rows);

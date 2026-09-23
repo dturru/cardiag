@@ -7,6 +7,7 @@
 #include "recorder.h"
 #include "config.h"
 #include "hubapi.h"
+#include "filestore.h"
 
 static WebServer g_server(80);
 static bool g_apMode = false;
@@ -225,6 +226,10 @@ static void registerRoutes() {
 
   // Additive: /api/v1/* for the hub. Nothing above is affected.
   hubapiRegister(g_server);
+  // Phase B. Registered after hubapiRegister, which owns collectHeaders() for
+  // the whole server -- that call REPLACES the list rather than adding to it,
+  // so it has to happen in exactly one place or "Range" quietly stops arriving.
+  filestoreRegister(g_server);
 
   g_server.begin();
 }
@@ -243,8 +248,12 @@ void webuiStart() {
 
   g_running = true;
   g_apMode  = true;
-  Serial.printf("AP up: SSID \"%s\"  pass \"%s\"  ->  http://%s/\n",
-                WIFI_AP_SSID, WIFI_AP_PASS, WiFi.softAPIP().toString().c_str());
+  // The password is NOT printed. That was harmless while it was the repo
+  // default and is not now that it is a real rotated secret: serial output is
+  // captured to files by the soak harness and pasted into notes. It lives in
+  // firmware/include/secrets.h.
+  Serial.printf("AP up: SSID \"%s\"  ->  http://%s/\n",
+                WIFI_AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
 // Serves the same routes over a network hublink already joined. Does NOT touch

@@ -131,6 +131,12 @@
 #define WIFI_STA_TIMEOUT_MS 8000
 // Retry the hub network periodically, so the logger joins when the car gets home.
 #define WIFI_STA_RETRY_MS   60000
+// First retry after an UNEXPECTED drop. A dropped link may be a blip rather
+// than a hub that went home, and 60 s of AP for a blip is a bad trade -- but
+// retrying every 10 s forever would tear the AP down repeatedly for a hub that
+// is genuinely absent, so this is a one-shot and the cadence then returns to
+// WIFI_STA_RETRY_MS. See hublink.cpp.
+#define WIFI_STA_QUICK_RETRY_MS 10000
 
 // Shared token for the mutating /api/v1 endpoints. Protocol v1 2.4.
 // Override in secrets.h. A default this obvious is intentional: it should look
@@ -145,8 +151,56 @@
 #define HUB_FAST_MAX_IDS    4
 
 // LittleFS partition (partitions_cardiag_8mb.csv) less ~8% LittleFS overhead.
-// Used only to PROJECT snapshot-log retention; Phase A has no filesystem yet.
+// Used to PROJECT snapshot-log retention. Phase B reports the real figure from
+// LittleFS.totalBytes() alongside it; when the two disagree, believe LittleFS.
 #define HUB_FS_USABLE_BYTES 3738173ull
+
+// ---------------------------------------------------------------------------
+// Filestore (protocol v1 section 2). See filestore.h for the tier argument.
+// ---------------------------------------------------------------------------
+
+#define FS_DIR "/log"
+
+// Rotation size. Small files are better here for three reasons that all
+// outrank the per-file overhead: retention deletes a whole file at a time so
+// granularity is the quantum of data loss; an interrupted sync re-fetches at
+// most this much; and the hub's watermark advances this often. 64 KB is ~7 s
+// of Tier C at the measured 9,450 B/s and ~5.7 min of Tier B at 14 ids.
+#define FS_FILE_MAX_BYTES 65536u
+
+// Tier A (frame-level: the change log, and the raw ring once SD exists) may
+// never occupy more than this share of the partition. Ordering alone (delete A
+// before B) is not enough: Tier A outruns Tier B fifty to one, so without a cap
+// it would fill the disk between two snapshot blocks and retention would spend
+// its whole life deleting. The cap is what makes the Tier B retention
+// projection on /api/v1/session mean anything.
+//
+// ⚠ Was FS_TIER_C_MAX_PCT. The change log is Tier A -- deduplicated raw frames
+// -- not Tier C, which is the trip bookends. See filestore.h.
+#define FS_TIER_A_MAX_PCT 40
+
+// Report usage on /api/v1/session well before retention has to delete
+// anything. Protocol 2.3: deletion is never the first the hub hears of it.
+#define FS_WARN_USAGE_PCT 70
+
+// One snapshot block per second. This is the sampling rate the whole storage
+// budget is built on -- changing it changes the retention projection.
+#define FS_SNAPSHOT_PERIOD_MS 1000
+
+// Bytes written to flash per filestore pass. LittleFS writes block-erase, and
+// a long write in loop() is a long time not serving HTTP or streaming UDP.
+// Draining is spread across passes instead; at ~1 kHz this ceiling is far
+// above the 9.5 KB/s the change log produces.
+#define FS_FLUSH_BUDGET_BYTES 2048u
+
+// Index-table ceiling. At FS_FILE_MAX_BYTES this covers the whole partition
+// with room to spare; files past it are on disk but not listed, which the
+// stats report rather than hide.
+#define FS_MAX_FILES 96
+
+// Compact the change log once this share of it has been written to flash.
+// Compaction memmoves the tail down, so it wants to be rare and bulk.
+#define FS_COMPACT_AT_PCT 25
 
 // Observed distinct CAN ids on the 2012 Civic. UNCONFIRMED -- the only measured
 // figure is 14, from a changes-only stimulus capture. 41 is the working number

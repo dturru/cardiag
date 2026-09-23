@@ -23,7 +23,26 @@
 
 #define HUB_HEADER_LEN 32
 #define HUB_RECORD_LEN 20
+
+// Records per datagram. Protocol 1.2 caps this at 64: 32 + 64*20 = 1312 B,
+// safely under a 1500 B MTU, and a receiver REJECTS a count above 64.
+//
+// A build may LOWER it and must never raise it. Lowering is what makes the
+// multi-packet split reachable on real hardware: SNIFF_MAX_IDS is 64, so at
+// the default the table can never produce a 65th row and the split loop is
+// unreachable by construction. Build the `esp32-can-x2-splittest` environment
+// (8 records/packet) and the 14-id SELFTEST profile splits every snapshot into
+// two real datagrams on a real radio.
+#ifndef HUB_MAX_RECORDS
 #define HUB_MAX_RECORDS 64
+#endif
+#if HUB_MAX_RECORDS > 64
+#error "HUB_MAX_RECORDS above 64 violates protocol 1.2; the hub rejects it"
+#endif
+#if HUB_MAX_RECORDS < 1
+#error "HUB_MAX_RECORDS must be at least 1"
+#endif
+
 #define HUB_MAX_PACKET (HUB_HEADER_LEN + HUB_MAX_RECORDS * HUB_RECORD_LEN)
 
 // Header flags

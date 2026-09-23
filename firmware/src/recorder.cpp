@@ -199,3 +199,19 @@ size_t recorderChangeCsvChunk(char *out, size_t cap, RecCsvCursor *cur) {
   unlockRec();
   return n;
 }
+
+uint32_t recorderChangeDiscardThrough(uint32_t rows) {
+  if (!g_chgCap || !rows) return 0;
+
+  lockRec();
+  if (rows > g_chgCount) rows = g_chgCount;
+  const uint32_t remain = g_chgCount - rows;
+  if (remain) {
+    // memmove, not memcpy: the ranges overlap whenever rows < remain.
+    memmove(g_chg, g_chg + rows, (size_t)remain * sizeof(Rec));
+    memmove(g_chgMask, g_chgMask + rows, (size_t)remain);
+  }
+  g_chgCount = remain;
+  unlockRec();
+  return rows;
+}
