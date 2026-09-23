@@ -9,3 +9,10 @@ data/*
 *.log
 secrets.h
 .env
+
+# Vendor design files are not redistributed: this repo is PUBLIC and the
+# Autosport Labs template carries no licence granting redistribution.
+# See hardware/README.md for the official download.
+hardware/vendor-*
+# byte-identical copy of the vendor original (verified by md5 2026-09-22)
+hardware/bolton_template.sch
