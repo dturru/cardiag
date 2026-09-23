@@ -105,7 +105,17 @@ No CAN wiring, no car.
 requested would re-read every file on every poll. Compute once at rotation, store in a
 sidecar index, serve from there. mbedTLS is already in the Arduino core.
 **B3 `/api/v1/files`, `/files/<i>` with Range, `/files/ack`.**
-**B4 Tiered retention** — delete acked → oldest unacked Tier A → Tier B/C last resort,
+**B3.5 1 Hz snapshot log — ADOPTED 2026-09-22.** Latest frame per ID once per second,
+no decoding (stays car-agnostic), reusing the sniffer's per-ID table. Per-second block
+format: `u32 ms | u16 count | count x {u32 id, u8 dlc, u8 data[8]}` = 4 + 13N B/s.
+**5.6 h at 14 IDs, 116 min at 41.** This is what makes the standalone guarantee hold
+without a hub. ⚠ It is fixed-rate sampling, which `recorder.h` argues against — the
+principle is tiered, not abandoned: the change log keeps transients (short retention),
+the snapshot keeps trends (long). Full budget in `docs/hardware.md` §Storage budget.
+🔴 ID count is UNVERIFIED (14 measured, changes-only). One 60 s `MODE_LISTEN` capture
+settles it — do that before sizing.
+
+**B4 Tiered retention** — delete acked → **change log before snapshot log** → snapshot last,
 with the `hub/health` usage warning *before* any deletion.
 **B5** Swap to `filestore_sd.cpp` when the carrier arrives. No protocol change.
 

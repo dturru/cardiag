@@ -31,10 +31,88 @@ A vehicle HS-CAN bus is already terminated at both ends (120 Ω each → 60 Ω e
 
 | Part | When it becomes necessary |
 |---|---|
-| microSD breakout | Phase 2+. 8 MB onboard flash holds ~28 hrs of Tier B (~80 B/s) — plenty for early work. |
+| microSD breakout | **Phase 2 — and it is on the CRITICAL PATH, not deferred.** Internal flash holds **minutes**, not hours, of what the logger actually writes. See §Storage budget below. |
 | DS3231 RTC | Phase 4. Until the device deep-sleeps for days, NTP over home WiFi is sufficient. |
 | Hall current sensor / shunt + 24-bit ADC | Separate subsystem. See the vault note. |
 | Custom PCB / LM5117-class supply | Only after Phase 2 measures the real power, thermal, and data-rate requirements. Designing it now means designing against guesses. |
+
+## 💾 Storage budget — measured 2026-09-22
+
+> ❌ **Correction.** This file previously claimed *"8 MB onboard flash holds ~28 hrs of
+> Tier B (~80 B/s)"*. Both halves were wrong: 8 MB is not available once the partition
+> table carries two OTA slots, and **80 B/s is not what the logger writes.**
+>
+> 80 B/s is **~20 DECODED signals at 1 Hz**. The logger is car-agnostic by design — it
+> ships frames and never decodes — so it cannot produce that stream. The doc was costing
+> a tier against a rate belonging to a different tier.
+
+**Available filesystem: 3.875 MB LittleFS (≈ 3.565 MB usable after LittleFS overhead)**,
+per `firmware/partitions_cardiag_8mb.csv` — 2 MB × 2 OTA app slots leaves the rest.
+
+### What each tier actually costs
+
+| Tier | What it is | Rate | 3.565 MB holds |
+|---|---|---|---|
+| **A — raw ring** | every frame, pre-trigger | ~16 kB/s | **RAM ONLY.** Under 4 min on flash, and it would burn write cycles doing it. Stays in PSRAM until SD exists |
+| **change log** | frame appended when a non-heartbeat byte moves | **9,450 B/s** measured · 3,789 B/s if binary | **7 min** · 16 min |
+| **snapshot log (NEW)** | latest frame per ID, **1 Hz**, no decoding | 186 B/s @ 14 IDs · 537 B/s @ 41 | **5.6 h** · 116 min |
+| ~~"Tier B" 80 B/s~~ | decoded signals @ 1 Hz | — | **the logger never writes this** |
+
+Change-log rate is measured from `analysis/captures_2026-09-08_civic_stimulus1.csv`:
+33,911 rows / 143.2 s = **237 rows/s at 39.9 B/row**.
+
+### The 1 Hz snapshot log — adopted for Phase B
+
+Writes the **latest frame per CAN ID once per second**. No decoding, so it stays
+car-agnostic, and it reuses the per-ID table the sniffer already maintains (the same
+table that feeds the UDP snapshot stream at 5 Hz).
+
+**On-disk format — per-second block**, which is 33% cheaper than repeating a full
+protocol record per ID:
+
+```
+block:  u32 ms                      (one timestamp for the whole second)
+        u16 count
+        count x { u32 can_id ; u8 dlc ; u8 data[8] }   = 13 B per ID
+```
+
+`changed` is deliberately absent: it is a change-log concept and means nothing in a
+snapshot.
+
+⚠ **This IS fixed-rate sampling, which `recorder.h` argues against** — *"fixed-rate
+sampling would alias away exactly the transients this project exists to catch."* That
+principle is not abandoned, it is **tiered**:
+
+| | keeps | loses | retention |
+|---|---|---|---|
+| change log | every transient | — | short |
+| snapshot log | trends at the 1 Hz the baselining layer needs | transients between samples | long |
+
+🔑 **Retention deletes the change log BEFORE the snapshot log.** Under pressure the
+device keeps hours of trend data and loses sub-second detail — the right trade for
+self-baselining, which compares operating points across months.
+
+⇒ **This is what makes the standalone-logger guarantee hold without the hub**: hours of
+1 Hz data instead of 7 minutes.
+
+🔴 **UNVERIFIED — the dominant variable is the ID count.** The only measurement so far
+is **14 IDs**, from a changes-only stimulus capture. Retention swings hard with it:
+
+| distinct IDs | snapshot rate | holds |
+|---|---|---|
+| 14 (measured) | 186 B/s | 5.6 h |
+| 41 (assumed) | 537 B/s | 116 min |
+| 60 | 784 B/s | 79 min |
+
+**A 60-second `MODE_LISTEN` capture settles this.** Do it before sizing anything else.
+
+### Why SD is still on the critical path
+
+With the hub present, LittleFS is a **staging buffer** — files rotate small and get
+pulled as they close, so minutes of buffer suffice and Phase B is fully developable.
+With the hub absent, the snapshot log buys hours rather than minutes, but the change
+log still expires in single-digit minutes. **The logger being genuinely standalone
+requires SD.**
 
 **No USB-CAN adapter needed.** The dual-CAN board self-tests: wire CAN1 to CAN2 and it is its own bench bus.
 
