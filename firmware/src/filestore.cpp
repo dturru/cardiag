@@ -178,6 +178,37 @@ static void recomputeUsage() {
 // Scan
 // ---------------------------------------------------------------------------
 
+// Recover the producing mode from the FILE ITSELF, for a file that has no
+// .meta yet.
+//
+// 🐛 WHY THIS EXISTS (found on hardware 2026-09-23). A closed file round-trips
+// its mode through `mode=` in the .meta sidecar. An OPEN .part has no .meta,
+// so after a reboot its mode came back unknown -- and the listing rendered
+// unknown as `"synthetic":false`. A SELFTEST run interrupted by a reset (which
+// is every run, because closing the USB serial port resets this board) was
+// therefore served to the hub as REAL CAR DATA. That is precisely the failure
+// the synthetic flag exists to prevent, and it was silent.
+//
+// The Tier B header already carries the mode, so the fact is on the disk; it
+// simply was not being read back. Content wins over the label, as everywhere
+// else in this project.
+static uint8_t readModeFromContent(uint32_t index, char kind, uint32_t bootId) {
+  // Only Tier B is self-describing. A CSV has a column header and no room for
+  // provenance, so for those kinds the mode is genuinely unrecoverable and
+  // must stay UNKNOWN rather than being guessed at.
+  if (kind != FS_KIND_SNAPSHOT) return FS_MODE_UNKNOWN;
+
+  char path[64];
+  makeName(path, sizeof(path), index, kind, bootId, "part");
+  File f = LittleFS.open(path, "r");
+  if (!f) return FS_MODE_UNKNOWN;
+  SnapFileHeader h{};
+  const size_t n = f.read((uint8_t *)&h, sizeof(h));
+  f.close();
+  if (n != sizeof(h) || memcmp(h.magic, "CDGS", 4) != 0) return FS_MODE_UNKNOWN;
+  return h.mode;
+}
+
 static void readMeta(FileEntry *e, uint32_t bootId) {
   char path[64];
   makeName(path, sizeof(path), e->index, e->kind, bootId, "meta");
@@ -225,8 +256,9 @@ static void scanDir() {
     e->bootId = bootId;
     e->bytes = (uint32_t)f.size();
     e->closed = (strcmp(ext, "log") == 0);
-    e->mode = 0xFF;
+    e->mode = FS_MODE_UNKNOWN;
     if (e->closed) readMeta(e, bootId);
+    else e->mode = readModeFromContent(index, kind, bootId);
   }
   dir.close();
   sortEntries();
@@ -675,7 +707,14 @@ static void handleList(WebServer &srv) {
         (unsigned long)e.bytes, (unsigned long)e.bootId, tier,
         fsKindName(e.kind),
         e.closed ? "true" : "false",
-        (e.mode == MODE_SELFTEST) ? "true" : "false",
+        // 🔑 THREE-VALUED, AND null IS NOT false. A file whose producing mode
+        // could not be recovered is UNKNOWN provenance, and rendering that as
+        // "synthetic":false would be a claim that it came from the car. The
+        // hub's policy for null is its own (do not pool into a baseline); the
+        // logger's job is only to not lie about what it knows.
+        (e.mode == FS_MODE_UNKNOWN) ? "null"
+                                    : ((e.mode == MODE_SELFTEST) ? "true"
+                                                                 : "false"),
         (e.kind == FS_KIND_SNAPSHOT) ? "cdgs1" : "csv");
     srv.sendContent(buf, n);
 

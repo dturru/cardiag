@@ -219,15 +219,35 @@ def run(args) -> int:
         print("WARNING: nothing on the serial port yet. If the PlatformIO "
               "monitor is open, close it -- the port is exclusive.")
 
-    # Start from a known state: hotspot ON and the board joined.
-    if state != "On":
-        print(f"  start -> {hotspot('start')}")
+    # Start from a known state: hotspot ON and the board OBSERVED to join.
+    #
+    # 🐛 A BOARD THAT IS ALREADY JOINED NEVER SAYS "STA up" AGAIN.
+    # This used to wait for that line unconditionally, which deadlocked for the
+    # whole join timeout in the ORDINARY case -- hotspot already on, board
+    # joined at boot -- and then blamed the SSID, the band and the firmware.
+    # Three wrong diagnoses for a tool that was waiting on an event which had
+    # already happened before it started looking.
+    #
+    # The fix is not to guess the state: it is to CREATE the transition we need
+    # to observe. One extra toggle before cycle 1 costs ~20 s and makes the
+    # starting point a measurement instead of an assumption.
+    if state == "On":
+        print("  hotspot already on; cycling it once to observe a real join")
+        print(f"  stop  -> {hotspot('stop')}")
+        # Not waited on: if the board was not joined there is nothing to lose,
+        # and that is fine. The dwell is what guarantees it has settled.
+        tap.wait_for(RE_STA_LOST, 0, timeout=args.drop_timeout)
+        time.sleep(2.0)
+
+    mark = len(tap.snapshot())
+    print(f"  start -> {hotspot('start')}")
     print("  waiting for the board to join ...")
-    got = tap.wait_for(RE_STA_UP, 0, timeout=args.join_timeout)
+    got = tap.wait_for(RE_STA_UP, mark, timeout=args.join_timeout)
     if not got:
         print(f"ERROR: board never reported 'STA up' within "
-              f"{args.join_timeout:.0f}s. Check the SSID/band (the S3 is "
-              f"2.4 GHz only) and that the firmware is the rotated build.")
+              f"{args.join_timeout:.0f}s of the hotspot coming up. Check the "
+              f"SSID/band (the S3 is 2.4 GHz only) and that the firmware is "
+              f"the rotated build.")
         tap.close()
         return 3
     print(f"  joined: {got[0].text}")

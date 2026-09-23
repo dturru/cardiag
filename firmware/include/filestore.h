@@ -78,6 +78,15 @@ class WebServer;
 #define FS_KIND_SNAPSHOT 's'     // snapshot log (Tier B)
 #define FS_KIND_BOOKEND  'b'     // trip bookend (Tier C) -- not written yet
 
+// The producing mode is not recoverable for this file.
+//
+// It is a distinct value and NOT a synonym for "a real capture". A closed file
+// carries `mode=` in its .meta and a Tier B .part carries it in the CDGS
+// header, but a CSV .part orphaned by a reset has nowhere to have kept it. The
+// listing reports that as `"synthetic":null`, because claiming `false` would
+// assert the file came from the car.
+#define FS_MODE_UNKNOWN  0xFF
+
 // The one place the mapping lives. Used by the writers and by the scanner, so
 // a file's tier can never disagree with its kind.
 static inline char fsTierForKind(char kind) {
