@@ -305,8 +305,13 @@ static void canTask(void *) {
 
     if (g_mode == MODE_SNIFF) {
       snifferNote(rx);   // also feeds the change log
-    } else if (!g_paused) {
-      printFrame(rx);
+    } else {
+      // The per-ID table is what the hub's UDP snapshot reads, so keep it
+      // current in LISTEN and SELFTEST as well. feedRecorder=false: loopback
+      // and listen frames must not be written into the change log, which is a
+      // record of the CAR, not of the bench.
+      snifferNote(rx, false);
+      if (!g_paused) printFrame(rx);
     }
   }
 }
@@ -377,10 +382,9 @@ static void handleKeys() {
           webuiStop();
           g_prefs.putBool("ap", false);
         } else {
-          // STA first, falling back to the board's own AP. hublinkBegin() calls
-  // webuiStart() itself on fallback, so standalone behaviour is unchanged.
-  hublinkBegin();
-  hubstreamBegin();
+          // 'w' is the manual radio toggle and stays AP-only: it is the
+          // "I want the standalone UI now" key, not a hub-join request.
+          webuiStart();
           g_prefs.putBool("ap", true);
         }
         break;
@@ -472,7 +476,14 @@ void setup() {
 
   // On by default: the whole point is that the board is usable with no laptop,
   // and a board that needs one to switch its radio on would defeat that.
-  if (g_prefs.getBool("ap", true)) webuiStart();
+  //
+  // hublinkBegin() tries the hub network FIRST and falls back to webuiStart(),
+  // so the standalone behaviour above is preserved exactly. If the radio was
+  // deliberately switched off with 'w', respect that and start nothing.
+  if (g_prefs.getBool("ap", true)) {
+    hublinkBegin();
+    hubstreamBegin();
+  }
 }
 
 // One sweep of the supported PID list, printed as a single line.

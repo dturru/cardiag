@@ -22,7 +22,13 @@
 void snifferBegin();
 
 // Records one frame. Cheap enough to call on every RX.
-void snifferNote(const twai_message_t &msg);
+//
+// `feedRecorder` controls the Tier-1 change-log side effect. MODE_SNIFF passes
+// true, which is the original behaviour. The other receiving modes pass false:
+// the hub's UDP snapshot reads this table, so it must be populated in LISTEN
+// and SELFTEST too -- but loopback test frames must NOT enter the change log,
+// which is a record of what the CAR did.
+void snifferNote(const twai_message_t &msg, bool feedRecorder = true);
 
 // Re-baselines every row to its current payload and clears the change marks.
 void snifferClearMarks();

@@ -83,7 +83,7 @@ void snifferClearMarks() {
   unlockTable();
 }
 
-void snifferNote(const twai_message_t &msg) {
+void snifferNote(const twai_message_t &msg, bool feedRecorder) {
   if (msg.rtr) return;   // remote frames carry no payload to diff
 
   uint8_t interesting = 0;
@@ -147,7 +147,7 @@ void snifferNote(const twai_message_t &msg) {
 
   // Deliberately outside the table lock: the recorder takes its own, and never
   // nesting the two removes the possibility of a lock-order bug later.
-  if (interesting) {
+  if (interesting && feedRecorder) {
     recorderNoteChange(msg.identifier, msg.extd, msg.data_length_code,
                        msg.data, interesting);
   }
