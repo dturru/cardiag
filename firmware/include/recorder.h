@@ -17,6 +17,30 @@
 //
 // Both are VOLATILE -- power loss loses them. Persisting to flash or SD is a
 // later tier; for now the workflow is drive, then download over the AP.
+//
+// ---------------------------------------------------------------------------
+// A NOTE ON THE ARGUMENT ABOVE, added 2026-09-22.
+//
+// The change log exists because "fixed-rate sampling would alias away exactly
+// the transients this project exists to catch." That argument still stands, and
+// Phase B nonetheless adds a 1 Hz SNAPSHOT LOG, which is fixed-rate sampling.
+//
+// That is not a reversal. It is tiering:
+//
+//   change log     keeps every transient        short retention
+//   snapshot log   keeps trends at the 1 Hz     long retention
+//                  the baselining layer needs
+//
+// The reason is storage, measured rather than assumed: the change log runs
+// ~9,450 B/s on the real Civic capture, so the 3.5 MB of internal flash holds
+// about SEVEN MINUTES of it. A 1 Hz per-id snapshot costs 4 + 13N bytes per
+// second and holds HOURS. Under retention pressure the device deletes the
+// change log first and keeps the snapshot, so it loses sub-second detail and
+// keeps the month-over-month comparison -- the right trade for self-baselining,
+// and the only way the logger is genuinely standalone without SD.
+//
+// See docs/hardware.md, section "Storage budget".
+// ---------------------------------------------------------------------------
 
 #include <stdint.h>
 #include <stddef.h>

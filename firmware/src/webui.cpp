@@ -6,8 +6,10 @@
 #include "sniffer.h"
 #include "recorder.h"
 #include "config.h"
+#include "hubapi.h"
 
 static WebServer g_server(80);
+static bool g_apMode = false;
 static bool      g_running = false;
 
 // Built once per request rather than held as live state. At a few hundred
@@ -209,6 +211,24 @@ static void handleMode() {
 
 // ---------------------------------------------------------------------------
 
+// Route table, shared by both network modes. The existing endpoints are
+// IDENTICAL in AP and STA -- the standalone UI does not change just because a
+// hub happens to be present.
+static void registerRoutes() {
+  g_server.on("/", HTTP_GET, handleRoot);
+  g_server.on("/api/table", HTTP_GET, handleTable);
+  g_server.on("/api/clear", HTTP_POST, handleClear);
+  g_server.on("/api/mode", HTTP_POST, handleMode);
+  g_server.on("/api/rec", HTTP_POST, handleRec);
+  g_server.on("/api/raw.csv", HTTP_GET, handleRawCsv);
+  g_server.on("/api/changes.csv", HTTP_GET, handleChangeCsv);
+
+  // Additive: /api/v1/* for the hub. Nothing above is affected.
+  hubapiRegister(g_server);
+
+  g_server.begin();
+}
+
 void webuiStart() {
   if (g_running) return;
 
@@ -219,27 +239,37 @@ void webuiStart() {
     return;
   }
 
-  g_server.on("/", HTTP_GET, handleRoot);
-  g_server.on("/api/table", HTTP_GET, handleTable);
-  g_server.on("/api/clear", HTTP_POST, handleClear);
-  g_server.on("/api/mode", HTTP_POST, handleMode);
-  g_server.on("/api/rec", HTTP_POST, handleRec);
-  g_server.on("/api/raw.csv", HTTP_GET, handleRawCsv);
-  g_server.on("/api/changes.csv", HTTP_GET, handleChangeCsv);
-  g_server.begin();
+  registerRoutes();
 
   g_running = true;
+  g_apMode  = true;
   Serial.printf("AP up: SSID \"%s\"  pass \"%s\"  ->  http://%s/\n",
                 WIFI_AP_SSID, WIFI_AP_PASS, WiFi.softAPIP().toString().c_str());
+}
+
+// Serves the same routes over a network hublink already joined. Does NOT touch
+// WiFi mode -- the radio is in STA and must stay there (one radio, one mode).
+void webuiStartOnCurrentNetwork() {
+  if (g_running) return;
+  registerRoutes();
+  g_running = true;
+  g_apMode  = false;
+  Serial.print("web up on hub network -> http://");
+  Serial.println(WiFi.localIP());
 }
 
 void webuiStop() {
   if (!g_running) return;
   g_server.stop();
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_OFF);
+  if (g_apMode) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("AP down, radio off.");
+  } else {
+    // hublink owns the STA link; leave it up.
+    Serial.println("web server stopped (STA link left up).");
+  }
   g_running = false;
-  Serial.println("AP down, radio off.");
 }
 
 void webuiLoop() {

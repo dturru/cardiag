@@ -35,6 +35,10 @@ struct IdSlot {
   uint8_t  dlc;
   uint8_t  changedMask;
   bool     extd;
+  // When the payload last DIFFERED from the previous frame of this id. Drives
+  // the hub's delta snapshots: "seen since" would resend every id every packet
+  // on a busy bus, which is not what the protocol means by "changed".
+  uint32_t changedAtMs;
 };
 
 static IdSlot   g_slots[SNIFF_MAX_IDS];
@@ -102,7 +106,8 @@ void snifferNote(const twai_message_t &msg) {
     memset(s, 0, sizeof(*s));
     s->id      = msg.identifier;
     s->extd    = msg.extd;
-    s->firstMs = millis();
+    s->firstMs     = millis();
+    s->changedAtMs = s->firstMs;
     memcpy(s->last, msg.data, msg.data_length_code);
     memcpy(s->base, msg.data, msg.data_length_code);
 
@@ -121,6 +126,7 @@ void snifferNote(const twai_message_t &msg) {
       if (msg.data[i] != s->base[i]) s->changedMask |= (uint8_t)(1u << i);
     }
     memcpy(s->last, msg.data, msg.data_length_code);
+    if (delta) s->changedAtMs = millis();
 
     // Rolling counters and checksums move on nearly every frame. Logging those
     // would defeat the entire point of a change log, so they are masked out.
@@ -269,6 +275,50 @@ size_t snifferSnapshotJson(char *out, size_t cap,
 
   n += snprintf(out + n, cap - n, "]}");
 
+  unlockTable();
+  return n;
+}
+
+
+// --- hub UDP stream access (hubproto v1) -----------------------------------
+
+static void fillRow(SnifferRow *r, const IdSlot &s) {
+  r->id          = s.id;
+  r->lastMs      = s.lastMs;
+  r->changedAtMs = s.changedAtMs;
+  r->dlc         = s.dlc;
+  r->changedMask = s.changedMask;
+  r->ext         = s.extd;
+  memset(r->data, 0, sizeof(r->data));
+  memcpy(r->data, s.last, s.dlc > 8 ? 8 : s.dlc);
+}
+
+uint16_t snifferRowsChangedSince(SnifferRow *out, uint16_t cap, uint32_t sinceMs) {
+  uint16_t n = 0;
+  lockTable();
+  for (uint16_t i = 0; i < g_count && n < cap; i++) {
+    // sinceMs == 0 means a FULL snapshot: every known id.
+    // Signed difference so the comparison survives a millis() wrap.
+    if (sinceMs && (int32_t)(g_slots[i].changedAtMs - sinceMs) <= 0) continue;
+    fillRow(&out[n++], g_slots[i]);
+  }
+  unlockTable();
+  return n;
+}
+
+uint16_t snifferRowsForIds(SnifferRow *out, uint16_t cap,
+                           const uint32_t *ids, uint16_t nIds, uint32_t sinceMs) {
+  uint16_t n = 0;
+  lockTable();
+  for (uint16_t i = 0; i < g_count && n < cap; i++) {
+    bool want = false;
+    for (uint16_t k = 0; k < nIds; k++) {
+      if (ids[k] == g_slots[i].id) { want = true; break; }
+    }
+    if (!want) continue;
+    if (sinceMs && (int32_t)(g_slots[i].changedAtMs - sinceMs) <= 0) continue;
+    fillRow(&out[n++], g_slots[i]);
+  }
   unlockTable();
   return n;
 }

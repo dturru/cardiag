@@ -30,6 +30,9 @@
 #include "sniffer.h"
 #include "recorder.h"
 #include "webui.h"
+#include "session.h"
+#include "hublink.h"
+#include "hubstream.h"
 
 // ---------------------------------------------------------------------------
 // Rolling stats. On a live bus the useful first question is not "what does
@@ -127,7 +130,10 @@ static bool startTwai(twai_mode_t mode) {
   // but it is NOT the real fix -- Phase 2 drains in an ISR into a ring buffer.
   // Until then, a full queue shows up as rx_missed in the stats line, which is
   // exactly the signal we want to see rather than silently losing frames.
-  g.rx_queue_len = 32;
+  // Raised from 32 when the hub work landed: WebServer and the UDP stream
+  // now share core 1 with the CAN task, so the queue has to absorb a
+  // scheduling hiccup rather than drop frames. 128 x 16 B is ~2 kB.
+  g.rx_queue_len = 128;
 
   twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
@@ -371,7 +377,10 @@ static void handleKeys() {
           webuiStop();
           g_prefs.putBool("ap", false);
         } else {
-          webuiStart();
+          // STA first, falling back to the board's own AP. hublinkBegin() calls
+  // webuiStart() itself on fallback, so standalone behaviour is unchanged.
+  hublinkBegin();
+  hubstreamBegin();
           g_prefs.putBool("ap", true);
         }
         break;
@@ -454,6 +463,10 @@ void setup() {
 
   applyMode(stored, false);
 
+  // Identity first: boot_id and device_id must exist before any packet,
+  // log line or API response can reference them.
+  sessionBegin();
+
   xTaskCreatePinnedToCore(canTask, "can", CAN_TASK_STACK, nullptr,
                           CAN_TASK_PRIO, &g_canTask, CAN_TASK_CORE);
 
@@ -516,6 +529,11 @@ void loop() {
   handleKeys();
   handleButton();
   webuiLoop();
+  hublinkLoop();
+  hubstreamLoop();
+  // millis() wraps at ~49.7 d; this closes the session and starts a new
+  // boot_id so relative time stays monotonic within a session.
+  if (sessionTick()) hubstreamRequestFullSnapshot();
 
   if (!g_twaiUp) { delay(10); return; }
 

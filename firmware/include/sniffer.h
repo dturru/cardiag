@@ -42,3 +42,31 @@ uint16_t snifferOverflow();
 // the page decides how to draw it and the payload stays small.
 size_t snifferSnapshotJson(char *out, size_t cap,
                            uint32_t frames, uint32_t missed, uint32_t busErr);
+
+// ---------------------------------------------------------------------------
+// Binary access for the hub UDP stream (hubproto v1).
+//
+// The stream is a LATEST-VALUE SNAPSHOT, not a frame firehose: the bus runs
+// ~1000 fps and no 5 Hz link can carry that. This table already holds exactly
+// what a snapshot is, which is why the protocol was shaped around it.
+// ---------------------------------------------------------------------------
+
+struct SnifferRow {
+  uint32_t id;
+  uint32_t lastMs;       // when this id was last seen
+  uint32_t changedAtMs;  // when its payload last DIFFERED from the previous one
+  uint8_t  data[8];
+  uint8_t  dlc;
+  uint8_t  changedMask;
+  bool     ext;
+};
+
+// Copies rows whose payload changed strictly after `sinceMs`. Pass 0 for a
+// full snapshot (every known id, changed or not). Returns rows written.
+// Takes the table lock internally; safe to call from a task other than the
+// CAN task.
+uint16_t snifferRowsChangedSince(SnifferRow *out, uint16_t cap, uint32_t sinceMs);
+
+// Same, restricted to a caller-supplied id list (the protocol's "fast list").
+uint16_t snifferRowsForIds(SnifferRow *out, uint16_t cap,
+                           const uint32_t *ids, uint16_t nIds, uint32_t sinceMs);

@@ -114,6 +114,48 @@
 
 // The page polls a small JSON snapshot instead of streaming frames. Streaming
 // 1000 fps over Wi-Fi is exactly how you turn a sniffer into a frame-dropper.
+// ---------------------------------------------------------------------------
+// Hub integration (protocol v1). See docs/hub-integration-plan.md.
+// ---------------------------------------------------------------------------
+
+// The hub network the logger joins as a station. Credentials live in the
+// gitignored secrets.h; these are only the fallbacks so a fresh checkout still
+// compiles. STA is tried first; on failure the board falls back to its own AP.
+#ifndef WIFI_STA_SSID
+#define WIFI_STA_SSID "carhub"
+#endif
+#ifndef WIFI_STA_PASS
+#define WIFI_STA_PASS "carhub-default"
+#endif
+// How long to wait for the hub network before falling back to AP mode.
+#define WIFI_STA_TIMEOUT_MS 8000
+// Retry the hub network periodically, so the logger joins when the car gets home.
+#define WIFI_STA_RETRY_MS   60000
+
+// Shared token for the mutating /api/v1 endpoints. Protocol v1 2.4.
+// Override in secrets.h. A default this obvious is intentional: it should look
+// wrong in a packet capture if it was never changed.
+#ifndef HUB_API_TOKEN
+#define HUB_API_TOKEN "change-me"
+#endif
+
+#define HUB_UDP_PORT        5005
+#define HUB_SNAPSHOT_HZ     5      // protocol 1.5 default; 1-10
+#define HUB_FAST_HZ         20     // fast-ID list ceiling
+#define HUB_FAST_MAX_IDS    4
+
+// LittleFS partition (partitions_cardiag_8mb.csv) less ~8% LittleFS overhead.
+// Used only to PROJECT snapshot-log retention; Phase A has no filesystem yet.
+#define HUB_FS_USABLE_BYTES 3738173ull
+
+// Observed distinct CAN ids on the 2012 Civic. UNCONFIRMED -- the only measured
+// figure is 14, from a changes-only stimulus capture. 41 is the working number
+// pending a 60 s MODE_LISTEN capture (next Texas trip).
+// NOTHING IS SIZED FROM THIS: the logger counts ids at runtime and reports the
+// projection on /api/v1/session and hub/health. SNIFF_MAX_IDS (64) is the only
+// hard bound, and it also covers the BMW, which will differ.
+#define CIVIC_OBSERVED_IDS_UNCONFIRMED 41
+
 #define WEB_POLL_HINT_MS 300
 
 // Snapshot buffer. 64 rows of ~90 chars plus the header, with headroom.

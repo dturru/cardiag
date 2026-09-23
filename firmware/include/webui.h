@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 void webuiStart();     // brings up the AP and the server
+void webuiStartOnCurrentNetwork();  // server only; radio already in STA
 void webuiStop();      // tears both down and powers the radio off
 void webuiLoop();      // call from loop(); cheap no-op while stopped
 bool webuiRunning();
