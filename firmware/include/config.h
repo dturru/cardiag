@@ -219,7 +219,7 @@
 //
 // Per the TCAN1043A-Q1 datasheet (checked 2026-09-23):
 //   * In NORMAL mode INH never drops by itself. Sleep is MCU-COMMANDED:
-//     EN high + nSTB low -> go-to-sleep -> INH off after tGOTOSLEEP, ~20-50 us.
+//     EN high + nSTB low -> go-to-sleep -> INH off after tGO_TO_SLEEP, 5-50 us.
 //   * The only automatic path is tINACTIVE (3-5 min), and only from STANDBY,
 //     as a failsafe.
 //   * tSILENCE (0.6-1.2 s) changes bus BIASING only. It does not touch INH.

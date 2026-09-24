@@ -5,7 +5,7 @@
 //
 // The TCAN1043's INH pin gates the buck. Per its datasheet INH does not drop
 // on its own in normal mode: sleep is MCU-commanded (EN high + nSTB low) and
-// INH follows ~20-50 us later. So this function is not reacting to a power
+// INH follows 5-50 us later. So this function is not reacting to a power
 // cut, it IS the power cut, and it is the only thing that has to respect the
 // go-to-sleep invariant in sleepguard.h.
 //
