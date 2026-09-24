@@ -38,6 +38,10 @@ param(
   [int]$Minutes = 30,
   [string]$Port = "COM3",
   [int]$AckAfter = 6,
+  # Which build to flash. captest leaves the snapshot period at its 1000 ms
+  # default so TIER A wins the race to the disk -- see platformio.ini. fstest
+  # accelerates Tier B and is the wrong build for the cap test.
+  [string]$Env = "esp32-can-x2-captest",
   # Unattended launch: skip the "press Enter" at the end. With nobody at the
   # keyboard that prompt waits forever and the window never closes, which looks
   # exactly like a hung run. Everything is already on disk by then.
@@ -138,8 +142,8 @@ Log "spiffs erased -- LittleFS will reformat on next mount"
 # --- 3. FLASH THE FSTEST BUILD ----------------------------------------------
 # fstest feeds SELFTEST frames into the change log, which is the only way to
 # grow Tier A on a desk with no car attached.
-Log "--- flashing esp32-can-x2-fstest ---"
-& $pio run -e esp32-can-x2-fstest -t upload --upload-port $Port 2>&1 |
+Log "--- flashing $Env ---"
+& $pio run -e $Env -t upload --upload-port $Port 2>&1 |
   Tee-Object -FilePath (Join-Path $out "flash.log") -Append | Out-Null
 $flashRc = $LASTEXITCODE
 Pop-Location
