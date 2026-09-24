@@ -174,7 +174,37 @@ the 09-24 mid-run reboot was the task watchdog firing during eviction.
 ⏸ **The WDT timing margin waits for the car** — the bench cannot produce a
 marginal link on demand.
 
-### 2a. Recipe: retention run 3 on a clean partition
+### 2a. ▶ RUN IT — one command, detached
+
+```
+powershell -ExecutionPolicy Bypass -File toolsun_bench.ps1
+```
+
+Launch it in **its own PowerShell window**. It is self-contained: pre-flight
+(sleep/hotspot/port), reads the pre-erase loss baseline, erases the spiffs
+partition, flashes the fstest build, captures serial for the whole window while
+sending the mode keys, finds the board's IP from that live log, then runs the
+watch. `-Minutes 30` by default.
+
+📂 **READ RESULTS FROM `analysis/bench-<yyyy-MM-dd-HHmm>/`:**
+
+| File | What |
+|---|---|
+| **`SUMMARY.md`** | ⭐ **START HERE** — PASS/FAIL per claim, key numbers, the reset/watchdog lines |
+| `retention.log` | full verdicts (RETENTION WATCH banner at the end) |
+| `retention.csv` | per-sample, **flushed every sample** — a killed run still leaves usable data |
+| `serial.log` | the board's own output, **flushed every line** — the boot banner and reset reason live here |
+| `runner.log` · `erase.log` · `flash.log` | what the runner did, and the two steps that can abort it |
+
+**What it is testing:** claim 2 (the cap's OWN acked-before-unacked choice),
+claim 4 (warn fires on loss while usage is LOW — the arm no run has reached),
+claim 5 (the NVS loss record survives the spiffs erase), and the reboot
+question, which is the higher-priority one.
+
+⚠️ **NVS is deliberately NOT erased** — it holds the lifetime loss counters, and
+leaving it intact is what makes claim 5 testable.
+
+### 2a-bis. Manual recipe (only if the runner cannot be used)
 Per the recipe above. The pass conditions are unchanged:
 
 - acked Tier A files are evicted **first**
