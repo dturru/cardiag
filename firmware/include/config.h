@@ -246,6 +246,37 @@
 // see, not on the suffix that is load-bearing in this application.
 #define CAN_BUS_IDLE_CLOSE_MS 3000
 
+// 🚨🚨 THE BACKSTOP WE HAVE TO PROVIDE BECAUSE THE G VARIANT HAS NONE.
+//
+// TCAN1043xx-Q1 datasheet, verified 2026-09-23: the A variant has a
+// tINACTIVE / sleep-wake-error failsafe that eventually turns things off on
+// its own. **THE G DOES NOT.** The carrier's as-built part is
+// `TCAN1043GDRQ1` (vault Carrier Board BOM §11.1), so there is NO hardware
+// path that will ever de-assert INH without this firmware asking.
+//
+// INH sits on OBD pin 16, which is UNSWITCHED -- permanently live off the
+// battery. A firmware hang with INH asserted is therefore an ESP32 awake on
+// the car battery indefinitely: the exact outcome INH was chosen to prevent,
+// and the project's stated #1 constraint (an ESP32 awake with WiFi flattens a
+// battery in roughly a week of sitting).
+//
+// Three layers, in sleepguard.h. This constant is the third: if the bus has
+// been quiet this long we sleep REGARDLESS of what else the firmware believes
+// it is doing -- closing any open file first, because the invariant is kept by
+// closing, not by refusing.
+//
+// 5 minutes: long enough that a genuinely long crank, a stalled restart or a
+// hub sync mid-parking-space does not cut us off, short enough that the worst
+// case costs milliamp-hours rather than a battery. Set to 0 to disable, which
+// on the G variant means nothing will ever turn this board off.
+#define CAN_MAX_AWAKE_MS (5u * 60u * 1000u)
+
+// Hardware task watchdog. Layer 1: the other two failsafes are code, so they
+// cannot help when the code is what stopped running.
+#ifndef WDT_TIMEOUT_S
+#define WDT_TIMEOUT_S 30
+#endif
+
 // Bytes written to flash per filestore pass. LittleFS writes block-erase, and
 // a long write in loop() is a long time not serving HTTP or streaming UDP.
 // Draining is spread across passes instead; at ~1 kHz this ceiling is far

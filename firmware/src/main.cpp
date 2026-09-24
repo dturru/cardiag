@@ -35,6 +35,8 @@
 #include "hubstream.h"
 #include "selftest_profile.h"
 #include "filestore.h"
+#include "transceiver.h"
+#include <esp_task_wdt.h>
 
 static void selfTestReset();
 
@@ -523,6 +525,25 @@ void setup() {
   // unhappy would be worse than one that says so and carries on.
   filestoreBegin();
 
+  // ========================================================================
+  // FAILSAFE LAYER 2 -- BOOT-TIME CHECK.
+  //
+  // This is what catches the reset layer 1 just caused. Waking up, finding a
+  // dead car, and cheerfully staying awake would turn a watchdog SAVE into
+  // exactly the battery drain the watchdog fired to prevent.
+  //
+  // Any leftover .part from the boot that just died is closed here as a side
+  // effect of the same call, so a crash artifact stops being open the moment
+  // the board comes back rather than lingering until the next mode change.
+  //
+  // Deliberately AFTER filestoreBegin() -- it needs the scan to know what is
+  // open -- and BEFORE the radio starts, because there is no point joining a
+  // network on a car that left twenty minutes ago.
+  //
+  // ⚠ On the dev board this can only log; there is no INH path to switch. On
+  // the carrier it removes power here.
+  transceiverRequestSleep();
+
   applyMode(stored, false);
 
   xTaskCreatePinnedToCore(canTask, "can", CAN_TASK_STACK, nullptr,
@@ -534,6 +555,33 @@ void setup() {
   // hublinkBegin() tries the hub network FIRST and falls back to webuiStart(),
   // so the standalone behaviour above is preserved exactly. If the radio was
   // deliberately switched off with 'w', respect that and start nothing.
+  // ========================================================================
+  // FAILSAFE LAYER 1 -- HARDWARE TASK WATCHDOG.
+  //
+  // The TCAN1043**G** on the carrier has NO tINACTIVE / SWE failsafe (the A
+  // variant does; ours does not), and INH sits on the UNSWITCHED OBD pin 16.
+  // So nothing in hardware will ever turn this board off, and a firmware hang
+  // with INH asserted is an ESP32 awake on the car battery until the battery
+  // is flat. The other two layers are code and cannot help when the code is
+  // what stopped running; this one can.
+  // ========================================================================
+  {
+    esp_task_wdt_config_t wdt = {
+        .timeout_ms = (uint32_t)WDT_TIMEOUT_S * 1000u,
+        .idle_core_mask = 0,
+        .trigger_panic = true,   // reset, do not just complain
+    };
+    // Already initialised by the Arduino core on some builds; reconfigure
+    // rather than treating "already exists" as a failure.
+    if (esp_task_wdt_init(&wdt) == ESP_ERR_INVALID_STATE) {
+      esp_task_wdt_reconfigure(&wdt);
+    }
+    esp_task_wdt_add(nullptr);   // watch loop()
+    Serial.printf("[wdt] task watchdog armed, %us (no hardware failsafe on "
+                  "the TCAN1043G -- this is the only one that survives a "
+                  "hang)\n", (unsigned)WDT_TIMEOUT_S);
+  }
+
   if (g_prefs.getBool("ap", true)) {
     hublinkBegin();
     hubstreamBegin();
@@ -661,6 +709,16 @@ static void selfTestTick() {
 }
 
 void loop() {
+  // Layer 1: feed the watchdog. If loop() stops running, the chip resets and
+  // layer 2 decides what to do about it on the way back up.
+  esp_task_wdt_reset();
+
+  // FAILSAFE LAYER 3 -- MAX-AWAKE BACKSTOP. Checked every pass and cheap: it
+  // is two integer comparisons until the bus has actually been quiet for
+  // CAN_MAX_AWAKE_MS. transceiverRequestSleep() owns the invariant, including
+  // closing any file that is somehow still open at the backstop.
+  if (filestoreBusQuietMs() >= CAN_MAX_AWAKE_MS) transceiverRequestSleep();
+
   handleKeys();
   handleButton();
   webuiLoop();

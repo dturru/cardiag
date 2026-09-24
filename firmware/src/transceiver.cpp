@@ -17,9 +17,20 @@ SleepVerdict transceiverRequestSleep() {
   const FileStoreStats *fs = filestoreStats();
   const SleepVerdict v = sleepVerdict(fs->openFiles, fs->mounted,
                                       filestoreBusQuietMs(),
-                                      CAN_BUS_IDLE_CLOSE_MS);
+                                      CAN_BUS_IDLE_CLOSE_MS,
+                                      CAN_MAX_AWAKE_MS);
 
-  if (v != SLEEP_OK) {
+  // ⭐ BACKSTOP. The G variant has no tINACTIVE failsafe, so refusing forever
+  // to protect an open file means draining the battery instead. Close it and
+  // go -- the invariant is kept by closing, not by refusing.
+  if (sleepNeedsClose(v)) {
+    Serial.printf("[sleep] %s (open=%u, quiet=%lums)\n",
+                  sleepVerdictName(v), (unsigned)fs->openFiles,
+                  (unsigned long)filestoreBusQuietMs());
+    filestoreCloseActive();
+  }
+
+  if (!sleepShouldSleep(v)) {
     // Loud, because a refusal here is the thing standing between an open file
     // and a power cut. It is also cheap: this is not a hot path.
     Serial.printf("[sleep] NOT commanding sleep -- %s "

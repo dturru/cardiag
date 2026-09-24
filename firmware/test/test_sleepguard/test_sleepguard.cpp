@@ -8,7 +8,8 @@
 
 #include "sleepguard.h"
 
-static const uint32_t QUIET = 3000;   // CAN_BUS_IDLE_CLOSE_MS
+static const uint32_t QUIET = 3000;    // CAN_BUS_IDLE_CLOSE_MS
+static const uint32_t MAXAWAKE = 300000;  // CAN_MAX_AWAKE_MS, 5 min
 
 // --- the invariant ---------------------------------------------------------
 
@@ -16,34 +17,34 @@ void test_sleep_is_refused_while_a_file_is_open(void) {
   // Bus long quiet, storage fine -- and it STILL refuses, because a file is
   // open. This is the whole point.
   TEST_ASSERT_EQUAL(SLEEP_REFUSED_FILES_OPEN,
-                    sleepVerdict(1, true, 60000, QUIET));
+                    sleepVerdict(1, true, 60000, QUIET, 0));
 }
 
 void test_open_files_outrank_a_quiet_bus_however_long(void) {
   TEST_ASSERT_EQUAL(SLEEP_REFUSED_FILES_OPEN,
-                    sleepVerdict(1, true, 0xFFFFFFFFu, QUIET));
+                    sleepVerdict(1, true, 0xFFFFFFFFu, QUIET, 0));
 }
 
 void test_many_open_files_still_refuse(void) {
   TEST_ASSERT_EQUAL(SLEEP_REFUSED_FILES_OPEN,
-                    sleepVerdict(2, true, 60000, QUIET));
+                    sleepVerdict(2, true, 60000, QUIET, 0));
 }
 
 void test_sleep_allowed_once_everything_is_closed(void) {
-  TEST_ASSERT_EQUAL(SLEEP_OK, sleepVerdict(0, true, QUIET, QUIET));
+  TEST_ASSERT_EQUAL(SLEEP_OK, sleepVerdict(0, true, QUIET, QUIET, 0));
 }
 
 // --- the debounce ----------------------------------------------------------
 
 void test_a_busy_bus_refuses_even_with_no_files_open(void) {
   TEST_ASSERT_EQUAL(SLEEP_REFUSED_BUS_ACTIVE,
-                    sleepVerdict(0, true, 0, QUIET));
+                    sleepVerdict(0, true, 0, QUIET, 0));
 }
 
 void test_the_quiet_threshold_is_inclusive(void) {
   TEST_ASSERT_EQUAL(SLEEP_REFUSED_BUS_ACTIVE,
-                    sleepVerdict(0, true, QUIET - 1, QUIET));
-  TEST_ASSERT_EQUAL(SLEEP_OK, sleepVerdict(0, true, QUIET, QUIET));
+                    sleepVerdict(0, true, QUIET - 1, QUIET, 0));
+  TEST_ASSERT_EQUAL(SLEEP_OK, sleepVerdict(0, true, QUIET, QUIET, 0));
 }
 
 // --- unknown is not "fine" -------------------------------------------------
@@ -53,12 +54,12 @@ void test_an_unmounted_filestore_refuses(void) {
   // nothing is at risk -- it is an absence of evidence, and it must not read
   // as permission.
   TEST_ASSERT_EQUAL(SLEEP_REFUSED_FS_UNKNOWN,
-                    sleepVerdict(0, false, 60000, QUIET));
+                    sleepVerdict(0, false, 60000, QUIET, 0));
 }
 
 void test_unmounted_outranks_everything(void) {
   TEST_ASSERT_EQUAL(SLEEP_REFUSED_FS_UNKNOWN,
-                    sleepVerdict(5, false, 0, QUIET));
+                    sleepVerdict(5, false, 0, QUIET, 0));
 }
 
 // --- the reasons are usable in a log --------------------------------------
@@ -73,6 +74,52 @@ void test_every_verdict_has_a_distinct_readable_reason(void) {
                            sleepVerdictName(SLEEP_REFUSED_FS_UNKNOWN));
 }
 
+
+// --- the backstop ----------------------------------------------------------
+//
+// The G variant has NO tINACTIVE failsafe, so refusing forever to protect an
+// open file means flattening the battery instead. Past the backstop the answer
+// is close-then-sleep, never refuse.
+
+void test_backstop_forces_a_close_then_sleep_with_files_open(void) {
+  TEST_ASSERT_EQUAL(SLEEP_BACKSTOP_CLOSE_THEN_SLEEP,
+                    sleepVerdict(1, true, MAXAWAKE, QUIET, MAXAWAKE));
+}
+
+void test_backstop_sleeps_outright_with_nothing_open(void) {
+  TEST_ASSERT_EQUAL(SLEEP_OK,
+                    sleepVerdict(0, true, MAXAWAKE, QUIET, MAXAWAKE));
+}
+
+void test_backstop_overrides_an_unmounted_filestore(void) {
+  // Nothing is at risk if storage never mounted, and staying awake forever on
+  // an unswitched pin is the worse outcome.
+  TEST_ASSERT_EQUAL(SLEEP_OK,
+                    sleepVerdict(0, false, MAXAWAKE, QUIET, MAXAWAKE));
+}
+
+void test_below_the_backstop_normal_rules_still_apply(void) {
+  TEST_ASSERT_EQUAL(SLEEP_REFUSED_FILES_OPEN,
+                    sleepVerdict(1, true, MAXAWAKE - 1, QUIET, MAXAWAKE));
+}
+
+void test_a_zero_backstop_disables_it(void) {
+  // Explicitly opting out must keep the old behaviour rather than meaning
+  // "backstop at zero", which would sleep instantly and forever.
+  TEST_ASSERT_EQUAL(SLEEP_REFUSED_FILES_OPEN,
+                    sleepVerdict(1, true, 0xFFFFFFFFu, QUIET, 0));
+}
+
+void test_the_close_and_sleep_helpers_agree_with_the_verdict(void) {
+  TEST_ASSERT_TRUE(sleepNeedsClose(SLEEP_BACKSTOP_CLOSE_THEN_SLEEP));
+  TEST_ASSERT_FALSE(sleepNeedsClose(SLEEP_OK));
+  TEST_ASSERT_TRUE(sleepShouldSleep(SLEEP_OK));
+  TEST_ASSERT_TRUE(sleepShouldSleep(SLEEP_BACKSTOP_CLOSE_THEN_SLEEP));
+  TEST_ASSERT_FALSE(sleepShouldSleep(SLEEP_REFUSED_FILES_OPEN));
+  TEST_ASSERT_FALSE(sleepShouldSleep(SLEEP_REFUSED_BUS_ACTIVE));
+  TEST_ASSERT_FALSE(sleepShouldSleep(SLEEP_REFUSED_FS_UNKNOWN));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_sleep_is_refused_while_a_file_is_open);
@@ -84,5 +131,11 @@ int main(int, char **) {
   RUN_TEST(test_an_unmounted_filestore_refuses);
   RUN_TEST(test_unmounted_outranks_everything);
   RUN_TEST(test_every_verdict_has_a_distinct_readable_reason);
+  RUN_TEST(test_backstop_forces_a_close_then_sleep_with_files_open);
+  RUN_TEST(test_backstop_sleeps_outright_with_nothing_open);
+  RUN_TEST(test_backstop_overrides_an_unmounted_filestore);
+  RUN_TEST(test_below_the_backstop_normal_rules_still_apply);
+  RUN_TEST(test_a_zero_backstop_disables_it);
+  RUN_TEST(test_the_close_and_sleep_helpers_agree_with_the_verdict);
   return UNITY_END();
 }
