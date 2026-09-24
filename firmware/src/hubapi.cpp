@@ -170,7 +170,19 @@ static void handleSession(WebServer &srv) {
       // `free` still reads comfortable. Watching only the total means the
       // first symptom of fragmentation is a malloc returning null.
       "\"heap\":{\"free\":%lu,\"min_free\":%lu,\"largest_block\":%lu,"
-      "\"largest_block_internal\":%lu}}",
+      "\"largest_block_internal\":%lu},"
+      // ⚠ COMPILE-TIME TEST HOOKS, ALWAYS REPORTED.
+      //
+      // Emitted as an array that is EMPTY in a production build rather
+      // than omitted, so the hub can assert on it. An absent field is
+      // indistinguishable from an old firmware; an empty array is a
+      // positive statement that nothing is hooked.
+      //
+      // Any hook here changes what the device measures or writes, so a
+      // build carrying one must never be mistaken for a car build. The
+      // files such a build produces are marked synthetic independently,
+      // via MODE_SELFTEST.
+      "\"test_hooks\":[%s]}",
       (unsigned long)ls->staJoins, (unsigned long)ls->staDrops,
       (unsigned long)ls->eventDrops, (unsigned long)ls->pollDrops,
       (unsigned long)ls->joinFailures, (unsigned long)ls->apStarts,
@@ -183,7 +195,13 @@ static void handleSession(WebServer &srv) {
       // Internal SRAM specifically. PSRAM is 8 MB and would mask exhaustion of
       // the internal heap, which is what WiFi, lwIP and the WebServer actually
       // allocate from -- the pool that ran out at cycle 34.
-      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+#if defined(FSTEST_BENCH_CHANGELOG) && FSTEST_BENCH_CHANGELOG
+      "\"fstest_bench_changelog\""
+#else
+      ""
+#endif
+      );
 
   srv.send(200, "application/json", buf);
 }

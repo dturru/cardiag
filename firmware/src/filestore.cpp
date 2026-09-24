@@ -87,6 +87,12 @@ static Active g_actSnapshot;   // Tier B
 static Active g_actChanges;    // Tier A
 
 static uint32_t g_nextSnapMs = 0;
+
+// Bus-idle tracking for the clean key-off close. Written by the CAN task,
+// read by loop(); a 32-bit aligned store is atomic on this core, and being a
+// few milliseconds stale cannot matter against a 3 s threshold.
+static volatile uint32_t g_lastBusMs = 0;
+static bool g_idleClosed = false;
 static RecCsvCursor g_chgCursor = {0, false};
 
 // ---------------------------------------------------------------------------
@@ -500,6 +506,22 @@ static bool ensureOpen(Active &a, char kind) {
   return true;
 }
 
+void filestoreNoteBusActivity() {
+  g_lastBusMs = millis();
+  g_idleClosed = false;     // traffic is back; re-arm for the next key-off
+}
+
+bool filestoreIdleClosed() { return g_idleClosed; }
+
+uint32_t filestoreBusQuietMs() {
+  // No frame ever seen is NOT 'infinitely quiet'. Returning 0 means a
+  // board that has never been on a bus can never satisfy the quiet test,
+  // which is the safe reading: absence of traffic we never looked for is
+  // not evidence the trip is over.
+  if (!g_lastBusMs) return 0;
+  return (uint32_t)(millis() - g_lastBusMs);
+}
+
 void filestoreCloseActive() {
   closeActive(g_actSnapshot);
   closeActive(g_actChanges);
@@ -660,6 +682,26 @@ void filestoreLoop() {
     writeSnapshotBlock();
   }
   drainChangeLog();
+
+  // ⭐ CLEAN KEY-OFF. The bus going quiet is the only warning there is that
+  // INH is about to drop and take the 3.3 V rail with it, so everything gets
+  // closed properly NOW -- digest, .meta, rename -- while there is still
+  // power. After this, losing the rail costs literally nothing.
+  //
+  // Deliberately not reliant on flushDue(): the 10 s bound is the crash
+  // backstop, and on a normal key-off there must be nothing left to lose
+  // rather than up to ten seconds of it.
+  if (!g_idleClosed && g_lastBusMs &&
+      (uint32_t)(now - g_lastBusMs) >= CAN_BUS_IDLE_CLOSE_MS &&
+      (g_actSnapshot.open || g_actChanges.open)) {
+    const uint32_t a = g_actSnapshot.bytes, b = g_actChanges.bytes;
+    filestoreCloseActive();
+    g_idleClosed = true;
+    Serial.printf("[fs] bus idle %lums -> closed all files "
+                  "(tierB=%lu B, tierA=%lu B); safe to lose power\n",
+                  (unsigned long)(now - g_lastBusMs),
+                  (unsigned long)a, (unsigned long)b);
+  }
 
   // Bound what a power cut or a panic can cost. Both tiers, every pass.
   flushDue(g_actSnapshot, now);

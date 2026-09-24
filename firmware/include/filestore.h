@@ -146,6 +146,24 @@ void filestoreSetMode(uint8_t mode);
 // Closes whatever is open. Called before a mode change and from the API.
 void filestoreCloseActive();
 
+// Called from the CAN task on every received frame. Cheap on purpose: one
+// volatile store, because it is on the hot path at ~1,500 frames/s.
+void filestoreNoteBusActivity();
+
+// True once the bus has been quiet for CAN_BUS_IDLE_CLOSE_MS and every open
+// file has been flushed, closed, digested and renamed to .log.
+//
+// ⭐ This is the key-off guarantee. The transceiver's INH pin removes power
+// with no warning when the bus sleeps, so a trip that ends cleanly must have
+// closed its files BEFORE that happens -- the periodic flush is only the
+// backstop for a crash, never the mechanism for a normal key-off.
+bool filestoreIdleClosed();
+
+// Milliseconds since the last received frame. Feeds the go-to-sleep
+// invariant in sleepguard.h. Returns 0 if no frame has ever arrived, so a
+// board that has never seen the bus never looks 'quiet enough' to sleep.
+uint32_t filestoreBusQuietMs();
+
 const FileStoreStats *filestoreStats();
 
 // Percent of the partition in use, 0-100.

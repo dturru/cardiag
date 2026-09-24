@@ -332,6 +332,10 @@ static void canTask(void *) {
     g_frames++;
     noteId(rx.identifier, rx.extd);
 
+    // Bus activity re-arms the clean-key-off close. One volatile store; this
+    // is the ~1,500 frames/s path.
+    filestoreNoteBusActivity();
+
     // The ring always rolls, in every passive mode. You cannot decide to keep
     // the interesting thirty seconds after they have already gone past.
     recorderNoteRaw(rx);
@@ -343,7 +347,17 @@ static void canTask(void *) {
       // current in LISTEN and SELFTEST as well. feedRecorder=false: loopback
       // and listen frames must not be written into the change log, which is a
       // record of the CAR, not of the bench.
+      //
+      // ⚠ The ONE exception is env:esp32-can-x2-fstest, which exists so the
+      // retention path is reachable without a car: Tier A is fed only by the
+      // change log, so the Tier A cap -- and the unacked eviction it triggers
+      // -- cannot otherwise be exercised on a desk. The discipline above is
+      // NOT relaxed in any shipping build.
+#if defined(FSTEST_BENCH_CHANGELOG) && FSTEST_BENCH_CHANGELOG
+      snifferNote(rx, g_mode == MODE_SELFTEST);
+#else
       snifferNote(rx, false);
+#endif
       if (!g_paused) printFrame(rx);
     }
   }

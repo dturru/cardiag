@@ -185,7 +185,16 @@
 
 // One snapshot block per second. This is the sampling rate the whole storage
 // budget is built on -- changing it changes the retention projection.
+//
+// 🐛 #ifndef, NOT a bare #define. `-DFS_SNAPSHOT_PERIOD_MS=20` in the fstest
+// env was SILENTLY IGNORED because this header redefined it afterwards, so a
+// build that claimed to fill flash 50x faster filled it at the normal rate and
+// the test measured something other than what it said it did. A build flag
+// that does nothing is worse than no build flag: the run still produces
+// numbers, and they get believed.
+#ifndef FS_SNAPSHOT_PERIOD_MS
 #define FS_SNAPSHOT_PERIOD_MS 1000
+#endif
 
 // 🐛 HOW MUCH DATA A CRASH IS ALLOWED TO COST.
 //
@@ -200,6 +209,42 @@
 // can actually state: at most this many milliseconds of data, whatever the
 // write rate happens to be.
 #define FS_FLUSH_INTERVAL_MS 10000
+
+// ⭐⭐ THIS IS A DEBOUNCE, NOT A RACE.
+//
+// ❌ AN EARLIER VERSION OF THIS COMMENT WAS WRONG and the correction matters,
+// because it changes what the number is FOR. It claimed the transceiver drops
+// INH on its own when the bus goes quiet, making key-off a hard power cut the
+// firmware had to beat. It does not.
+//
+// Per the TCAN1043A-Q1 datasheet (checked 2026-09-23):
+//   * In NORMAL mode INH never drops by itself. Sleep is MCU-COMMANDED:
+//     EN high + nSTB low -> go-to-sleep -> INH off after tGOTOSLEEP, ~20-50 us.
+//   * The only automatic path is tINACTIVE (3-5 min), and only from STANDBY,
+//     as a failsafe.
+//   * tSILENCE (0.6-1.2 s) changes bus BIASING only. It does not touch INH.
+//
+// ⇒ Power cannot vanish underneath an open file unless this firmware asks it
+// to. So this constant is not a deadline to beat; it is how long the bus must
+// be quiet before we BELIEVE the trip is over. Short enough to react at
+// key-off, long enough not to rotate a file at every traffic gap.
+//
+// The invariant that replaces the imagined race is enforced in code, not by
+// this number: see sleepguard.h -- the go-to-sleep command may not be issued
+// while any file is open.
+//
+// ⚠️ VARIANT MISMATCH, UNRESOLVED. The timings above are from the
+// **TCAN1043A-Q1** datasheet. The carrier's as-built part is
+// **`TCAN1043GDRQ1`** (non-H), per vault [[Carrier Board -- Requirements and
+// BOM]] §11.1 -- a knowing substitution made when both H variants were
+// unobtainable. The ARCHITECTURAL claim (INH is MCU-commanded, never
+// automatic in normal mode) is what this design rests on and is expected to
+// hold across the family; the specific microsecond and minute figures are
+// **NOT CONFIRMED for the G variant**. Confirm against the G datasheet before
+// quoting any of them as fact. That BOM section's own lesson applies: a
+// distributor's substitution engine differentiates on the parametric it can
+// see, not on the suffix that is load-bearing in this application.
+#define CAN_BUS_IDLE_CLOSE_MS 3000
 
 // Bytes written to flash per filestore pass. LittleFS writes block-erase, and
 // a long write in loop() is a long time not serving HTTP or streaming UDP.
