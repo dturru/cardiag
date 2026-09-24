@@ -37,7 +37,11 @@
 param(
   [int]$Minutes = 30,
   [string]$Port = "COM3",
-  [int]$AckAfter = 6
+  [int]$AckAfter = 6,
+  # Unattended launch: skip the "press Enter" at the end. With nobody at the
+  # keyboard that prompt waits forever and the window never closes, which looks
+  # exactly like a hung run. Everything is already on disk by then.
+  [switch]$NoPause
 )
 
 $ErrorActionPreference = 'Stop'
@@ -237,6 +241,16 @@ Log "      $out\retention.log   (full verdicts)"
 Log "      $out\retention.csv   (per-sample, flushed live)"
 Log "      $out\serial.log      (board output + reset reason)"
 Write-Host ""
-Write-Host "Press Enter to close..." -ForegroundColor Cyan
-Read-Host
+if (-not $NoPause) {
+  Write-Host "Press Enter to close..." -ForegroundColor Cyan
+  Read-Host
+}
+# A marker file is the unattended signal that the run reached the end rather
+# than dying partway. Its absence next to a populated folder means the run was
+# cut, and the partial CSV/log are still the real data.
+Set-Content -Path (Join-Path $out 'DONE.txt') -Encoding utf8 -Value @"
+finished $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+verdict rc=$rc  ($(if ($rc -eq 0) {'PASS'} else {'FAIL or incomplete'}))
+read SUMMARY.md first
+"@
 exit $rc
