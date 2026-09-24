@@ -1,11 +1,59 @@
 # Handoff — next session
 
+## 0. Where the measurements are
+
+⚠️ **These are gitignored and therefore LOCAL TO THIS MACHINE.** `.gitignore`
+excludes `*.log` and `*.csv` because vehicle captures are a location history;
+these are storage/heap statistics with nothing sensitive in them, but the rule
+was not overridden to push them. Copied out of `%TEMP%` (which Windows may
+clear) into the repo working tree:
+
+```
+cardiag/analysis/retention-2026-09-23/
+    retention1.log / .csv   fill to 25%, nothing evicted -- baseline
+    retention2.log / .csv   THE TIER A CAP RUN -- read the CLAIM 3 verdict here
+    soak50.log   / .csv     the 50-cycle soak that found the 6.3 kB/cycle leak
+```
+
+**The CLAIM 3 verdict is at the bottom of `retention2.log`**, under a
+`RETENTION WATCH` banner. `retention_watch.py` also exits non-zero on FAIL.
+
+🔑 **The `.csv` is written only when the run COMPLETES** (in `main()`, after
+`report()`), so a killed run leaves the `.log` but no `.csv`. The log is written
+live and is the one to trust.
+
+
+
 Written 2026-09-23 with context running short. Everything here is agreed work
 that was deliberately NOT started, so it does not get half-done.
 
 ## 1. Tier A retention gap — fix to the agreed rule
 
-Status: measured in retention run 2 (see the session report). The gap is that
+### ✅ CONFIRMED — retention run 2, 2026-09-23. `retention_watch.py` exited 1.
+
+```
+[t= 1249.0] EVICTED #7 tier=A kind=changes bytes=65559 synthetic=True
+[t= 1249.0] *** first UNACKED deletion, usage 55%, warn=False ***
+[t= 1359.9] EVICTED #8 tier=A kind=changes bytes=65842 synthetic=True
+[t= 1458.3] EVICTED #9 tier=A kind=changes bytes=65884 synthetic=True
+
+usage      28% -> 55%          tier A  769,470 -> 1,586,755 B
+deleted    acked 0  unacked 3  write err 0   rows dropped 0
+
+CLAIM 3 -- warn before any unacked loss:
+  ** FAIL **: an unacked file was deleted at usage 55% with warn=False.
+```
+
+**Three unacked Tier A files — 197,285 bytes — were destroyed with `warn` still
+false, at 55% usage, 15 points below the 70% threshold.** `deleted_unacked` did
+increment, so the loss is *reported*; it is simply never *pre-warned*, which is
+exactly the ordering the rule below fixes.
+
+**CLAIM 2 remains NOT EXERCISED** — and honestly so: there were no acked files
+left to drop, so going straight to unacked was correct behaviour, not a failure.
+That is what run 3 (§1b) is for.
+
+Status: measured in retention run 2, verdict above. The gap is that
 `enforceTierACap()` evicts Tier A at 40% of the partition **independently of
 total usage**, while `storage.warn` fires at 70% of total — so an unacked Tier
 A file can be deleted with `warn` still false.
