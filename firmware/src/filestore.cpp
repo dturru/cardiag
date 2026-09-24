@@ -4,6 +4,10 @@
 #include <Preferences.h>
 #include <uri/UriBraces.h>
 #include <mbedtls/sha256.h>
+// Retention and file downloads are legitimate long operations that run inside
+// loop()'s watchdog window, so they feed it after each unit of progress. See
+// the esp_task_wdt_reset() calls below; each one documents what bought it.
+#include <esp_task_wdt.h>
 
 #include "filestore.h"
 #include "recorder.h"
@@ -397,6 +401,11 @@ static void enforceTierACap() {
     else       noteUnackedEviction(g_files[i]);
     dropEntry(i);
     recomputeUsage();
+    // Bought with progress: one file is provably gone. A full partition can
+    // put many removes plus a recomputeUsage() back to back, and this runs
+    // inside loop()'s WDT window. The loop terminates on its own -- tierABytes
+    // strictly decreases, and it breaks when no candidate remains.
+    esp_task_wdt_reset();
   }
 }
 
@@ -410,6 +419,11 @@ static void enforceRetention() {
   while (LittleFS.usedBytes() > limit && guard++ < FS_MAX_FILES) {
     if (!evictOne()) break;
     recomputeUsage();
+    // Same contract as the cap: fed only after a file was provably deleted,
+    // and `guard` bounds the loop at FS_MAX_FILES regardless. A full-disk
+    // reclaim is a legitimate long operation; rebooting through it would drop
+    // the open files it is trying to make room for.
+    esp_task_wdt_reset();
   }
   recomputeUsage();
 }
@@ -670,6 +684,14 @@ bool filestoreBegin() {
 
   // Partition is labelled "spiffs" (see partitions_cardiag_8mb.csv), which is
   // what LittleFS.begin() looks for by default.
+  //
+  // ⭐ THE FORMAT IS SAFE FROM THE WATCHDOG BY CONSTRUCTION, NOT BY LUCK.
+  // formatOnFail=true can take far longer than WDT_TIMEOUT_S on a corrupt
+  // partition, but filestoreBegin() is called from setup() and the task
+  // watchdog is not armed until AFTER setup() has got this far -- so there is
+  // no window in which a format can trip it. ⚠️ Moving the arming earlier, or
+  // moving a format into loop(), reintroduces the hazard: a watchdog firing
+  // mid-format would reboot into the same format, forever.
   if (!LittleFS.begin(/*formatOnFail=*/true)) {
     Serial.println("[fs] LittleFS mount FAILED; the logger keeps running "
                    "without persistence (rule 1) but files are not truth "
@@ -934,6 +956,18 @@ static void handleFetch(WebServer &srv) {
     if (!got) break;
     srv.sendContent((const char *)buf, got);
     left -= got;
+    // ⭐ FEED THE WATCHDOG, BUT ONLY HAVING MADE PROGRESS.
+    //
+    // This loop runs inside loop()'s WDT window and sendContent() blocks on
+    // the socket. The biggest file the partition can hold, over a marginal
+    // link, can exceed WDT_TIMEOUT_S -- and a watchdog that fires during a
+    // legitimate download reboots the board mid-transfer, forever, which is
+    // strictly worse than no watchdog.
+    //
+    // The feed is AFTER `got` bytes were actually sent, never at the top of
+    // the loop: it is bought with progress. A stall inside a single
+    // sendContent() still trips the watchdog, which is the case it is for.
+    esp_task_wdt_reset();
   }
   f.close();
 }

@@ -577,6 +577,14 @@ void setup() {
       esp_task_wdt_reconfigure(&wdt);
     }
     esp_task_wdt_add(nullptr);   // watch loop()
+    // ⚠️ ARMED HERE, DELIBERATELY LATE. filestoreBegin() above can format a
+    // corrupt LittleFS partition, which may take far longer than
+    // WDT_TIMEOUT_S; arming before it would reboot into the same format on
+    // every boot, forever. Everything slow that runs AFTER this point feeds
+    // the watchdog as it makes progress instead -- see the
+    // esp_task_wdt_reset() calls in filestore.cpp's retention and download
+    // paths. A watchdog that fires during a legitimate long operation is worse
+    // than no watchdog.
     Serial.printf("[wdt] task watchdog armed, %us (no hardware failsafe on "
                   "the TCAN1043G -- this is the only one that survives a "
                   "hang)\n", (unsigned)WDT_TIMEOUT_S);

@@ -160,9 +160,14 @@ class Watcher:
         except Exception:                             # noqa: BLE001
             return
         now = {f["index"]: f for f in files}
+        # ⚠️ REFRESH, do not only insert. A file is first seen as an OPEN .part
+        # and only later closes; caching the first sighting left every Tier A
+        # file permanently recorded as closed=false, so --ack-after never found
+        # a candidate and run 3 could not arm. The eviction record below wants
+        # the LAST known state anyway -- final size, not the size when the file
+        # was first noticed.
         for idx, f in now.items():
-            if idx not in self.seen_indices:
-                self.seen_indices[idx] = f
+            self.seen_indices[idx] = f
         gone = [i for i in self.seen_indices if i not in now]
         for i in gone:
             f = self.seen_indices.pop(i)
