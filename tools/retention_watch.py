@@ -77,6 +77,13 @@ class Watcher:
         # claim 5 can assert the NVS record outlived the wipe.
         self.baseline_lost: int | None = None
         self.failures = 0
+        # Claims whose PRECONDITION never occurred. Counted separately from
+        # failures and never folded into them: "the code did not break" and
+        # "the code never ran" are different results, and only one is evidence.
+        # Four runs in a row reported PASS while claim 2 sat unexercised,
+        # because zero failures read as success.
+        self.unexercised = 0
+        self.unexercised_claims: list[str] = []
         self.rows: list[dict] = []
         self.events: list[str] = []
         # The state at the moment each threshold was first crossed. None until
@@ -301,9 +308,22 @@ class Watcher:
               f"{last['rows_dropped']}")
 
         failures = 0
+
+        def ne(claim: str, msg: str) -> None:
+            """Record a claim whose precondition never happened.
+
+            Deliberately NOT a failure and deliberately NOT a pass. The run
+            simply never reached the state the claim is about, and the only
+            honest thing to do is say so and make the overall verdict say so
+            too -- see write_summary().
+            """
+            self.unexercised += 1
+            self.unexercised_claims.append(claim)
+            print(f"  {msg}")
+
         print("\nCLAIM 3 -- warn before any unacked loss:")
         if self.first_unacked_delete is None:
-            print("  NOT EXERCISED: no unacked file was deleted in this run.")
+            ne("3", "NOT EXERCISED: no unacked file was deleted in this run.")
         elif self.first_unacked_delete["warn"]:
             print(f"  PASS: warn was already set when the first unacked file "
                   f"went (usage {self.first_unacked_delete['usage_pct']}%).")
@@ -319,7 +339,7 @@ class Watcher:
 
         print("\nCLAIM 3b -- the loss is attributed to a tier:")
         if self.first_unacked_delete is None:
-            print("  NOT EXERCISED: nothing unacked was deleted.")
+            ne("3b", "NOT EXERCISED: nothing unacked was deleted.")
         elif not last["tier_counters_present"]:
             failures += 1
             print("  ** FAIL **: unacked data was destroyed and the session "
@@ -355,10 +375,10 @@ class Watcher:
         unacked_evs = [e for e in self.evicted if not e["acked"]]
         violations = [e for e in unacked_evs if e["acked_available"] > 0]
         if not self.evicted:
-            print("  NOT EXERCISED: nothing was deleted.")
+            ne("2", "NOT EXERCISED: nothing was deleted.")
         elif not unacked_evs:
-            print("  NOT EXERCISED as an ordering test: only acked files were "
-                  "dropped, which is the correct end of the order.")
+            ne("2", "NOT EXERCISED as an ordering test: only acked files were "
+                    "dropped, which is the correct end of the order.")
         elif violations:
             failures += 1
             v = violations[0]
@@ -366,9 +386,9 @@ class Watcher:
                   f"deleted at t={v['t']:.1f} while {v['acked_available']} "
                   f"acked file(s) were still on the disk.")
         elif not any(e["acked"] for e in self.evicted):
-            print("  NOT EXERCISED as an ordering test: no acked file was ever "
-                  "on the disk to compete, so going straight to unacked is "
-                  "correct behaviour, not a failure.")
+            ne("2", "NOT EXERCISED as an ordering test: no acked file was ever "
+                    "on the disk to compete, so going straight to unacked is "
+                    "correct behaviour, not a failure.")
             print("     Re-run with --ack-after N to create the contest.")
         else:
             n_acked = sum(1 for e in self.evicted if e["acked"])
@@ -389,11 +409,12 @@ class Watcher:
                     if (r["usage_pct"] or 0) < wp
                     and (r["lost_files_total"] or 0) > (r["loss_recorded_files"] or 0)]
         if not low_loss:
-            print(f"  NOT EXERCISED: no sample had unrecorded loss while usage "
-                  f"was under {wp}%. Either the Tier A cap never fired, or the "
-                  f"partition filled past {wp}% first -- check `usage` above. "
-                  f"This is the run's whole point, so a NOT EXERCISED here "
-                  f"means the setup needs revisiting, not that the code is ok.")
+            ne("4", f"NOT EXERCISED: no sample had unrecorded loss while usage "
+                    f"was under {wp}%. Either the Tier A cap never fired, or "
+                    f"the partition filled past {wp}% first -- check `usage` "
+                    f"above. This is the run's whole point, so a NOT EXERCISED "
+                    f"here means the setup needs revisiting, not that the code "
+                    f"is ok.")
         elif all(r["warn"] for r in low_loss):
             r = low_loss[0]
             print(f"  PASS: warn was TRUE at usage {r['usage_pct']}% (< {wp}%) "
@@ -410,7 +431,7 @@ class Watcher:
 
         print("\nCLAIM 5 -- the loss record survived the partition erase:")
         if self.baseline_lost is None:
-            print("  NOT CHECKED: no --baseline-lost given.")
+            ne("5", "NOT CHECKED: no --baseline-lost given.")
         elif (first["lost_files_total"] or 0) >= self.baseline_lost:
             print(f"  PASS: lifetime loss read {first['lost_files_total']} at "
                   f"the start of this run, against {self.baseline_lost} recorded "
@@ -436,8 +457,28 @@ class Watcher:
         last = self.rows[-1] if self.rows else {}
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("# Bench run summary\n\n")
-            fh.write(f"**VERDICT: {'PASS' if rc == 0 else 'FAIL'}** "
-                     f"({getattr(self, 'failures', '?')} failed claim(s))\n\n")
+            # 🔑 THREE-VALUED ON PURPOSE. "0 failed claims" is not a pass when
+            # the claim under test never ran -- that reading is what let four
+            # consecutive runs report PASS while claim 2 sat unexercised. A run
+            # that proved nothing says INCONCLUSIVE, at the top, where it is
+            # read.
+            nex = getattr(self, "unexercised", 0)
+            claims = ", ".join(getattr(self, "unexercised_claims", []))
+            if rc != 0:
+                verdict = "FAIL"
+            elif nex:
+                verdict = "INCONCLUSIVE"
+            else:
+                verdict = "PASS"
+            fh.write(f"**VERDICT: {verdict}** "
+                     f"({getattr(self, 'failures', '?')} failed, "
+                     f"{nex} NOT EXERCISED)\n\n")
+            if nex:
+                fh.write(f"> ⚪ **Nothing failed, but claim(s) {claims} never "
+                         f"ran** — the run did not reach the state they are "
+                         f"about, so they are neither passed nor broken. "
+                         f"Fix the setup and re-run; do not read this as "
+                         f"green.\n\n")
             for k, v in meta.items():
                 fh.write(f"- **{k}:** {v}\n")
             fh.write(f"- **samples:** {len(self.rows)}\n")

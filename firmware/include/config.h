@@ -177,7 +177,21 @@
 //
 // ⚠ Was FS_TIER_C_MAX_PCT. The change log is Tier A -- deduplicated raw frames
 // -- not Tier C, which is the trip bookends. See filestore.h.
+//
+// 🐛 #ifndef, NOT a bare #define -- THE SAME BUG AS FS_SNAPSHOT_PERIOD_MS BELOW,
+// one define later, found the same way. `-DFS_TIER_A_MAX_PCT=10` in the captest
+// env was SILENTLY IGNORED because this header redefined it afterwards, so the
+// 2026-09-24 18:40 run believed the cap was 406 kB (10%) when it was still
+// 1,625 kB (40%). Tier A reached 692 kB -- past the cap it was testing, nowhere
+// near the cap it actually had -- the run reported PASS with zero failed
+// claims, and claim 2 was NOT EXERCISED for the FOURTH time.
+//
+// A build flag that does nothing is worse than no build flag: the run still
+// produces numbers, and they get believed. Audited 2026-09-24: this was the
+// only remaining bare #define among the macros any env sets with -D.
+#ifndef FS_TIER_A_MAX_PCT
 #define FS_TIER_A_MAX_PCT 40
+#endif
 
 // Report usage on /api/v1/session well before retention has to delete
 // anything. Protocol 2.3: deletion is never the first the hub hears of it.

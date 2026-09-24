@@ -775,6 +775,19 @@ bool filestoreBegin() {
                 (unsigned long)LittleFS.totalBytes(),
                 g_fileCount, g_st.openFiles,
                 (unsigned long)g_st.nextIndex, (long)g_st.ackedThrough);
+
+  // ⭐ THE BOARD STATES ITS OWN EFFECTIVE LIMITS, so no run has to infer them
+  // from the env it believes it flashed. A `-D` flag that a header quietly
+  // redefines is invisible in every artifact a bench run produces -- it cost
+  // claim 2 a fourth wasted run on 2026-09-24. serial.log is captured for the
+  // whole window, so this line makes that class of failure legible.
+  Serial.printf("[fs] EFFECTIVE CAPS: tier A max %u%% = %lu B, warn at %u%%, "
+                "snapshot %lu ms\n",
+                (unsigned)FS_TIER_A_MAX_PCT,
+                (unsigned long)((uint64_t)usableBytes() * FS_TIER_A_MAX_PCT / 100),
+                (unsigned)FS_WARN_USAGE_PCT,
+                (unsigned long)FS_SNAPSHOT_PERIOD_MS);
+
   if (g_st.openFiles) {
     Serial.printf("[fs] %u file(s) left open by an earlier boot -- crash "
                   "artifacts. They are listed closed=false and the hub syncs "
