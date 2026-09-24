@@ -33,12 +33,12 @@ Commits: cardiag `9b5a26b`, `4290d6f`, `93a36c1` · carhub `ac24757`, `ae9b34e`.
 | §1 Tier A "never silent" | **FIXED** — `filestoreWarn()`, per-tier counters, hub/health, dashboard |
 | §1b run 3 ordering | **CLAIM 2 NOW PASSES ON HARDWARE** at the `evictOne()` level → `analysis/retention-2026-09-24/claim2-hardware-2026-09-24.md`. The **cap's own** choice is still unexercised — see below |
 | §2 WDT vs long ops | **FIXED** in code; format case proved safe by construction |
-| §3 key-off sync delay | **DOCUMENTED** (protocol §2.3.1) + `pending_unacked` on the dashboard |
+| §3 key-off sync delay | **DOCUMENTED** (protocol §2.3.3) + `pending_unacked` on the dashboard |
 | §4 MEMORY.md compaction | **DONE** — 24.4 kB → 16.7 kB, every pointer grep-verified first |
 
 ### What was verified ON HARDWARE (board on COM3, Wi-Fi `192.168.137.64`)
 
-- `unacked_evicted_files` / `unacked_evicted_bytes` are live and **attribution
+- `lost_files` / `lost_bytes` (then named `unacked_evicted_*`) are live and **attribution
   is exact**: `deleted_unacked=6` with `{A:4, B:2}` summing to 6.
   The Tier B loss (131,256 B) was **invisible in the old total** — it is the
   irreplaceable class and the single number could not distinguish it.
@@ -100,7 +100,35 @@ the real one.
 
 ---
 
-## 🚨 1. THE BIGGEST THING FOUND TODAY — the loss counters are volatile
+## ✅ RESOLVED 2026-09-24 (later) — the volatile-counter hole is closed
+
+cardiag `5211463` · carhub `a7075bf`. The section below is kept for the
+reasoning; the decision and the outcome are here.
+
+**Decision taken:** persist cumulative per-tier counters in NVS, monotonic,
+never reset, written only on change. The hub records the delta each sync with a
+timestamp and owns the history; the dashboard shows "data lost since X" from the
+hub's record. **`warn` derives from `lost_files_total > loss_recorded_files`,
+both in NVS**, so key-off cannot erase it.
+
+**Hardware-verified:** boot_id 29 → 30 with `deleted_unacked` 9 → 0 (the old
+evidence-losing behaviour) while `lost_files_total` went 9 → **16** — it
+survived the reboot *and* kept counting. Persisted again across a second reboot.
+Loss ack accepted at 16, an over-ack of 99999 clamped to 16, a backwards ack of
+0 held at 16.
+
+Also shipped: **contract tests against a real board** (`tests/fixtures/`,
+26 tests). They caught two live bugs on their first run — `retention_summary()`
+still reading the pre-rename `unacked_evicted_*` keys, and never passing `warn`
+through at all. ⚠️ **Re-capture those fixtures from hardware when the firmware's
+JSON changes; never hand-edit them to make a test pass.**
+
+🔴 **Reboot cause from the original observation is STILL UNCONFIRMED** — capture
+serial alongside the HTTP poll on the next bench run; the boot line prints the
+reset reason. If it was the task watchdog, that independently confirms the §2
+fix was needed.
+
+## 🗄 1. (HISTORICAL) THE BIGGEST THING FOUND TODAY — the loss counters were volatile
 
 Run 3's rows read `del a/u = 0/22` at t=8.8 and `0/0` from t≈288: **the board
 rebooted and the counters started from zero.** Confirmed in the source —
@@ -111,7 +139,7 @@ rebooted and the counters started from zero.** Confirmed in the source —
 `deleted_unacked` as the field to act on, and the new `warn` latches on it — and
 **the board power-cycles at every key-off**, because INH removes power when the
 bus sleeps. The losing sequence is the *normal* one: retention destroys unacked
-data mid-trip → the hub does not poll before key-off (expected, per §2.3.1) →
+data mid-trip → the hub does not poll before key-off (expected, per §2.3.3) →
 power drops → next ignition reports a clean `deleted_unacked = 0`. The data is
 still gone and nothing says so.
 
@@ -128,9 +156,25 @@ exactly §2's hypothesis — or an unrelated crash. **Capture serial alongside t
 HTTP poll next run**; the firmware prints the reset reason on boot and settles it
 in one line. If it was the watchdog, that independently confirms the §2 fix.
 
-## 2. Remaining work
+## 🔬 2. QUEUED FOR THE NEXT BENCH SESSION
 
-### 1a. Finish retention run 3 on a clean partition
+**One run, two open questions, and a clean partition answers both.** Both are
+blocked for the same reason: the bench partition is Tier B dominant (~3.1 MB of
+4.06 MB) and sits at 87-91%, so `enforceTierACap()` is never entered and usage
+never drops below the 70% warn threshold.
+
+1. **`enforceTierACap()`'s own acked-before-unacked choice.** Claim 2 is verified
+   at the `evictOne()` level, not inside the cap.
+2. **The low-usage `warn` arm** — warn set by an unacked eviction while total
+   usage is still well under `warn_pct`.
+
+Add to the run: **capture serial alongside the HTTP poll**, to settle whether
+the 09-24 mid-run reboot was the task watchdog firing during eviction.
+
+⏸ **The WDT timing margin waits for the car** — the bench cannot produce a
+marginal link on demand.
+
+### 2a. Recipe: retention run 3 on a clean partition
 Per the recipe above. The pass conditions are unchanged:
 
 - acked Tier A files are evicted **first**
@@ -143,7 +187,7 @@ Per the recipe above. The pass conditions are unchanged:
 (was: which counter moved first) and adds **claim 3b**, which asserts the
 per-tier counters sum to `deleted_unacked`.
 
-### 1b. Measure the watchdog margin
+### 2b. (DEFERRED — waits for the car) Measure the watchdog margin
 §2's fix is structural: every long loop now feeds the WDT after a unit of
 provable progress, and the format case is safe because the watchdog is armed
 after `filestoreBegin()`. **What is NOT measured is the margin** — how close a
@@ -153,7 +197,7 @@ produce a marginal link on demand. Options: throttle at the AP, or instrument
 `/api/v1/session` alongside the heap low-water mark, which is the same trick and
 needs no special network.
 
-## 2. Unchanged from before
+## 3. Unchanged from before
 
 - 🔴 `cea5bcd` (Altium hardware design) is in neither repo; needs Diego's
   interactive Altium 365 credentials.
