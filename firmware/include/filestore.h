@@ -126,21 +126,49 @@ struct FileStoreStats {
   uint32_t tierABytes;
   uint32_t tierBBytes;
   uint32_t tierCBytes;
+  // SINCE BOOT. Unchanged meaning, kept for protocol compatibility.
   uint32_t deletedAcked;
-  uint32_t deletedUnacked;   // >0 means data was lost to retention
-  // Per-tier breakdown of that loss, indexed by fsTierSlot(): 0=A, 1=B, 2=C.
+  uint32_t deletedUnacked;
+
+  // ⭐ LIFETIME, MONOTONIC, NVS-BACKED. Per tier, indexed by fsTierSlot().
   //
-  // `deletedUnacked` alone says data was destroyed; it does not say WHAT. The
-  // tiers are not interchangeable -- Tier A is collectable again on the next
-  // drive, Tier B is a month that cannot be re-measured -- so the same count
-  // means very different things depending on where it landed, and a single
-  // total cannot tell them apart.
-  uint32_t unackedEvictedBytes[3];
-  uint16_t unackedEvictedFiles[3];
+  // Two separate reasons these exist and are not just `deletedUnacked`:
+  //
+  // 1. PER TIER, because the tiers are not interchangeable. Tier A is
+  //    collectable again on the next drive; Tier B is a month that cannot be
+  //    re-measured. One total cannot tell them apart.
+  //
+  // 2. LIFETIME AND PERSISTENT, because the since-boot counters are erased by
+  //    exactly the event that ends every trip. The transceiver's INH pin
+  //    removes power at key-off, so a loss during a drive -- whose files the
+  //    hub will not collect until the NEXT ignition (protocol 2.3.1) -- was
+  //    reported to nobody and then forgotten. The logger came back up saying
+  //    deleted_unacked = 0 while the data was still missing. Measured
+  //    2026-09-24: a mid-run reboot reset a count of 22 to 0.
+  //
+  // These only ever count up. They are never reset, including by a format --
+  // a format is the most destructive thing this device does, so it is the
+  // last moment to forget that data was lost.
+  uint64_t lostBytes[3];
+  uint32_t lostFiles[3];
+
+  // The hub's watermark over lostFiles, also lifetime and NVS-backed: "I have
+  // recorded this many lost files." Not an acknowledgement that the data came
+  // back -- it cannot -- but that the loss is now written down somewhere that
+  // survives. `warn` stays true until this catches up, so a key-off can no
+  // longer erase the warning.
+  uint32_t lostAckedFiles;
+
   uint32_t writeErrors;
   uint32_t rowsDropped;      // change-log appends the recorder refused
   bool     mounted;
 };
+
+// Total lost files across all tiers, lifetime. The quantity the hub's
+// watermark is compared against.
+static inline uint32_t fsLostFilesTotal(const struct FileStoreStats *s) {
+  return s->lostFiles[0] + s->lostFiles[1] + s->lostFiles[2];
+}
 
 // Index into the per-tier arrays above. Anything unrecognised lands in A,
 // matching fsTierForKind()'s default.
@@ -205,9 +233,22 @@ uint8_t filestoreUsagePct();
 // 197,285 bytes, were destroyed at 55% usage with `warn` still false, because
 // enforceTierACap() evicts at 40% of the PARTITION while the warning fires at
 // 70% of TOTAL. Evicting unacked data at the cap is allowed; doing it silently
-// is not. So warn is now true if EITHER the partition is filling OR anything
-// unacked has already been destroyed, whatever the usage was at the time.
+// is not. So warn is true if EITHER the partition is filling OR data has been
+// lost that the hub has not yet recorded.
+//
+// ⭐ The second arm is `fsLostFilesTotal() > lostAckedFiles`, and BOTH sides of
+// that comparison live in NVS. A latched RAM flag would have been erased by
+// the key-off that ends every trip -- the same power cut that erases the
+// since-boot counters. Deriving the warning from two PERSISTENT numbers means
+// it survives until the hub actually writes the loss down.
 bool filestoreWarn();
+
+// Records that the hub has durably stored the loss record up to this many
+// lifetime lost files (protocol 2.3). A watermark: idempotent, clamped to the
+// real total, and it never moves backwards -- a hub that lost its own state
+// must not be able to silence a warning it never recorded. Returns the
+// watermark in force afterwards.
+uint32_t filestoreAckLoss(uint32_t throughFiles);
 
 // Registers /api/v1/files, /api/v1/files/<index> and /api/v1/files/ack.
 void filestoreRegister(WebServer &srv);

@@ -308,16 +308,34 @@ static void noteUnackedEviction(const FileEntry &e) {
   const char tier = fsTierForKind(e.kind);
   const uint8_t slot = fsTierSlot(tier);
   g_st.deletedUnacked++;
-  g_st.unackedEvictedBytes[slot] += e.bytes;
-  g_st.unackedEvictedFiles[slot]++;
+  g_st.lostBytes[slot] += e.bytes;
+  g_st.lostFiles[slot]++;
+
+  // ⭐ PERSIST IMMEDIATELY, and only the tier that changed -- two keys, not
+  // six. This is the write that makes the loss survive key-off, so it has to
+  // happen here rather than at some tidier later point: INH can remove power
+  // between this eviction and the next loop() pass.
+  //
+  // On wear: a write happens ONLY when unacked data is destroyed. That is
+  // supposed to be rare, and if it is frequent enough for NVS wear to matter
+  // then the device is destroying uncollected data continuously, which is the
+  // bug to fix rather than a reason to stop recording it.
+  char key[8];
+  snprintf(key, sizeof(key), "lf%u", (unsigned)slot);
+  g_fsPrefs.putULong(key, g_st.lostFiles[slot]);
+  snprintf(key, sizeof(key), "lb%u", (unsigned)slot);
+  g_fsPrefs.putULong64(key, g_st.lostBytes[slot]);
   // Loud on purpose. This line is the only trace a field unit leaves of data
   // the hub will now never receive.
   Serial.printf("[fs] *** EVICTED UNACKED TIER %c (%s) #%lu, %lu B -- DATA LOST "
-                "(tier %c total now %u files / %lu B) ***\n",
+                "(tier %c LIFETIME now %lu files / %llu B; hub has recorded "
+                "%lu of %lu) ***\n",
                 tier, fsKindName(e.kind), (unsigned long)e.index,
                 (unsigned long)e.bytes, tier,
-                (unsigned)g_st.unackedEvictedFiles[slot],
-                (unsigned long)g_st.unackedEvictedBytes[slot]);
+                (unsigned long)g_st.lostFiles[slot],
+                (unsigned long long)g_st.lostBytes[slot],
+                (unsigned long)g_st.lostAckedFiles,
+                (unsigned long)fsLostFilesTotal(&g_st));
 }
 
 // Deletes exactly one file, choosing by the protocol's order. Returns false
@@ -682,6 +700,37 @@ bool filestoreBegin() {
   memset(&g_st, 0, sizeof(g_st));
   g_st.ackedThrough = -1;
 
+  // ⚠️ NVS FIRST, BEFORE THE MOUNT, and deliberately so.
+  //
+  // The loss record must be correct even on the paths where the filesystem is
+  // not. A failed mount returns early below, and a corrupt partition gets
+  // formatted -- both are exactly when "has this device ever destroyed
+  // uncollected data?" matters most, and loading these afterwards would have
+  // reported a confident zero. NVS lives in its own partition, so a LittleFS
+  // format does not touch it: the counters survive the most destructive thing
+  // this device does, which is the point.
+  g_fsPrefs.begin("cardiagfs", false);
+  g_st.nextIndex    = g_fsPrefs.getULong("idx", 0);
+  g_st.ackedThrough = (int32_t)g_fsPrefs.getLong("ack", -1);
+  for (uint8_t s = 0; s < 3; s++) {
+    char key[8];
+    snprintf(key, sizeof(key), "lf%u", (unsigned)s);
+    g_st.lostFiles[s] = g_fsPrefs.getULong(key, 0);
+    snprintf(key, sizeof(key), "lb%u", (unsigned)s);
+    g_st.lostBytes[s] = g_fsPrefs.getULong64(key, 0);
+  }
+  g_st.lostAckedFiles = g_fsPrefs.getULong("lostack", 0);
+  if (const uint32_t lost = fsLostFilesTotal(&g_st)) {
+    Serial.printf("[fs] LIFETIME LOSS RECORD: %lu file(s) of uncollected data "
+                  "destroyed (A=%lu B=%lu C=%lu); hub has recorded %lu.%s\n",
+                  (unsigned long)lost,
+                  (unsigned long)g_st.lostFiles[0],
+                  (unsigned long)g_st.lostFiles[1],
+                  (unsigned long)g_st.lostFiles[2],
+                  (unsigned long)g_st.lostAckedFiles,
+                  lost > g_st.lostAckedFiles ? "  *** WARN STAYS SET ***" : "");
+  }
+
   // Partition is labelled "spiffs" (see partitions_cardiag_8mb.csv), which is
   // what LittleFS.begin() looks for by default.
   //
@@ -700,10 +749,6 @@ bool filestoreBegin() {
     return false;
   }
   g_st.mounted = true;
-
-  g_fsPrefs.begin("cardiagfs", false);
-  g_st.nextIndex = g_fsPrefs.getULong("idx", 0);
-  g_st.ackedThrough = (int32_t)g_fsPrefs.getLong("ack", -1);
 
   if (!LittleFS.exists(FS_DIR)) LittleFS.mkdir(FS_DIR);
   scanDir();
@@ -793,12 +838,36 @@ uint8_t filestoreUsagePct() {
 }
 
 bool filestoreWarn() {
-  // Either arm is sufficient, and the second one is the fix from retention
-  // run 2: once anything unacked has been destroyed the warning is true
-  // forever, regardless of what usage happens to be now. A latched flag would
-  // be equivalent -- deletedUnacked already only ever counts up, so it IS the
-  // latch, and keeping one source of truth means the two cannot disagree.
-  return filestoreUsagePct() >= FS_WARN_USAGE_PCT || g_st.deletedUnacked > 0;
+  // Arm 1: the partition is filling. Arm 2: data has been destroyed that the
+  // hub has not yet written down.
+  //
+  // ⭐ Arm 2 compares two NVS-backed lifetime numbers, NOT a RAM flag. An
+  // earlier version latched on `deletedUnacked > 0`, which was erased by the
+  // key-off that ends every trip -- the warning died with the counter and the
+  // next ignition reported all clear while the data was still missing.
+  //
+  // It clears only when the hub says it has recorded the loss, which is the
+  // right condition: the point was never "somebody saw a flag", it was "the
+  // loss is written down somewhere that survives this device".
+  return filestoreUsagePct() >= FS_WARN_USAGE_PCT ||
+         fsLostFilesTotal(&g_st) > g_st.lostAckedFiles;
+}
+
+uint32_t filestoreAckLoss(uint32_t throughFiles) {
+  // A watermark, like the file ack: idempotent and monotonic. Clamped to the
+  // real total so a hub cannot acknowledge losses that have not happened, and
+  // never moved backwards -- a hub that lost its own state must not be able to
+  // silence a warning for a loss it never recorded.
+  const uint32_t total = fsLostFilesTotal(&g_st);
+  if (throughFiles > total) throughFiles = total;
+  if (throughFiles > g_st.lostAckedFiles) {
+    g_st.lostAckedFiles = throughFiles;
+    g_fsPrefs.putULong("lostack", throughFiles);
+    Serial.printf("[fs] hub recorded the loss of %lu file(s) of %lu; warn %s\n",
+                  (unsigned long)throughFiles, (unsigned long)total,
+                  filestoreWarn() ? "STAYS SET" : "clears");
+  }
+  return g_st.lostAckedFiles;
 }
 
 int32_t filestoreAck(int32_t throughIndex) {
@@ -988,13 +1057,32 @@ static void handleAck(WebServer &srv) {
   const long through = (c >= 0) ? atol(body.c_str() + c + 1) : -1;
   const int32_t now = filestoreAck((int32_t)through);
 
+  // OPTIONAL second watermark, over the LIFETIME loss record rather than over
+  // files: "I have durably stored the loss record up to N lost files."
+  //
+  // It rides on this endpoint because the hub already calls it every sync and
+  // it is already authenticated -- a separate endpoint would be a second round
+  // trip and a second thing to get wrong. Omitting the field is not an
+  // acknowledgement: a hub that does not know about loss records leaves the
+  // warning exactly where it is, which is the safe default.
+  uint32_t lossAcked = g_st.lostAckedFiles;
+  const int lk = body.indexOf("\"loss_recorded_files\"");
+  if (lk >= 0) {
+    const int lc = body.indexOf(':', lk);
+    if (lc >= 0) lossAcked = filestoreAckLoss(
+        (uint32_t)strtoul(body.c_str() + lc + 1, nullptr, 10));
+  }
+
   enforceRetention();
 
-  char buf[160];
+  char buf[240];
   snprintf(buf, sizeof(buf),
            "{\"ok\":true,\"acked_through\":%ld,\"requested\":%ld,"
-           "\"files\":%u,\"usage_pct\":%u}",
-           (long)now, through, g_fileCount, filestoreUsagePct());
+           "\"files\":%u,\"usage_pct\":%u,"
+           "\"lost_files_total\":%lu,\"loss_recorded_files\":%lu,\"warn\":%s}",
+           (long)now, through, g_fileCount, filestoreUsagePct(),
+           (unsigned long)fsLostFilesTotal(&g_st), (unsigned long)lossAcked,
+           filestoreWarn() ? "true" : "false");
   srv.send(200, "application/json", buf);
 }
 

@@ -143,6 +143,15 @@ static void handleSession(WebServer &srv) {
   // could destroy unacked data at 55% usage with warn still false (retention
   // run 2, 2026-09-23). A consumer must NOT reconstruct it from usage_pct and
   // warn_pct -- those two still describe only the total-usage arm of the rule.
+  //
+  // 🔑 TWO DIFFERENT BASES IN THIS BLOCK, and mixing them up is the trap:
+  //   deleted_acked / deleted_unacked   SINCE BOOT   (RAM, reset every key-off)
+  //   lost_files / lost_bytes           LIFETIME     (NVS, monotonic, per tier)
+  // They will NOT agree, and that is correct: a reboot zeroes the first pair
+  // and never the second. `lost_*` is the one to act on, because the board
+  // power-cycles at every key-off. `loss_recorded_files` is the hub's own
+  // watermark over lost_files_total -- warn's second arm is simply
+  // lost_files_total > loss_recorded_files.
   const FileStoreStats *fs = filestoreStats();
   n = jsonAppend(buf, sizeof(buf), n,
       "\"storage\":{\"mounted\":%s,\"used\":%lu,\"total\":%lu,"
@@ -151,8 +160,9 @@ static void handleSession(WebServer &srv) {
       "\"acked_through\":%ld,"
       "\"tier_a_bytes\":%lu,\"tier_b_bytes\":%lu,\"tier_c_bytes\":%lu,"
       "\"deleted_acked\":%lu,\"deleted_unacked\":%lu,"
-      "\"unacked_evicted_bytes\":{\"A\":%lu,\"B\":%lu,\"C\":%lu},"
-      "\"unacked_evicted_files\":{\"A\":%u,\"B\":%u,\"C\":%u},"
+      "\"lost_bytes\":{\"A\":%llu,\"B\":%llu,\"C\":%llu},"
+      "\"lost_files\":{\"A\":%lu,\"B\":%lu,\"C\":%lu},"
+      "\"lost_files_total\":%lu,\"loss_recorded_files\":%lu,"
       "\"write_errors\":%lu,\"rows_dropped\":%lu},",
       fs->mounted ? "true" : "false",
       (unsigned long)fs->usedBytes, (unsigned long)fs->totalBytes,
@@ -163,12 +173,14 @@ static void handleSession(WebServer &srv) {
       (unsigned long)fs->tierABytes, (unsigned long)fs->tierBBytes,
       (unsigned long)fs->tierCBytes,
       (unsigned long)fs->deletedAcked, (unsigned long)fs->deletedUnacked,
-      (unsigned long)fs->unackedEvictedBytes[0],
-      (unsigned long)fs->unackedEvictedBytes[1],
-      (unsigned long)fs->unackedEvictedBytes[2],
-      (unsigned)fs->unackedEvictedFiles[0],
-      (unsigned)fs->unackedEvictedFiles[1],
-      (unsigned)fs->unackedEvictedFiles[2],
+      (unsigned long long)fs->lostBytes[0],
+      (unsigned long long)fs->lostBytes[1],
+      (unsigned long long)fs->lostBytes[2],
+      (unsigned long)fs->lostFiles[0],
+      (unsigned long)fs->lostFiles[1],
+      (unsigned long)fs->lostFiles[2],
+      (unsigned long)fsLostFilesTotal(fs),
+      (unsigned long)fs->lostAckedFiles,
       (unsigned long)fs->writeErrors, (unsigned long)fs->rowsDropped);
 
   // Link transition counters, for the AP<->STA soak test. A fault that
