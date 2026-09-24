@@ -100,7 +100,35 @@ the real one.
 
 ---
 
-## 1. Remaining work
+## 🚨 1. THE BIGGEST THING FOUND TODAY — the loss counters are volatile
+
+Run 3's rows read `del a/u = 0/22` at t=8.8 and `0/0` from t≈288: **the board
+rebooted and the counters started from zero.** Confirmed in the source —
+`filestoreBegin()` memsets `g_st` and restores only `idx` and `ack` from NVS, so
+`deletedAcked`, `deletedUnacked` and the new per-tier counters are RAM only.
+
+**This undercuts part of what was just built.** Protocol §2.3 names
+`deleted_unacked` as the field to act on, and the new `warn` latches on it — and
+**the board power-cycles at every key-off**, because INH removes power when the
+bus sleeps. The losing sequence is the *normal* one: retention destroys unacked
+data mid-trip → the hub does not poll before key-off (expected, per §2.3.1) →
+power drops → next ignition reports a clean `deleted_unacked = 0`. The data is
+still gone and nothing says so.
+
+**Deliberately not fixed** — persisting on a path that can fire repeatedly costs
+flash wear, so it is a design call, not an obvious yes. Preferred option:
+**persist on the 0 → non-zero transition only**, so the durable fact is "data has
+been lost since this device was last serviced" rather than the running count.
+Full reasoning and the alternatives → `analysis/retention-2026-09-24/claim2-hardware-2026-09-24.md`.
+
+🔴 **Reboot cause UNCONFIRMED.** Either the task watchdog fired during eviction —
+the board was on the fstest build flashed *before* the §2 WDT fix, so the
+retention path fed nothing, at 87-89% with eviction running constantly, which is
+exactly §2's hypothesis — or an unrelated crash. **Capture serial alongside the
+HTTP poll next run**; the firmware prints the reset reason on boot and settles it
+in one line. If it was the watchdog, that independently confirms the §2 fix.
+
+## 2. Remaining work
 
 ### 1a. Finish retention run 3 on a clean partition
 Per the recipe above. The pass conditions are unchanged:

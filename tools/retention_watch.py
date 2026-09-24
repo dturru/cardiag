@@ -177,8 +177,22 @@ class Watcher:
             # was collected -- that is what makes the order checkable.
             wm = self.rows[-1].get("acked_through") if self.rows else None
             was_acked = wm is not None and i <= wm
+            # 🔑 How many ACKED files were still on disk AT THIS MOMENT.
+            #
+            # Claim 2 is "unacked goes only when nothing acked is left", and
+            # that has to be judged against the watermark IN FORCE WHEN THE
+            # DELETION HAPPENED. Ack status is not a property of a file, it is
+            # a property of a file at a time: a mid-run ack turns dozens of
+            # files from unacked to acked at once. Comparing a later acked
+            # eviction against an earlier unacked one without this produces a
+            # false FAIL -- those files were not acked yet when the earlier
+            # one went.
+            acked_available = sum(
+                1 for j in self.seen_indices
+                if wm is not None and j <= wm and j != i)
             self.evicted.append({"t": t, "index": i, "tier": f.get("tier"),
-                                 "bytes": f.get("bytes"), "acked": was_acked})
+                                 "bytes": f.get("bytes"), "acked": was_acked,
+                                 "acked_available": acked_available})
             self.events.append(
                 f"[t={t:7.1f}] EVICTED "
                 f"#{i} tier={f.get('tier')} kind={f.get('kind')} "
@@ -286,36 +300,37 @@ class Watcher:
                       f"counters sum to {counted}. One eviction path is not "
                       f"going through the shared accounting.")
 
-        # Claim 2 is judged on the observed SEQUENCE, not on which counter
-        # moved first. The counters only say how many of each went; the
-        # sequence says whether an unacked file was destroyed while an acked
-        # one was still sitting there, which is the actual claim.
+        # Claim 2 is judged on the observed SEQUENCE, and on the watermark that
+        # was IN FORCE at each deletion -- never on a later one. A mid-run ack
+        # reclassifies dozens of files at once, so "an acked file was deleted
+        # after this unacked one" is not evidence of anything by itself.
+        #
+        # The violation is narrow and specific: an unacked file was destroyed
+        # WHILE an acked file was sitting on the disk AT THAT MOMENT.
         print("\nCLAIM 2 -- acked goes before unacked:")
-        first_unacked_ev = next((e for e in self.evicted if not e["acked"]), None)
-        acked_after_unacked = [
-            e for e in self.evicted
-            if e["acked"] and first_unacked_ev and e["t"] > first_unacked_ev["t"]]
+        unacked_evs = [e for e in self.evicted if not e["acked"]]
+        violations = [e for e in unacked_evs if e["acked_available"] > 0]
         if not self.evicted:
             print("  NOT EXERCISED: nothing was deleted.")
-        elif first_unacked_ev is None:
+        elif not unacked_evs:
             print("  NOT EXERCISED as an ordering test: only acked files were "
                   "dropped, which is the correct end of the order.")
-        elif not self.ack_after and not self.first_acked_delete:
-            print("  NOT EXERCISED as an ordering test: there were no acked "
-                  "files to drop, so going straight to unacked is correct.")
-            print("     Re-run with --ack-after N to create the contest.")
-        elif acked_after_unacked:
+        elif violations:
             failures += 1
-            print(f"  ** FAIL **: unacked #{first_unacked_ev['index']} went at "
-                  f"t={first_unacked_ev['t']:.1f}, but "
-                  f"{len(acked_after_unacked)} acked file(s) were still on "
-                  f"disk and were only deleted afterwards "
-                  f"(#{acked_after_unacked[0]['index']} at "
-                  f"t={acked_after_unacked[0]['t']:.1f}).")
+            v = violations[0]
+            print(f"  ** FAIL **: unacked #{v['index']} (tier {v['tier']}) was "
+                  f"deleted at t={v['t']:.1f} while {v['acked_available']} "
+                  f"acked file(s) were still on the disk.")
+        elif not any(e["acked"] for e in self.evicted):
+            print("  NOT EXERCISED as an ordering test: no acked file was ever "
+                  "on the disk to compete, so going straight to unacked is "
+                  "correct behaviour, not a failure.")
+            print("     Re-run with --ack-after N to create the contest.")
         else:
             n_acked = sum(1 for e in self.evicted if e["acked"])
-            print(f"  PASS: {n_acked} acked file(s) were exhausted before "
-                  f"unacked #{first_unacked_ev['index']} was touched.")
+            print(f"  PASS: every unacked deletion happened with no acked file "
+                  f"left on the disk, and {n_acked} acked file(s) were taken "
+                  f"in preference once they existed.")
         return 1 if failures else 0
 
 
