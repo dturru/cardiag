@@ -88,6 +88,7 @@ def main(argv=None) -> int:
                     print(line, flush=True)
                 if fh:
                     fh.write(line + "\n")
+                    fh.flush()
                 next_send = now + args.gap
 
             chunk = ser.read(4096)
@@ -101,7 +102,13 @@ def main(argv=None) -> int:
                 if not args.quiet:
                     print(line, flush=True)
                 if fh:
+                    # ⭐ FLUSH EVERY LINE. An unattended run can be killed at any
+                    # moment, and a buffered tail is the part you most want --
+                    # the lines just before it died. Also lets another process
+                    # tail this file live, which is how the runner discovers the
+                    # board's IP while the capture is still going.
                     fh.write(line + "\n")
+                    fh.flush()
     finally:
         if buf:
             tail = f"[{time.monotonic() - t0:8.3f}] {buf.decode('utf-8', 'replace')}"

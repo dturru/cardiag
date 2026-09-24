@@ -73,6 +73,10 @@ class Watcher:
         self.token = token
         self.acked_at: dict | None = None
         self.acked_index: int | None = None
+        # Lifetime loss total observed BEFORE the partition was erased, so
+        # claim 5 can assert the NVS record outlived the wipe.
+        self.baseline_lost: int | None = None
+        self.failures = 0
         self.rows: list[dict] = []
         self.events: list[str] = []
         # The state at the moment each threshold was first crossed. None until
@@ -84,6 +88,35 @@ class Watcher:
         # Eviction order as observed, so claim 2 is judged on the sequence and
         # not only on which counter moved first.
         self.evicted: list[dict] = []
+
+    def open_csv(self, path: str) -> None:
+        """Open the per-sample CSV for INCREMENTAL writing.
+
+        ⭐ It used to be written once at the end, inside main(), so a killed run
+        left a .log and no .csv at all. An unattended run that gets cut is the
+        normal case, not the exception, so every sample is now written and
+        flushed as it is taken: a kill leaves a short but complete CSV.
+        """
+        import csv as _csv
+        self._csv_path = path
+        self._csv_fh = open(path, "w", newline="", encoding="utf-8")
+        self._csv_writer = None
+        self._csv_mod = _csv
+
+    def _csv_row(self, row: dict) -> None:
+        if getattr(self, "_csv_fh", None) is None:
+            return
+        if self._csv_writer is None:
+            self._csv_writer = self._csv_mod.DictWriter(
+                self._csv_fh, fieldnames=list(row.keys()))
+            self._csv_writer.writeheader()
+        self._csv_writer.writerow(row)
+        self._csv_fh.flush()
+
+    def close_csv(self) -> None:
+        if getattr(self, "_csv_fh", None) is not None:
+            self._csv_fh.close()
+            self._csv_fh = None
 
     def poll(self) -> dict | None:
         try:
@@ -106,23 +139,28 @@ class Watcher:
             "tier_a": st.get("tier_a_bytes"),
             "tier_b": st.get("tier_b_bytes"),
             "tier_c": st.get("tier_c_bytes"),
+            "pending_unacked": st.get("pending_unacked"),
+            # SINCE BOOT, RAM, reset by every reboot.
             "deleted_acked": st.get("deleted_acked"),
             "deleted_unacked": st.get("deleted_unacked"),
-            # Per-tier breakdown of the loss. Absent on firmware older than the
+            # LIFETIME, NVS, monotonic. Absent on firmware older than the
             # "never silent" fix; None is recorded rather than 0 so the CSV
             # cannot be read as "nothing was lost from that tier".
-            "unacked_a": (st.get("unacked_evicted_files") or {}).get("A"),
-            "unacked_b": (st.get("unacked_evicted_files") or {}).get("B"),
-            "unacked_c": (st.get("unacked_evicted_files") or {}).get("C"),
-            "unacked_bytes_a": (st.get("unacked_evicted_bytes") or {}).get("A"),
-            "unacked_bytes_b": (st.get("unacked_evicted_bytes") or {}).get("B"),
-            "unacked_bytes_c": (st.get("unacked_evicted_bytes") or {}).get("C"),
-            "tier_counters_present":
-                isinstance(st.get("unacked_evicted_files"), dict),
+            # ⚠️ These and the pair above are DIFFERENT BASES -- never compare.
+            "lost_a": (st.get("lost_files") or {}).get("A"),
+            "lost_b": (st.get("lost_files") or {}).get("B"),
+            "lost_c": (st.get("lost_files") or {}).get("C"),
+            "lost_bytes_a": (st.get("lost_bytes") or {}).get("A"),
+            "lost_bytes_b": (st.get("lost_bytes") or {}).get("B"),
+            "lost_bytes_c": (st.get("lost_bytes") or {}).get("C"),
+            "lost_files_total": st.get("lost_files_total"),
+            "loss_recorded_files": st.get("loss_recorded_files"),
+            "tier_counters_present": isinstance(st.get("lost_files"), dict),
             "write_errors": st.get("write_errors"),
             "rows_dropped": st.get("rows_dropped"),
         }
         self.rows.append(row)
+        self._csv_row(row)
         return row
 
     def maybe_ack(self) -> None:
@@ -253,10 +291,12 @@ class Watcher:
         print(f"deleted    acked {last['deleted_acked']}  "
               f"unacked {last['deleted_unacked']}")
         if last["tier_counters_present"]:
-            print(f"lost/tier  A {last['unacked_a']} files "
-                  f"/ {last['unacked_bytes_a']} B   "
-                  f"B {last['unacked_b']} / {last['unacked_bytes_b']} B   "
-                  f"C {last['unacked_c']} / {last['unacked_bytes_c']} B")
+            print(f"lost/tier  A {last['lost_a']} files "
+                  f"/ {last['lost_bytes_a']} B   "
+                  f"B {last['lost_b']} / {last['lost_bytes_b']} B   "
+                  f"C {last['lost_c']} / {last['lost_bytes_c']} B   "
+                  f"(LIFETIME; hub recorded {last['loss_recorded_files']} "
+                  f"of {last['lost_files_total']})")
         print(f"write err  {last['write_errors']}   rows dropped "
               f"{last['rows_dropped']}")
 
@@ -287,16 +327,20 @@ class Watcher:
                   "went, not WHAT -- and Tier A and Tier B do not cost the "
                   "same. (Firmware predates the 'never silent' fix?)")
         else:
+            # ⚠️ Compared against lost_files_total, NOT deleted_unacked. Those
+            # are different bases -- lifetime NVS vs since-boot RAM -- and they
+            # are SUPPOSED to disagree after any reboot. Comparing them would
+            # make this check fail every time the board restarts.
             counted = sum(int(last[k] or 0)
-                          for k in ("unacked_a", "unacked_b", "unacked_c"))
-            total = int(last["deleted_unacked"] or 0)
+                          for k in ("lost_a", "lost_b", "lost_c"))
+            total = int(last["lost_files_total"] or 0)
             if counted == total:
-                print(f"  PASS: all {total} unacked deletion(s) are attributed "
-                      f"(A={last['unacked_a']} B={last['unacked_b']} "
-                      f"C={last['unacked_c']}).")
+                print(f"  PASS: all {total} lifetime loss(es) are attributed "
+                      f"(A={last['lost_a']} B={last['lost_b']} "
+                      f"C={last['lost_c']}).")
             else:
                 failures += 1
-                print(f"  ** FAIL **: deleted_unacked={total} but the per-tier "
+                print(f"  ** FAIL **: lost_files_total={total} but the per-tier "
                       f"counters sum to {counted}. One eviction path is not "
                       f"going through the shared accounting.")
 
@@ -331,7 +375,95 @@ class Watcher:
             print(f"  PASS: every unacked deletion happened with no acked file "
                   f"left on the disk, and {n_acked} acked file(s) were taken "
                   f"in preference once they existed.")
+
+        # ⭐ THE HEADLINE TEST OF THE CLEAN-PARTITION RUN.
+        #
+        # Runs 1-3 could never reach this: the bench partition was Tier B
+        # dominant and sat at 87-91%, so `warn` was true from total usage the
+        # whole time and the second arm was never under test. On an empty
+        # partition Tier A grows into its 40% cap while TOTAL usage is still
+        # well under warn_pct -- so a loss here must set warn on its own.
+        print("\nCLAIM 4 -- warn fires on loss even when usage is LOW:")
+        wp = int(last["warn_pct"] or 70)
+        low_loss = [r for r in self.rows
+                    if (r["usage_pct"] or 0) < wp
+                    and (r["lost_files_total"] or 0) > (r["loss_recorded_files"] or 0)]
+        if not low_loss:
+            print(f"  NOT EXERCISED: no sample had unrecorded loss while usage "
+                  f"was under {wp}%. Either the Tier A cap never fired, or the "
+                  f"partition filled past {wp}% first -- check `usage` above. "
+                  f"This is the run's whole point, so a NOT EXERCISED here "
+                  f"means the setup needs revisiting, not that the code is ok.")
+        elif all(r["warn"] for r in low_loss):
+            r = low_loss[0]
+            print(f"  PASS: warn was TRUE at usage {r['usage_pct']}% (< {wp}%) "
+                  f"with {r['lost_files_total']} lifetime loss(es) and only "
+                  f"{r['loss_recorded_files']} recorded. The second arm works "
+                  f"on its own -- total usage was not carrying it.")
+        else:
+            failures += 1
+            r = next(r for r in low_loss if not r["warn"])
+            print(f"  ** FAIL **: at usage {r['usage_pct']}% (< {wp}%), "
+                  f"lost_files_total={r['lost_files_total']} exceeded "
+                  f"loss_recorded_files={r['loss_recorded_files']} and warn was "
+                  f"FALSE. Unrecorded data loss is not raising the warning.")
+
+        print("\nCLAIM 5 -- the loss record survived the partition erase:")
+        if self.baseline_lost is None:
+            print("  NOT CHECKED: no --baseline-lost given.")
+        elif (first["lost_files_total"] or 0) >= self.baseline_lost:
+            print(f"  PASS: lifetime loss read {first['lost_files_total']} at "
+                  f"the start of this run, against {self.baseline_lost} recorded "
+                  f"before the spiffs partition was erased. NVS is a separate "
+                  f"partition and the counters are not reset by wiping the "
+                  f"filesystem -- which is the closest thing to a format.")
+        else:
+            failures += 1
+            print(f"  ** FAIL **: lifetime loss was {self.baseline_lost} before "
+                  f"the erase and {first['lost_files_total']} after. The record "
+                  f"did not survive, so 'never reset, including by a format' is "
+                  f"not true.")
+
+        self.failures = failures
         return 1 if failures else 0
+
+    def write_summary(self, path: str, rc: int, meta: dict) -> None:
+        """PASS/FAIL plus the numbers, in a file, separate from the log.
+
+        Required by the uninterruptible-work rule: the run must leave a verdict
+        on disk that can be read without re-deriving it from a 2,000-line log.
+        """
+        last = self.rows[-1] if self.rows else {}
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("# Bench run summary\n\n")
+            fh.write(f"**VERDICT: {'PASS' if rc == 0 else 'FAIL'}** "
+                     f"({getattr(self, 'failures', '?')} failed claim(s))\n\n")
+            for k, v in meta.items():
+                fh.write(f"- **{k}:** {v}\n")
+            fh.write(f"- **samples:** {len(self.rows)}\n")
+            if last:
+                fh.write(f"- **final usage:** {last.get('usage_pct')}% "
+                         f"(warn_pct {last.get('warn_pct')})\n")
+                fh.write(f"- **warn at end:** {last.get('warn')}\n")
+                fh.write(f"- **lifetime loss:** {last.get('lost_files_total')} "
+                         f"file(s) — A={last.get('lost_a')} B={last.get('lost_b')} "
+                         f"C={last.get('lost_c')}; hub recorded "
+                         f"{last.get('loss_recorded_files')}\n")
+                fh.write(f"- **since boot:** deleted_acked="
+                         f"{last.get('deleted_acked')} deleted_unacked="
+                         f"{last.get('deleted_unacked')} "
+                         f"(different basis — do not compare to the line above)\n")
+                fh.write(f"- **write errors:** {last.get('write_errors')} · "
+                         f"**rows dropped:** {last.get('rows_dropped')}\n")
+            fh.write(f"- **evictions observed:** {len(self.evicted)}\n\n")
+            fh.write("## Events\n\n")
+            for e in self.events:
+                fh.write(f"- {e}\n")
+            fh.write("\n## Full verdicts\n\nSee `retention.log` "
+                     "(the RETENTION WATCH banner at the end).\n")
+            fh.write("\n## Serial\n\n`serial.log` in this folder holds the "
+                     "board's own output for the same window, including the "
+                     "boot line with the reset reason if it rebooted.\n")
 
 
 def main(argv=None) -> int:
@@ -348,6 +480,12 @@ def main(argv=None) -> int:
     ap.add_argument("--token", default=os.environ.get("HUB_API_TOKEN", ""),
                     help="X-Hub-Token for /api/v1/files/ack "
                          "(default: $HUB_API_TOKEN)")
+    ap.add_argument("--summary", metavar="PATH",
+                    help="write a PASS/FAIL summary file here")
+    ap.add_argument("--baseline-lost", type=int, metavar="N",
+                    help="lifetime lost-file total observed BEFORE the spiffs "
+                         "partition was erased; enables claim 5 (the NVS loss "
+                         "record must survive a filesystem wipe)")
     args = ap.parse_args(argv)
 
     if args.ack_after and not args.token:
@@ -358,19 +496,31 @@ def main(argv=None) -> int:
 
     w = Watcher(args.host, args.interval,
                 ack_after=args.ack_after, token=args.token)
+    w.baseline_lost = args.baseline_lost
+    # Opened BEFORE the run, not written after it: an unattended run that gets
+    # killed must still leave a usable CSV of everything up to that moment.
+    if args.csv:
+        w.open_csv(args.csv)
     try:
         w.run(args.seconds)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
+    finally:
+        w.close_csv()
     rc = w.report()
 
-    if args.csv and w.rows:
-        import csv as _csv
-        with open(args.csv, "w", newline="", encoding="utf-8") as fh:
-            wr = _csv.DictWriter(fh, fieldnames=list(w.rows[0].keys()))
-            wr.writeheader()
-            wr.writerows(w.rows)
+    if args.csv:
         print(f"\nper-sample CSV -> {args.csv}")
+    if args.summary:
+        w.write_summary(args.summary, rc, {
+            "host": args.host,
+            "seconds requested": args.seconds,
+            "interval": args.interval,
+            "ack-after": args.ack_after or "(none)",
+            "baseline lifetime loss (pre-erase)":
+                args.baseline_lost if args.baseline_lost is not None else "(not given)",
+        })
+        print(f"summary -> {args.summary}")
     return rc
 
 
