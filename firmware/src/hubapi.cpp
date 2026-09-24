@@ -54,7 +54,13 @@ static void handleSession(WebServer &srv) {
   const uint32_t rate = sessionSnapshotBytesPerSec(ids);
   const uint32_t secs = sessionSnapshotSeconds(ids);
 
-  char buf[2048];
+  // 2048 was already the working size; the per-tier eviction counters added
+  // ~130 bytes of storage block, which is close enough to the edge to be worth
+  // the headroom. This runs on the Arduino loop task (8 kB stack), not the CAN
+  // task, so the extra half-kB is not the constraint. jsonAppend() truncates
+  // rather than overflowing if this is ever wrong, and a truncated body fails
+  // the hub's parse loudly instead of corrupting the stack.
+  char buf[2560];
   int n = jsonAppend(buf, sizeof(buf), 0,
       "{\"proto\":%d,"
       "\"device_id\":%lu,"
@@ -131,6 +137,12 @@ static void handleSession(WebServer &srv) {
   // loop publishes to hub/health. `deleted_unacked` is the number that
   // matters: anything above zero means retention destroyed data the hub had
   // not collected, which is the one outcome the tiering exists to prevent.
+  //
+  // ⚠️ `warn` comes from filestoreWarn(), NOT from usage_pct. Computing it here
+  // is what made it mean only "the partition is filling", so the Tier A cap
+  // could destroy unacked data at 55% usage with warn still false (retention
+  // run 2, 2026-09-23). A consumer must NOT reconstruct it from usage_pct and
+  // warn_pct -- those two still describe only the total-usage arm of the rule.
   const FileStoreStats *fs = filestoreStats();
   n = jsonAppend(buf, sizeof(buf), n,
       "\"storage\":{\"mounted\":%s,\"used\":%lu,\"total\":%lu,"
@@ -138,15 +150,23 @@ static void handleSession(WebServer &srv) {
       "\"files\":%u,\"open\":%u,\"acked_through\":%ld,"
       "\"tier_a_bytes\":%lu,\"tier_b_bytes\":%lu,\"tier_c_bytes\":%lu,"
       "\"deleted_acked\":%lu,\"deleted_unacked\":%lu,"
+      "\"unacked_evicted_bytes\":{\"A\":%lu,\"B\":%lu,\"C\":%lu},"
+      "\"unacked_evicted_files\":{\"A\":%u,\"B\":%u,\"C\":%u},"
       "\"write_errors\":%lu,\"rows_dropped\":%lu},",
       fs->mounted ? "true" : "false",
       (unsigned long)fs->usedBytes, (unsigned long)fs->totalBytes,
       (unsigned)filestoreUsagePct(), (unsigned)FS_WARN_USAGE_PCT,
-      (filestoreUsagePct() >= FS_WARN_USAGE_PCT) ? "true" : "false",
+      filestoreWarn() ? "true" : "false",
       (unsigned)fs->files, (unsigned)fs->openFiles, (long)fs->ackedThrough,
       (unsigned long)fs->tierABytes, (unsigned long)fs->tierBBytes,
       (unsigned long)fs->tierCBytes,
       (unsigned long)fs->deletedAcked, (unsigned long)fs->deletedUnacked,
+      (unsigned long)fs->unackedEvictedBytes[0],
+      (unsigned long)fs->unackedEvictedBytes[1],
+      (unsigned long)fs->unackedEvictedBytes[2],
+      (unsigned)fs->unackedEvictedFiles[0],
+      (unsigned)fs->unackedEvictedFiles[1],
+      (unsigned)fs->unackedEvictedFiles[2],
       (unsigned long)fs->writeErrors, (unsigned long)fs->rowsDropped);
 
   // Link transition counters, for the AP<->STA soak test. A fault that

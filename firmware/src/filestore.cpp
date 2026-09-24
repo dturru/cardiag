@@ -289,6 +289,27 @@ static void dropEntry(uint16_t i) {
   g_fileCount--;
 }
 
+// The ONE place an unacked deletion is accounted for. Both eviction paths go
+// through it, because the gap retention run 2 found was exactly that the cap
+// path did its own bookkeeping and skipped the warning.
+//
+// Call BEFORE dropEntry(): the entry still holds the byte count.
+static void noteUnackedEviction(const FileEntry &e) {
+  const char tier = fsTierForKind(e.kind);
+  const uint8_t slot = fsTierSlot(tier);
+  g_st.deletedUnacked++;
+  g_st.unackedEvictedBytes[slot] += e.bytes;
+  g_st.unackedEvictedFiles[slot]++;
+  // Loud on purpose. This line is the only trace a field unit leaves of data
+  // the hub will now never receive.
+  Serial.printf("[fs] *** EVICTED UNACKED TIER %c (%s) #%lu, %lu B -- DATA LOST "
+                "(tier %c total now %u files / %lu B) ***\n",
+                tier, fsKindName(e.kind), (unsigned long)e.index,
+                (unsigned long)e.bytes, tier,
+                (unsigned)g_st.unackedEvictedFiles[slot],
+                (unsigned long)g_st.unackedEvictedBytes[slot]);
+}
+
 // Deletes exactly one file, choosing by the protocol's order. Returns false
 // when there is nothing left that may be deleted.
 static bool evictOne() {
@@ -316,12 +337,9 @@ static bool evictOne() {
     for (uint16_t i = 0; i < g_fileCount; i++) {
       if (!g_files[i].closed) continue;
       if (fsTierForKind(g_files[i].kind) != tier) continue;
-      Serial.printf("[fs] *** EVICTING UNACKED TIER %c (%s) #%lu -- DATA LOST ***\n",
-                    tier, fsKindName(g_files[i].kind),
-                    (unsigned long)g_files[i].index);
       removeFiles(g_files[i]);
+      noteUnackedEviction(g_files[i]);
       dropEntry(i);
-      g_st.deletedUnacked++;
       return true;
     }
   }
@@ -333,23 +351,45 @@ static uint32_t usableBytes() {
   return total ? total : (uint32_t)HUB_FS_USABLE_BYTES;
 }
 
+// Finds the oldest closed Tier A file, preferring acked ones. Returns
+// g_fileCount when there is no candidate.
+//
+// ⚠️ The two passes are the point. g_files is sorted by index, so a single
+// oldest-first sweep picks up whatever comes first -- which, once the hub has
+// acked a prefix and the newer files are still unacked, is an ACKED file by
+// luck of ordering rather than by rule. The moment an ack arrives out of that
+// shape the same sweep destroys unacked data while acked copies the hub
+// already holds sit right next to it.
+static uint16_t oldestTierACandidate(bool wantAcked) {
+  for (uint16_t i = 0; i < g_fileCount; i++) {
+    if (!g_files[i].closed) continue;
+    if (fsTierForKind(g_files[i].kind) != FS_TIER_RAW) continue;
+    const bool acked = (int32_t)g_files[i].index <= g_st.ackedThrough;
+    if (acked == wantAcked) return i;
+  }
+  return g_fileCount;
+}
+
 // Keeps Tier A inside its share. Without this, Tier A's 50:1 rate advantage
 // lets it fill the partition between two snapshot blocks.
+//
+// Deletion order inside the cap mirrors the global one: acked first, because
+// the hub already has those and they cost nothing to lose.
 static void enforceTierACap() {
   const uint32_t cap = (uint32_t)((uint64_t)usableBytes() * FS_TIER_A_MAX_PCT / 100);
   while (g_st.tierABytes > cap) {
-    bool removed = false;
-    for (uint16_t i = 0; i < g_fileCount; i++) {
-      if (!g_files[i].closed) continue;
-      if (fsTierForKind(g_files[i].kind) != FS_TIER_RAW) continue;
-      removeFiles(g_files[i]);
-      if ((int32_t)g_files[i].index <= g_st.ackedThrough) g_st.deletedAcked++;
-      else g_st.deletedUnacked++;
-      dropEntry(i);
-      removed = true;
-      break;
+    bool acked = true;
+    uint16_t i = oldestTierACandidate(true);
+    if (i == g_fileCount) {
+      acked = false;
+      i = oldestTierACandidate(false);
     }
-    if (!removed) break;
+    if (i == g_fileCount) break;      // only open Tier A left; leave it alone
+
+    removeFiles(g_files[i]);
+    if (acked) g_st.deletedAcked++;
+    else       noteUnackedEviction(g_files[i]);
+    dropEntry(i);
     recomputeUsage();
   }
 }
@@ -722,6 +762,15 @@ uint8_t filestoreUsagePct() {
   const uint32_t total = LittleFS.totalBytes();
   if (!total) return 0;
   return (uint8_t)((uint64_t)LittleFS.usedBytes() * 100 / total);
+}
+
+bool filestoreWarn() {
+  // Either arm is sufficient, and the second one is the fix from retention
+  // run 2: once anything unacked has been destroyed the warning is true
+  // forever, regardless of what usage happens to be now. A latched flag would
+  // be equivalent -- deletedUnacked already only ever counts up, so it IS the
+  // latch, and keeping one source of truth means the two cannot disagree.
+  return filestoreUsagePct() >= FS_WARN_USAGE_PCT || g_st.deletedUnacked > 0;
 }
 
 int32_t filestoreAck(int32_t throughIndex) {

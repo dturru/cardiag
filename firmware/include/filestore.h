@@ -119,10 +119,29 @@ struct FileStoreStats {
   uint32_t tierCBytes;
   uint32_t deletedAcked;
   uint32_t deletedUnacked;   // >0 means data was lost to retention
+  // Per-tier breakdown of that loss, indexed by fsTierSlot(): 0=A, 1=B, 2=C.
+  //
+  // `deletedUnacked` alone says data was destroyed; it does not say WHAT. The
+  // tiers are not interchangeable -- Tier A is collectable again on the next
+  // drive, Tier B is a month that cannot be re-measured -- so the same count
+  // means very different things depending on where it landed, and a single
+  // total cannot tell them apart.
+  uint32_t unackedEvictedBytes[3];
+  uint16_t unackedEvictedFiles[3];
   uint32_t writeErrors;
   uint32_t rowsDropped;      // change-log appends the recorder refused
   bool     mounted;
 };
+
+// Index into the per-tier arrays above. Anything unrecognised lands in A,
+// matching fsTierForKind()'s default.
+static inline uint8_t fsTierSlot(char tier) {
+  switch (tier) {
+    case FS_TIER_SNAPSHOT: return 1;
+    case FS_TIER_BOOKEND:  return 2;
+    default:               return 0;
+  }
+}
 
 // Mounts LittleFS, rebuilds the index by scanning FS_DIR, and loads the
 // watermark from NVS. Safe to call when the partition is empty or corrupt --
@@ -168,6 +187,18 @@ const FileStoreStats *filestoreStats();
 
 // Percent of the partition in use, 0-100.
 uint8_t filestoreUsagePct();
+
+// The storage warning the hub reports and the dashboard shows. THE ONE PLACE
+// THE WARN RULE LIVES -- it was computed inline at the API before, which is
+// how it came to mean only "total usage is high".
+//
+// 🔑 Retention run 2 (2026-09-23) measured the gap: three unacked Tier A files,
+// 197,285 bytes, were destroyed at 55% usage with `warn` still false, because
+// enforceTierACap() evicts at 40% of the PARTITION while the warning fires at
+// 70% of TOTAL. Evicting unacked data at the cap is allowed; doing it silently
+// is not. So warn is now true if EITHER the partition is filling OR anything
+// unacked has already been destroyed, whatever the usage was at the time.
+bool filestoreWarn();
 
 // Registers /api/v1/files, /api/v1/files/<index> and /api/v1/files/ack.
 void filestoreRegister(WebServer &srv);
