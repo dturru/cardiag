@@ -78,6 +78,7 @@ struct Active {
   File     fh;
   uint32_t index;
   uint32_t bytes;
+  uint32_t lastFlushMs;   // bounds what a crash can cost; see flushDue()
   char     kind;
   bool     open;
   mbedtls_sha256_context sha;
@@ -427,6 +428,7 @@ static bool openActive(Active &a, char kind) {
   a.index = nextIndex();
   a.kind = kind;
   a.bytes = 0;
+  a.lastFlushMs = millis();
   mbedtls_sha256_init(&a.sha);
   mbedtls_sha256_starts(&a.sha, 0);   // 0 = SHA-256, not SHA-224
 
@@ -468,6 +470,28 @@ static bool writeActive(Active &a, const uint8_t *data, size_t len) {
   FileEntry *e = findEntry(a.index);
   if (e) e->bytes = a.bytes;
   return true;
+}
+
+// Commit buffered bytes on a time bound, so a crash costs a KNOWN amount of
+// data rather than everything since the file was opened.
+//
+// 🐛 Before this existed, a Tier B .part with 12,612 bytes in it came back
+// from a hard reset reporting 0 bytes. The name was on disk -- LittleFS
+// commits that at create -- so the hub saw a crash artifact and correctly
+// synced it as truncated, and it was truncated to NOTHING. Tier B is the
+// month-over-month record; "a month that is gone cannot be re-measured" was
+// already the stated reason it is deleted last, and it was being lost to
+// something much more ordinary than a full disk.
+//
+// Deliberately NOT a flush per write: at the Tier A change-log rate that is
+// thousands of syncs a minute and pointless flash wear. A time bound is also
+// the thing that can be stated plainly in the docs -- at most
+// FS_FLUSH_INTERVAL_MS of data, whatever the write rate.
+static void flushDue(Active &a, uint32_t now) {
+  if (!a.open) return;
+  if ((uint32_t)(now - a.lastFlushMs) < FS_FLUSH_INTERVAL_MS) return;
+  a.fh.flush();
+  a.lastFlushMs = now;
 }
 
 static bool ensureOpen(Active &a, char kind) {
@@ -636,6 +660,10 @@ void filestoreLoop() {
     writeSnapshotBlock();
   }
   drainChangeLog();
+
+  // Bound what a power cut or a panic can cost. Both tiers, every pass.
+  flushDue(g_actSnapshot, now);
+  flushDue(g_actChanges, now);
 
   g_st.rowsDropped = recorderChangeDropped();
 

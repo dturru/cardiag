@@ -157,7 +157,20 @@ static void handleSession(WebServer &srv) {
       "\"event_drops\":%lu,\"poll_drops\":%lu,\"join_failures\":%lu,"
       "\"ap_starts\":%lu,\"last_reason\":%u,"
       "\"last_fallback_ms\":%lu,\"worst_fallback_ms\":%lu},"
-      "\"heap\":{\"free\":%lu,\"min_free\":%lu}}",
+      // ⭐ FIELD GUARD FOR THE LEAK CLASS (added after the handler leak).
+      //
+      // `free` alone would NOT have caught that leak until the board was
+      // already dying: it is restored by every reboot, so a hub sampling only
+      // the current value sees a healthy number shortly after each crash.
+      // `min_free` is the low-water mark and only ever falls, so a downward
+      // trend in it is a leak whether or not the board rebooted in between.
+      //
+      // `largest_block` is the other half and is not redundant: the heap can
+      // fragment into many small holes, so a few-kB allocation fails while
+      // `free` still reads comfortable. Watching only the total means the
+      // first symptom of fragmentation is a malloc returning null.
+      "\"heap\":{\"free\":%lu,\"min_free\":%lu,\"largest_block\":%lu,"
+      "\"largest_block_internal\":%lu}}",
       (unsigned long)ls->staJoins, (unsigned long)ls->staDrops,
       (unsigned long)ls->eventDrops, (unsigned long)ls->pollDrops,
       (unsigned long)ls->joinFailures, (unsigned long)ls->apStarts,
@@ -165,7 +178,12 @@ static void handleSession(WebServer &srv) {
       (unsigned long)ls->lastFallbackMs,
       (unsigned long)ls->worstFallbackMs,
       (unsigned long)ESP.getFreeHeap(),
-      (unsigned long)ESP.getMinFreeHeap());
+      (unsigned long)ESP.getMinFreeHeap(),
+      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+      // Internal SRAM specifically. PSRAM is 8 MB and would mask exhaustion of
+      // the internal heap, which is what WiFi, lwIP and the WebServer actually
+      // allocate from -- the pool that ran out at cycle 34.
+      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
   srv.send(200, "application/json", buf);
 }

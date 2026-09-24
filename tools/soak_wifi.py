@@ -71,7 +71,10 @@ HOTSPOT_PS1 = os.path.join(HERE, "hotspot.ps1")
 RE_STA_LOST = re.compile(r"\[hublink\] STA lost \((\w+), reason=(\d+)\)")
 RE_STA_UP = re.compile(r"\[hublink\] STA up: ip=(\S+)")
 RE_FALLBACK = re.compile(r"\[hublink\] fallback .*fallback=(\d+)ms")
-RE_HEAP = re.compile(r"heap=(\d+) minheap=(\d+)")
+RE_HEAP = re.compile(r"heap=(\d+) minheap=(\d+)(?: largest=(\d+))?")
+# min_free only ever FALLS, so it is the leak signal that survives a
+# reboot -- current free heap is restored by every crash and therefore
+# looks healthy right after the worst moment.
 RE_NETSTACK = re.compile(r"netstack cb reg failed with (\d+)")
 # The ROM prints these on every reset. Seeing one MID-RUN means the board
 # restarted, which is the failure mode a recovering fault would otherwise hide.
@@ -99,6 +102,8 @@ class Cycle:
     drop_path: str = ""       # "event" or "poll"
     reason: int | None = None
     heap: int | None = None
+    minheap: int | None = None
+    largest: int | None = None
     netstack: int = 0
     reboot: bool = False
 
@@ -200,6 +205,9 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
         m = RE_HEAP.search(ln.text)
         if m:
             cyc.heap = int(m.group(1))
+            cyc.minheap = int(m.group(2))
+            if m.group(3):
+                cyc.largest = int(m.group(3))
         m = RE_FALLBACK.search(ln.text)
         if m:
             cyc.fallback_ms = int(m.group(1))
@@ -307,8 +315,8 @@ def run(args) -> int:
               + ("  REBOOT" if cyc.reboot else ""))
 
     tap.close()
-    report(cycles, tot, args)
-    return 0
+    rc = report(cycles, tot, args)
+    return rc
 
 
 def stat_block(name: str, vals: list[float], unit: str = "s") -> str:
@@ -366,30 +374,118 @@ def report(cycles: list[Cycle], tot: Totals, args):
     print()
     if len(heaps) >= 2:
         first, last = heaps[0][1], heaps[-1][1]
-        drift = last - first
-        per = drift / max(1, heaps[-1][0] - heaps[0][0])
         print(f"heap first          {first} B  (cycle {heaps[0][0]})")
         print(f"heap last           {last} B  (cycle {heaps[-1][0]})")
-        print(f"drift               {drift:+d} B total, {per:+.1f} B/cycle")
-        print("                    A steady negative slope is a leak. Noise of "
-              "a few hundred bytes is not.")
+
+        # 🐛 (last - first) / cycles IS WRONG ACROSS A REBOOT, and it
+        # understated a real leak by 3x. A reboot restores the heap, so a run
+        # that leaked 6.3 kB/cycle until it exhausted itself at cycle 34 and
+        # then leaked another 94 kB reported as "-1,922 B/cycle" -- a number
+        # small enough to read as drift. The per-cycle DELTAS are what the
+        # leak actually is; the reboot is a discontinuity, not a data point.
+        deltas = [(c, h - prev_h)
+                  for (prev_c, prev_h), (c, h) in zip(heaps, heaps[1:])
+                  if h <= prev_h or (h - prev_h) < 50_000]
+        if deltas:
+            vals = sorted(d for _, d in deltas)
+            med = vals[len(vals) // 2]
+            neg = sum(1 for d in vals if d < 0)
+            print(f"per-cycle delta     median {med:+.0f} B   "
+                  f"negative on {neg}/{len(vals)} cycles")
+            if neg == len(vals) and med < -256:
+                print(f"                    ** LEAK **: every single cycle "
+                      f"lost heap. At {abs(med):.0f} B/cycle this exhausts "
+                      f"{first} B in about {first // max(1, abs(int(med)))} "
+                      f"cycles.")
+            elif neg > len(vals) * 0.8 and med < -256:
+                print("                    ** probable leak **: most cycles "
+                      "lost heap.")
+            else:
+                print("                    No consistent slope -- this is "
+                      "noise, not a leak.")
+        jumps = [c for (pc, ph), (c, h) in zip(heaps, heaps[1:])
+                 if h - ph >= 50_000]
+        if jumps:
+            print(f"                    heap JUMPED UP at cycle(s) "
+                  f"{', '.join(str(c) for c in jumps)} -- that is a reboot, "
+                  f"and the slope is measured within segments, not across it.")
     else:
         print("heap                not enough samples")
+
+    # --- explicit verdict -------------------------------------------------
+    #
+    # A run that only prints numbers gets read optimistically. These are the
+    # agreed pass criteria for "the leak is fixed", checked rather than eyeballed.
+    mins = [(c.n, c.minheap) for c in cycles if c.minheap]
+    larges = [(c.n, c.largest) for c in cycles if c.largest]
+    fails: list[str] = []
+
+    if len(heaps) >= 2:
+        d = [h - ph for (_, ph), (_, h) in zip(heaps, heaps[1:])
+             if h - ph < 50_000]
+        if d:
+            med = sorted(d)[len(d) // 2]
+            if med < -256:
+                fails.append(f"median per-cycle heap delta {med:+.0f} B "
+                             f"(want approximately 0)")
+    if len(mins) >= 2:
+        # min_free only ever falls, so ANY net fall across the run is real --
+        # and unlike free heap it is not reset by a reboot.
+        drop = mins[0][1] - mins[-1][1]
+        print(f"min free heap       {mins[0][1]} -> {mins[-1][1]} B "
+              f"({-drop:+d})")
+        if drop > 4096:
+            fails.append(f"min free heap fell {drop} B across the run")
+    else:
+        print("min free heap       not reported -- firmware predates "
+              "`minheap=` in the stats line")
+
+    if len(larges) >= 2:
+        lo = min(v for _, v in larges)
+        drop = larges[0][1] - larges[-1][1]
+        print(f"largest free block  {larges[0][1]} -> {larges[-1][1]} B "
+              f"(min seen {lo})")
+        # Fragmentation kills with free heap to spare: a flat total and a
+        # falling largest block still ends in a failed allocation.
+        if drop > 8192:
+            fails.append(f"largest free block fell {drop} B -- fragmentation, "
+                         f"even if total free heap looks flat")
+    else:
+        print("largest free block  not reported -- firmware predates "
+              "`largest=` in the stats line")
+
+    if tot.reboots:
+        fails.append(f"{tot.reboots} reboot(s)")
+    if tot.panics:
+        fails.append(f"{tot.panics} panic/assert(s)")
+
+    print()
+    if fails:
+        print("VERDICT: ** FAIL **")
+        for f in fails:
+            print(f"  - {f}")
+    else:
+        print(f"VERDICT: PASS over {len(cycles)} cycles -- heap flat, min free "
+              f"heap stable, no fragmentation trend, no reboots or panics.")
 
     out = args.csv or os.path.join(HERE, "soak_wifi_result.csv")
     with open(out, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["cycle", "detect_ms", "rejoin_ms", "fallback_ms",
-                    "drop_path", "reason", "heap", "netstack_12308", "reboot"])
+                    "drop_path", "reason", "heap", "minheap",
+                    "largest_block", "netstack_12308", "reboot"])
         for c in cycles:
             w.writerow([c.n,
                         f"{c.detect_ms:.1f}" if c.detect_ms is not None else "",
                         f"{c.rejoin_ms:.1f}" if c.rejoin_ms is not None else "",
                         c.fallback_ms if c.fallback_ms is not None else "",
                         c.drop_path, c.reason if c.reason is not None else "",
-                        c.heap or "", c.netstack, int(c.reboot)])
+                        c.heap or "", c.minheap or "",
+                        c.largest or "", c.netstack, int(c.reboot)])
     print()
     print(f"per-cycle CSV -> {out}")
+    # Non-zero on FAIL so this is usable from a script, not just by eye.
+    return 1 if fails else 0
 
 
 def main(argv=None) -> int:

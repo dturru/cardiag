@@ -64,7 +64,12 @@ void hublinkPrintStats(const char *what) {
   const HubLinkStats &s = g_stats;
   Serial.printf("[hublink] %s state=%s joins=%lu drops=%lu(evt=%lu poll=%lu) "
                 "joinfail=%lu apstarts=%lu reason=%u fallback=%lums "
-                "worst=%lums heap=%lu minheap=%lu\n",
+                // largest= is the fragmentation half of the story. Free heap
+                // can look fine while no single block is big enough to serve
+                // a request, and the soak logs it per cycle for exactly that
+                // reason: a flat `heap` with a falling `largest` is still a
+                // board on its way to a failed allocation.
+                "worst=%lums heap=%lu minheap=%lu largest=%lu\n",
                 what, hublinkStateName(),
                 (unsigned long)s.staJoins, (unsigned long)s.staDrops,
                 (unsigned long)s.eventDrops, (unsigned long)s.pollDrops,
@@ -73,7 +78,8 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)s.lastFallbackMs,
                 (unsigned long)s.worstFallbackMs,
                 (unsigned long)ESP.getFreeHeap(),
-                (unsigned long)ESP.getMinFreeHeap());
+                (unsigned long)ESP.getMinFreeHeap(),
+                (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 static bool tryJoin(uint32_t timeoutMs) {

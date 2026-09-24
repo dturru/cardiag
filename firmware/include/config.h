@@ -187,6 +187,20 @@
 // budget is built on -- changing it changes the retention projection.
 #define FS_SNAPSHOT_PERIOD_MS 1000
 
+// 🐛 HOW MUCH DATA A CRASH IS ALLOWED TO COST.
+//
+// LittleFS buffers writes and only commits on flush or close, and the active
+// file is closed only on a mode change. Measured on hardware 2026-09-23: a
+// Tier B .part holding 12,612 bytes came back as **0 bytes** after a hard
+// reset -- not truncated, LOST. The protocol says a .part from a previous boot
+// is a crash artifact the hub syncs as truncated; there was nothing to sync.
+//
+// Flushing every block would be safest and wears the flash for no good reason
+// at 1 Hz. Flushing on a TIME bound instead makes the exposure something you
+// can actually state: at most this many milliseconds of data, whatever the
+// write rate happens to be.
+#define FS_FLUSH_INTERVAL_MS 10000
+
 // Bytes written to flash per filestore pass. LittleFS writes block-erase, and
 // a long write in loop() is a long time not serving HTTP or streaming UDP.
 // Draining is spread across passes instead; at ~1 kHz this ceiling is far

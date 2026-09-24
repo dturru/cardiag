@@ -215,7 +215,30 @@ static void handleMode() {
 // Route table, shared by both network modes. The existing endpoints are
 // IDENTICAL in AP and STA -- the standalone UI does not change just because a
 // hub happens to be present.
+// 🐛🐛 REGISTERED EXACTLY ONCE, AND THAT IS THE WHOLE POINT OF THIS FUNCTION.
+//
+// `WebServer::on()` APPENDS to an internal handler list; `stop()` closes the
+// listening socket but does NOT free that list, and `g_server` is a static
+// that is never destroyed. This used to run on every AP<->STA transition, so
+// each transition leaked one heap-allocated handler plus its URI String for
+// every route -- ~6.3 kB per cycle, for as long as the car kept driving in and
+// out of range of the hub.
+//
+// Measured over 50 soak cycles BEFORE the fix: free heap fell 209,484 -> 9,272
+// bytes with 48 of 48 per-cycle deltas negative and not one positive; the
+// board then exhausted its heap at cycle 34, panicked, rebooted, and began
+// leaking again at the identical rate. It is a linear, unbounded leak on the
+// exact path a moving car exercises most.
+//
+// The route table is IDENTICAL in both modes -- the comment above already said
+// so -- so there was never a reason to rebuild it. What genuinely differs per
+// transition is the listening socket, so begin()/stop() stay per-transition
+// and only the table is once-ever.
 static void registerRoutes() {
+  static bool registered = false;
+  if (registered) return;
+  registered = true;
+
   g_server.on("/", HTTP_GET, handleRoot);
   g_server.on("/api/table", HTTP_GET, handleTable);
   g_server.on("/api/clear", HTTP_POST, handleClear);
@@ -230,8 +253,6 @@ static void registerRoutes() {
   // the whole server -- that call REPLACES the list rather than adding to it,
   // so it has to happen in exactly one place or "Range" quietly stops arriving.
   filestoreRegister(g_server);
-
-  g_server.begin();
 }
 
 void webuiStart() {
@@ -245,6 +266,7 @@ void webuiStart() {
   }
 
   registerRoutes();
+  g_server.begin();          // the socket, not the table
 
   g_running = true;
   g_apMode  = true;
@@ -261,6 +283,7 @@ void webuiStart() {
 void webuiStartOnCurrentNetwork() {
   if (g_running) return;
   registerRoutes();
+  g_server.begin();          // the socket, not the table
   g_running = true;
   g_apMode  = false;
   Serial.print("web up on hub network -> http://");
