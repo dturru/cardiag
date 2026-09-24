@@ -1,5 +1,101 @@
 # Handoff — next session
 
+## 🏁 VERDICT — clean-partition run, 2026-09-24 17:36
+
+📂 **READ: `analysis/bench-2026-09-24-1736/SUMMARY.md`** (then `retention.log`,
+`retention.csv`, `serial.log` in that folder).
+
+**`rc=0`, zero failed claims — but that is 2 PASS and 3 NOT EXERCISED, not a
+blanket pass.** Nothing was evicted at all: usage only reached 30%, below both
+the 90% reclaim threshold and the Tier A cap, so there was no eviction pressure
+to observe.
+
+| Claim | Verdict |
+|---|---|
+| **4 — warn fires on loss at LOW usage** | ✅ **PASS.** warn TRUE at **usage 0%** with 34 lifetime losses and only 16 recorded. **The second arm works on its own; total usage was not carrying it.** This is the one no previous run could reach |
+| **5 — loss record survives the partition erase** | ✅ **PASS**, and formally this time — the pre-erase baseline (34) *was* captured, so it is a measurement, not evidence. NVS is a separate partition; wiping LittleFS does not reset it |
+| 3 — warn before unacked loss | ⚪ NOT EXERCISED — nothing deleted |
+| 3b — loss attributed to a tier | ⚪ NOT EXERCISED — nothing deleted |
+| **2 — the cap's OWN acked-before-unacked choice** | ⚪ **NOT EXERCISED, third time.** Tier A reached 918 kB of the 1,625 kB cap |
+
+### 🔴 THE REBOOT QUESTION — did NOT reproduce
+
+No reset occurred in the 20-minute window. The only watchdog lines in
+`serial.log` are benign init noise, so **the 2026-09-24 mid-run reboot remains
+unexplained** — this run simply did not trigger it. Do not treat that as a
+clearance.
+
+⭐ The new boot line worked exactly as intended and is the proof claim 5 rests on:
+
+```
+[fs] LIFETIME LOSS RECORD: 34 file(s) of uncollected data destroyed
+     (A=14 B=20 C=0); hub has recorded 16.  *** WARN STAYS SET ***
+```
+
+### 🐛 Regression found and fixed by this run
+
+`E task_wdt: esp_task_wdt_reset(707): task not found` on every boot. The §2 WDT
+feeds run from `enforceRetention()` inside `filestoreBegin()`, which is in
+`setup()` — **before** the watchdog is armed. Harmless, but a benign error
+printed every boot is what hides a real one later. Now guarded by
+`wdtFeedIfArmed()`, which checks `esp_task_wdt_status()` first. Deliberately
+not fixed by arming earlier: the late arming is what stops a corrupt-partition
+format rebooting into itself.
+
+---
+
+## ▶ 1. FIRST CARDIAG TASK — finish claim 2 (~10 min)
+
+Everything is staged. `captest` now carries **`-DFS_TIER_A_MAX_PCT=10`**, moving
+the cap to ~406 kB, which the measured **786 B/s** Tier A rate reaches in about
+9 minutes.
+
+```
+powershell -ExecutionPolicy Bypass -File toolsun_bench.ps1 -Minutes 15
+```
+
+🔑 **Why claim 2 kept missing, and it was not one cause but three:**
+1. the partition was Tier B dominant → fixed by erasing spiffs;
+2. `fstest` set `FS_SNAPSHOT_PERIOD_MS=20`, accelerating the **wrong tier** →
+   fixed by the `captest` env;
+3. SELFTEST fills Tier A at **786 B/s**, not the 9,450 B/s measured on a real
+   bus, because the change log **deduplicates** and SELFTEST emits a fixed
+   14-id profile → fixed by lowering the cap for the test.
+
+⚠️ The board currently on the bench was flashed **before** the 10% flag, so it
+still has the 40% cap. The runner reflashes, so just run it.
+
+## ▶ 2. FIRST TASK ONCE THE PI IS PLUGGED IN — Ventis backup, treated as uninterruptible
+
+🚨 **BEFORE ANY REIMAGE.** That Pi *is* the Ventis legacy Pi.
+
+- `ls -la ~ ~/ventis` **first** — an older CSV may sit at
+  `/home/diegot1466/ventis_data.csv`, one level up from `~/ventis/`. Copying
+  only `~/ventis/` could miss it.
+- Copy **both** to the laptop, **verify sha256 on both ends**, record the
+  hashes in `carhub/docs/deploy-pi.md`, and only then reimage.
+- CSV columns are `timestamp, condition, co2_ppm, temp_c, humidity_pct` —
+  **`humidity_pct`, not `humidity_rh`**. → `memory/reference_rpi.md`.
+
+## ▶ 3. Pi migration — 3 of 4 blockers cleared
+
+Blockers 2 and 3 fixed (`sink: mqtt`, network → `10.42.0.x`) and MQTT
+credentials generated. The hub now prints `[deploy] profile=pi`. **Left, both
+off-laptop:** copy the credentials to the Pi's `secrets.env` (verify by
+fingerprint, not by eye) and create the broker user with **`allow_anonymous
+false`**. → `carhub/docs/deploy-pi.md` §1a.
+
+## ▶ 4. BMW electrical reference — template ready, awaiting TIS
+
+`carhub/docs/bmw-f30-electrical.md` — **private repo on purpose** (TIS diagrams
+are copyrighted; only our own notes and citations go in). Every slot empty,
+every row needs `source` + `status`. ⏳ Blocked on Diego's TIS access, and §d is
+blocked on his VIN option decode.
+
+⏸ **The WDT timing margin still waits for the car** — the bench cannot produce a
+marginal link on demand.
+
+---
 ## 0. Where the measurements are
 
 ⚠️ **These are gitignored and therefore LOCAL TO THIS MACHINE.** `.gitignore`
@@ -177,7 +273,8 @@ marginal link on demand.
 ### 2a. ▶ RUN IT — one command, detached
 
 ```
-powershell -ExecutionPolicy Bypass -File toolsun_bench.ps1
+powershell -ExecutionPolicy Bypass -File tools
+un_bench.ps1
 ```
 
 Launch it in **its own PowerShell window**. It is self-contained: pre-flight

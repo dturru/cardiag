@@ -9,6 +9,22 @@
 // the esp_task_wdt_reset() calls below; each one documents what bought it.
 #include <esp_task_wdt.h>
 
+// Feed the task watchdog ONLY if this task is actually subscribed to it.
+//
+// 🐛 WHY THE GUARD (found on the bench 2026-09-24). enforceRetention() runs
+// from filestoreBegin(), which runs in setup() -- and the watchdog is not
+// armed until LATER in setup(). Calling esp_task_wdt_reset() before that
+// prints `E task_wdt: esp_task_wdt_reset(707): task not found` on every single
+// boot. It is harmless, the call just fails, but a benign error printed every
+// boot is exactly the noise that hides a real one six months from now.
+//
+// Deliberately NOT solved by moving the arming earlier: the watchdog is armed
+// late on purpose, because a corrupt-partition format in filestoreBegin() can
+// take longer than WDT_TIMEOUT_S and would otherwise reboot into itself.
+static inline void wdtFeedIfArmed() {
+  if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
+}
+
 #include "filestore.h"
 #include "recorder.h"
 #include "sniffer.h"
@@ -423,7 +439,7 @@ static void enforceTierACap() {
     // put many removes plus a recomputeUsage() back to back, and this runs
     // inside loop()'s WDT window. The loop terminates on its own -- tierABytes
     // strictly decreases, and it breaks when no candidate remains.
-    esp_task_wdt_reset();
+    wdtFeedIfArmed();
   }
 }
 
@@ -441,7 +457,7 @@ static void enforceRetention() {
     // and `guard` bounds the loop at FS_MAX_FILES regardless. A full-disk
     // reclaim is a legitimate long operation; rebooting through it would drop
     // the open files it is trying to make room for.
-    esp_task_wdt_reset();
+    wdtFeedIfArmed();
   }
   recomputeUsage();
 }
@@ -1036,7 +1052,7 @@ static void handleFetch(WebServer &srv) {
     // The feed is AFTER `got` bytes were actually sent, never at the top of
     // the loop: it is bought with progress. A stall inside a single
     // sendContent() still trips the watchdog, which is the case it is for.
-    esp_task_wdt_reset();
+    wdtFeedIfArmed();
   }
   f.close();
 }
