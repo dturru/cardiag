@@ -112,6 +112,15 @@ struct FileStoreStats {
   uint32_t totalBytes;
   uint16_t files;
   uint16_t openFiles;
+  // Closed files the hub has not acked. Between trips this is normally
+  // NON-ZERO and that is correct, not a stalled sync: the bus goes quiet, the
+  // files close ~3 s later and the board sleeps before the hub can pull them,
+  // so a trip syncs at the NEXT ignition (protocol 2.3.1).
+  //
+  // The logger has to report it because the hub cannot derive it -- evictions
+  // punch holes in the index range, so files/open/acked_through do not
+  // determine the count.
+  uint16_t pendingUnacked;
   uint32_t nextIndex;
   int32_t  ackedThrough;     // -1 = nothing acked yet
   uint32_t tierABytes;

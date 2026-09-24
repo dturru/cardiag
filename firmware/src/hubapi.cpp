@@ -147,7 +147,8 @@ static void handleSession(WebServer &srv) {
   n = jsonAppend(buf, sizeof(buf), n,
       "\"storage\":{\"mounted\":%s,\"used\":%lu,\"total\":%lu,"
       "\"usage_pct\":%u,\"warn_pct\":%u,\"warn\":%s,"
-      "\"files\":%u,\"open\":%u,\"acked_through\":%ld,"
+      "\"files\":%u,\"open\":%u,\"pending_unacked\":%u,"
+      "\"acked_through\":%ld,"
       "\"tier_a_bytes\":%lu,\"tier_b_bytes\":%lu,\"tier_c_bytes\":%lu,"
       "\"deleted_acked\":%lu,\"deleted_unacked\":%lu,"
       "\"unacked_evicted_bytes\":{\"A\":%lu,\"B\":%lu,\"C\":%lu},"
@@ -157,7 +158,8 @@ static void handleSession(WebServer &srv) {
       (unsigned long)fs->usedBytes, (unsigned long)fs->totalBytes,
       (unsigned)filestoreUsagePct(), (unsigned)FS_WARN_USAGE_PCT,
       filestoreWarn() ? "true" : "false",
-      (unsigned)fs->files, (unsigned)fs->openFiles, (long)fs->ackedThrough,
+      (unsigned)fs->files, (unsigned)fs->openFiles,
+      (unsigned)fs->pendingUnacked, (long)fs->ackedThrough,
       (unsigned long)fs->tierABytes, (unsigned long)fs->tierBBytes,
       (unsigned long)fs->tierCBytes,
       (unsigned long)fs->deletedAcked, (unsigned long)fs->deletedUnacked,

@@ -167,10 +167,16 @@ static void sortEntries() {
 static void recomputeUsage() {
   g_st.files = g_fileCount;
   g_st.openFiles = 0;
+  g_st.pendingUnacked = 0;
   g_st.tierABytes = g_st.tierBBytes = g_st.tierCBytes = 0;
   for (uint16_t i = 0; i < g_fileCount; i++) {
     const FileEntry &e = g_files[i];
     if (!e.closed) g_st.openFiles++;
+    // Closed and above the watermark: finished, and the hub does not have it.
+    // Only the logger can count this -- the hub cannot derive it from files,
+    // open and acked_through, because evictions punch holes in the index
+    // range. Between trips this is normally non-zero; see protocol 2.3.1.
+    else if ((int32_t)e.index > g_st.ackedThrough) g_st.pendingUnacked++;
     switch (fsTierForKind(e.kind)) {
       case FS_TIER_SNAPSHOT: g_st.tierBBytes += e.bytes; break;
       case FS_TIER_BOOKEND:  g_st.tierCBytes += e.bytes; break;
