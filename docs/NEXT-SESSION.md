@@ -11,127 +11,128 @@ clear) into the repo working tree:
 ```
 cardiag/analysis/retention-2026-09-23/
     retention1.log / .csv   fill to 25%, nothing evicted -- baseline
-    retention2.log / .csv   THE TIER A CAP RUN -- read the CLAIM 3 verdict here
+    retention2.log / .csv   THE TIER A CAP RUN -- found the CLAIM 3 failure
     soak50.log   / .csv     the 50-cycle soak that found the 6.3 kB/cycle leak
+cardiag/analysis/retention-2026-09-24/
+    retention3.log / .csv   post-fix run. See section 1 for what it did and
+                            did not manage to exercise.
 ```
-
-**The CLAIM 3 verdict is at the bottom of `retention2.log`**, under a
-`RETENTION WATCH` banner. `retention_watch.py` also exits non-zero on FAIL.
 
 🔑 **The `.csv` is written only when the run COMPLETES** (in `main()`, after
 `report()`), so a killed run leaves the `.log` but no `.csv`. The log is written
 live and is the one to trust.
 
+---
 
+## ✅ DONE 2026-09-24 — sections 1, 2, 3 and 4 of the previous handoff
 
-Written 2026-09-23 with context running short. Everything here is agreed work
-that was deliberately NOT started, so it does not get half-done.
+Commits: cardiag `9b5a26b`, `4290d6f`, `93a36c1` · carhub `ac24757`, `ae9b34e`.
 
-## 1. Tier A retention gap — fix to the agreed rule
+| Was | Now |
+|---|---|
+| §1 Tier A "never silent" | **FIXED** — `filestoreWarn()`, per-tier counters, hub/health, dashboard |
+| §1b run 3 ordering | **CLAIM 2 NOW PASSES ON HARDWARE** at the `evictOne()` level → `analysis/retention-2026-09-24/claim2-hardware-2026-09-24.md`. The **cap's own** choice is still unexercised — see below |
+| §2 WDT vs long ops | **FIXED** in code; format case proved safe by construction |
+| §3 key-off sync delay | **DOCUMENTED** (protocol §2.3.1) + `pending_unacked` on the dashboard |
+| §4 MEMORY.md compaction | **DONE** — 24.4 kB → 16.7 kB, every pointer grep-verified first |
 
-### ✅ CONFIRMED — retention run 2, 2026-09-23. `retention_watch.py` exited 1.
+### What was verified ON HARDWARE (board on COM3, Wi-Fi `192.168.137.64`)
+
+- `unacked_evicted_files` / `unacked_evicted_bytes` are live and **attribution
+  is exact**: `deleted_unacked=6` with `{A:4, B:2}` summing to 6.
+  The Tier B loss (131,256 B) was **invisible in the old total** — it is the
+  irreplaceable class and the single number could not distinguish it.
+- `pending_unacked` reports (46 at the time of the check), which is the
+  key-off-delay number the dashboard now shows.
+- **CLAIM 2 PASSES.** Acking a broad prefix mid-run created the contest runs 1
+  and 2 never had: `deleted_acked` then moved 0 → 1 → 2 while
+  `deleted_unacked` stayed pinned at 26, having been climbing every ~20 s up to
+  that point. Retention takes acked first and leaves unacked alone. Evidence:
+  `analysis/retention-2026-09-24/claim2-hardware-2026-09-24.md`.
+- `warn` reports true. ⚠️ **Only the total-usage arm was exercised** — the board
+  sat at 87-91% the whole time, above the 70% threshold, so the run did NOT
+  demonstrate the new "warn even when usage is low" arm. See below.
+
+### 🔴 STILL OPEN — run 3 could not reach the state it needs
+
+The bench partition is **dominated by Tier B** (~3.1 MB of 4.06 MB) and sits at
+87-91% usage. Two consequences, and both defeat the test:
+
+1. **The Tier A cap never fires.** Tier A never exceeds ~70 kB against a cap of
+   ~1.6 MB (40% of the partition), so `enforceTierACap()` — the function §1b is
+   about — is never entered. What evicts is `enforceRetention()`'s 90% rule.
+2. **`warn` is already true** from total usage, so the second arm of the fixed
+   rule is not under test.
+
+Tier A files also rotate at `FS_FILE_MAX_BYTES` (64 kB) and are then evicted
+almost immediately by `evictOne()` step 2, so a *closed* Tier A file exists only
+for seconds. `--ack-after N` looks for N closed Tier A files and mostly finds
+zero.
+
+**To actually run it, start from a clean partition:**
 
 ```
-[t= 1249.0] EVICTED #7 tier=A kind=changes bytes=65559 synthetic=True
-[t= 1249.0] *** first UNACKED deletion, usage 55%, warn=False ***
-[t= 1359.9] EVICTED #8 tier=A kind=changes bytes=65842 synthetic=True
-[t= 1458.3] EVICTED #9 tier=A kind=changes bytes=65884 synthetic=True
-
-usage      28% -> 55%          tier A  769,470 -> 1,586,755 B
-deleted    acked 0  unacked 3  write err 0   rows dropped 0
-
-CLAIM 3 -- warn before any unacked loss:
-  ** FAIL **: an unacked file was deleted at usage 55% with warn=False.
+# erase the spiffs partition so LittleFS reformats on mount, then:
+pio run -e esp32-can-x2-fstest -t upload --upload-port COM3
+# board joins the hotspot; then SELFTEST + change log on:
+python tools/serial_capture.py --port COM3 --seconds 40 --delay 3 --gap 3 \
+    --send "3" --send "y" --send "l"
+python tools/retention_watch.py --host <ip> --seconds 1800 --interval 3 \
+    --ack-after 6 --csv analysis/retention-2026-09-2x/retention3.csv
 ```
 
-**Three unacked Tier A files — 197,285 bytes — were destroyed with `warn` still
-false, at 55% usage, 15 points below the 70% threshold.** `deleted_unacked` did
-increment, so the loss is *reported*; it is simply never *pre-warned*, which is
-exactly the ordering the rule below fixes.
+On an empty partition Tier A grows toward its cap while total usage stays well
+under 70%, which is the state that exercises **both** open questions at once:
+the cap's acked-before-unacked choice, and `warn` firing on an unacked eviction
+while usage is low.
 
-**CLAIM 2 remains NOT EXERCISED** — and honestly so: there were no acked files
-left to drop, so going straight to unacked was correct behaviour, not a failure.
-That is what run 3 (§1b) is for.
+🔑 **Two environment traps that cost time, both already in MEMORY.md:**
+- **`PYTHONIOENCODING=utf-8` is required for `pio ... -t upload`.** Without it
+  the upload dies after ~10 minutes on a `UnicodeEncodeError` in cp1252 that
+  says nothing about the real problem.
+- **Windows Mobile Hotspot switches itself off** when nothing connects. Start it
+  (`tools/hotspot.ps1 -Action start`) and reset the board promptly, or the join
+  fails with `NO_AP_FOUND` against the correct SSID.
 
-Status: measured in retention run 2, verdict above. The gap is that
-`enforceTierACap()` evicts Tier A at 40% of the partition **independently of
-total usage**, while `storage.warn` fires at 70% of total — so an unacked Tier
-A file can be deleted with `warn` still false.
+📡 **Bench IP has now been `.57 · .119 · .109 · .51 · .64` — five.** Windows ICS
+has no reservation. Never filter on `logger_ip`; the `device_id` allowlist is
+the real one.
 
-**The rule to implement** (agreed, not my invention): evicting unacked Tier A at
-the 40% cap is allowed, but never silent. Any deletion of unacked data must:
+---
 
-- **(a)** set `warn` **regardless of total usage**
-- **(b)** increment **per-tier** `unacked_evicted_bytes` / `unacked_evicted_files`
-  counters on `/api/v1/session`
-- **(c)** be published to `hub/health` **and** shown on the dashboard
+## 1. Remaining work
 
-Touches: `filestore.cpp` (`evictOne`, `enforceTierACap`, `FileStoreStats`),
-`hubapi.cpp` (session JSON), `carhub/ingest/file_sync.py` (consume + publish),
-`carhub/web/templates/hub.html` (surface), plus tests on both sides.
+### 1a. Finish retention run 3 on a clean partition
+Per the recipe above. The pass conditions are unchanged:
 
-### 1b. Retention run 3 — make `enforceTierACap()` actually choose
-
-Runs 1 and 2 could not test the deletion **order**, only the warn rule. Every
-file on the disk was acked through index 3 and every Tier A file created during
-the fill was unacked, so at the cap there was no acked-vs-unacked contest —
-`enforceTierACap()` only ever looks at Tier A, and it had exactly one kind of
-candidate. That is why claim 2 is reported as **not exercised** rather than
-passed.
-
-**Run 3 setup:** fill Tier A as before, but **ack some of the Tier A files
-mid-run** (sync + `POST /api/v1/files/ack` partway through) and leave later ones
-unacked, so that when the cap fires there are both kinds present and the
-function has to pick.
-
-**Pass:**
 - acked Tier A files are evicted **first**
 - unacked Tier A is touched **only after** the acked ones are gone
-- `warn` is set on the **first unacked** eviction (the rule from §1)
+- `warn` is set on the **first unacked** eviction *while total usage is still
+  below `warn_pct`* — the arm that is still unproven
 - `deleted_acked` and `deleted_unacked` move independently and correctly
 
-`tools/retention_watch.py` already records eviction order per file index and the
-`warn` state at the first unacked deletion, so it should need no changes — only
-a fill script that interleaves acks.
+`retention_watch.py` now judges claim 2 on the **observed eviction sequence**
+(was: which counter moved first) and adds **claim 3b**, which asserts the
+per-tier counters sum to `deleted_unacked`.
 
-## 2. Watchdog vs long operations — bench test
+### 1b. Measure the watchdog margin
+§2's fix is structural: every long loop now feeds the WDT after a unit of
+provable progress, and the format case is safe because the watchdog is armed
+after `filestoreBegin()`. **What is NOT measured is the margin** — how close a
+worst-case download over a marginal link actually gets to 30 s. The bench cannot
+produce a marginal link on demand. Options: throttle at the AP, or instrument
+`handleFetch()` to record its own worst-case duration and report it on
+`/api/v1/session` alongside the heap low-water mark, which is the same trick and
+needs no special network.
 
-The 30 s task watchdog is armed in `setup()` and fed from `loop()`. Three
-operations can plausibly exceed 30 s or block `loop()` long enough to trip it,
-and **all three must feed the WDT**:
+## 2. Unchanged from before
 
-- a large `GET /api/v1/files/<index>` download (worst case: the biggest file
-  the partition can hold, over a marginal link)
-- full-disk eviction (`enforceRetention()` walking many files at once)
-- a LittleFS format
-
-Test: run each at worst case with the WDT armed, expect **zero resets**. A
-watchdog that fires during a legitimate long operation is worse than no
-watchdog — it would reboot mid-download forever.
-
-## 3. Document the key-off sync delay as intended behaviour
-
-The logger closes its files ~3 s after the bus goes quiet and then sleeps, which
-is *before* the hub can pull them. So a trip's files sync at the **NEXT
-ignition**, not at the end of the trip that produced them.
-
-**Nothing is lost** — `Range` resume plus the ack watermark make it a delay, not
-a gap — but it is surprising if undocumented, and someone will eventually read
-it as a bug.
-
-- Add to `carhub/docs/protocol.md` §2 as stated behaviour, with the reasoning
-- Surface on the dashboard as **"N files pending from last trip"**, so the delay
-  is visible rather than inferred
-
-## 4. MEMORY.md compaction
-
-`MEMORY.md` is ~23 KB against a ~24.4 KB hard load cap. Compact to under ~17 KB.
-
-🔑 **Verify each pointer target actually holds the detail BEFORE cutting.** The
-file's own trim rule says compaction without that check is deletion, and it
-records six bad anchors found so far.
-
-Most of this session's detail is already in vault
-`Projects/CAN-Diagnostics/CAN Diagnostics Overview.md` §HARDWARE BRING-UP and
-§DASHBOARD — grep-verified at the time — but re-verify rather than trusting
-this sentence.
+- 🔴 `cea5bcd` (Altium hardware design) is in neither repo; needs Diego's
+  interactive Altium 365 credentials.
+- 🔴 Board UNDERSIDE clearance at the 4 mounts is UNVERIFIED and gates boss
+  height.
+- 🚗 The 60 s `MODE_LISTEN` id-count on a real bus is still the dominant
+  unknown and the only thing a desk cannot produce.
+- Harness is dupont + tape and **browns out when moved**, so every capture taken
+  on it is suspect.
+- **`github.com/dturru/Ventis` still exposes the Gmail address** on every commit.
