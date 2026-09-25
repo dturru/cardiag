@@ -441,10 +441,11 @@
 #define REC_RAW_BYTES_PSRAM (4u * 1024u * 1024u)
 #define REC_CHG_BYTES_PSRAM (2u * 1024u * 1024u)
 
-// Without PSRAM the feature shrinks rather than disappears, so a board that
-// fails to bring the octal RAM up is still usable and says so.
+// Without PSRAM the RAW ring shrinks rather than disappears (it is a debug
+// window, not a record). The CHANGE LOG does not: a 32 KB log held ~1.4 s at
+// 1,500 frames/s and dropped rows on any filestore stall, so without PSRAM it
+// is OFF and the board says so at boot and on /api/v1/session (recorder.cpp).
 #define REC_RAW_BYTES_FALLBACK (64u * 1024u)
-#define REC_CHG_BYTES_FALLBACK (32u * 1024u)
 
 // Chunk size for streaming a CSV download out of the web server.
 #define REC_CSV_CHUNK 2048

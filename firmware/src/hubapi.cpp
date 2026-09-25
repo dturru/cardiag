@@ -188,10 +188,14 @@ static void handleSession(WebServer &srv) {
     const CanDrops d = cardiagCanDrops();
     n = jsonAppend(buf, sizeof(buf), n,
         "\"can_drops\":{\"twai_up\":%s,\"rx_missed\":%lu,\"rx_overrun\":%lu,"
-        "\"changelog_dropped\":%lu,\"id_overflow\":%lu},",
+        "\"changelog_dropped\":%lu,\"id_overflow\":%lu,\"raw_ring_busy\":%lu,"
+        // "ok", or why there is no Tier A change log (no PSRAM: it is OFF,
+        // not shrunk to a size that drops rows).
+        "\"change_log\":\"%s\"},",
         d.twaiUp ? "true" : "false", (unsigned long)d.rxMissed,
         (unsigned long)d.rxOverrun, (unsigned long)d.changelogDropped,
-        (unsigned long)d.idOverflow);
+        (unsigned long)d.idOverflow, (unsigned long)d.rawRingBusy,
+        d.changeLog ? d.changeLog : "");
   }
 
   // Stream counters. The hub counts datagrams it RECEIVED; these are what the

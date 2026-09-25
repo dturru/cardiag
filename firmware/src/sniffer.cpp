@@ -161,17 +161,40 @@ static bool isHeartbeatByte(const struct IdSlot &s, uint8_t i) {
   return (s.byteChanges[i] * 100UL) / comparisons >= SNIFF_HEARTBEAT_PCT;
 }
 
-void snifferPrint(uint32_t frames, uint32_t missed, uint32_t busErr) {
+// A consistent copy of the table, taken under the lock and nothing else.
+//
+// 🐛 snifferPrint() used to hold the table lock for the WHOLE Serial print --
+// 64 rows at 115200 baud is ~350 ms -- and canTask takes that lock on every
+// frame. A blocked canTask is a full TWAI queue and a missed frame. Printing
+// and JSON formatting now happen on the copy, outside the lock; the lock is
+// held for one memcpy of the table (~5 KB).
+static IdSlot   s_copy[SNIFF_MAX_IDS];
+static uint16_t copyTable(uint16_t *overflow, uint32_t *markedAtMs) {
   lockTable();
+  const uint16_t n = g_count;
+  memcpy(s_copy, g_slots, (size_t)n * sizeof(IdSlot));
+  *overflow = g_overflow;
+  *markedAtMs = g_markedAtMs;
+  unlockTable();
+  return n;
+}
+
+void snifferPrint(uint32_t frames, uint32_t missed, uint32_t busErr) {
+  // loop() only; the copy buffer is shared with snifferSnapshotJson(), which
+  // runs in the web server -- also on the loop() task.
+  uint16_t ovf;
+  uint32_t markedAt;
+  const uint16_t count = copyTable(&ovf, &markedAt);
+  const IdSlot *slots = s_copy;
 
   // Sort indices by ID for a stable, readable table. Done at print time (twice
   // a second) rather than on insert, so the RX path stays a plain scan.
   uint16_t idx[SNIFF_MAX_IDS];
-  for (uint16_t i = 0; i < g_count; i++) idx[i] = i;
-  for (uint16_t i = 1; i < g_count; i++) {
+  for (uint16_t i = 0; i < count; i++) idx[i] = i;
+  for (uint16_t i = 1; i < count; i++) {
     const uint16_t key = idx[i];
     int16_t j = (int16_t)i - 1;
-    while (j >= 0 && g_slots[idx[j]].id > g_slots[key].id) {
+    while (j >= 0 && slots[idx[j]].id > slots[key].id) {
       idx[j + 1] = idx[j];
       j--;
     }
@@ -180,17 +203,17 @@ void snifferPrint(uint32_t frames, uint32_t missed, uint32_t busErr) {
 
   Serial.printf("=== sniff | %u ids | %lu frames | missed %lu | bus_err %lu | "
                 "marked %lus ago",
-                g_count,
+                count,
                 (unsigned long)frames,
                 (unsigned long)missed,
                 (unsigned long)busErr,
-                (unsigned long)((millis() - g_markedAtMs) / 1000));
-  if (g_overflow) Serial.printf(" | OVERFLOW %u", g_overflow);
+                (unsigned long)((millis() - markedAt) / 1000));
+  if (ovf) Serial.printf(" | OVERFLOW %u", ovf);
   Serial.println(" ===");
   Serial.println(" ID     per  count   data   ([xx] moved since clear, .. heartbeat)");
 
-  for (uint16_t n = 0; n < g_count; n++) {
-    const IdSlot &s = g_slots[idx[n]];
+  for (uint16_t n = 0; n < count; n++) {
+    const IdSlot &s = slots[idx[n]];
 
     const uint32_t period =
         (s.count > 1) ? (s.lastMs - s.firstMs) / (s.count - 1) : 0;
@@ -214,7 +237,6 @@ void snifferPrint(uint32_t frames, uint32_t missed, uint32_t busErr) {
   }
   Serial.println();
 
-  unlockTable();
 }
 
 // ---------------------------------------------------------------------------
@@ -223,14 +245,17 @@ void snifferPrint(uint32_t frames, uint32_t missed, uint32_t busErr) {
 
 size_t snifferSnapshotJson(char *out, size_t cap,
                            uint32_t frames, uint32_t missed, uint32_t busErr) {
-  lockTable();
+  uint16_t ovf;
+  uint32_t markedAt;
+  const uint16_t count = copyTable(&ovf, &markedAt);
+  const IdSlot *slots = s_copy;
 
   uint16_t idx[SNIFF_MAX_IDS];
-  for (uint16_t i = 0; i < g_count; i++) idx[i] = i;
-  for (uint16_t i = 1; i < g_count; i++) {
+  for (uint16_t i = 0; i < count; i++) idx[i] = i;
+  for (uint16_t i = 1; i < count; i++) {
     const uint16_t key = idx[i];
     int16_t j = (int16_t)i - 1;
-    while (j >= 0 && g_slots[idx[j]].id > g_slots[key].id) {
+    while (j >= 0 && slots[idx[j]].id > slots[key].id) {
       idx[j + 1] = idx[j];
       j--;
     }
@@ -242,11 +267,11 @@ size_t snifferSnapshotJson(char *out, size_t cap,
                 "{\"frames\":%lu,\"missed\":%lu,\"busErr\":%lu,"
                 "\"ids\":%u,\"overflow\":%u,\"markedAgo\":%lu,\"rows\":[",
                 (unsigned long)frames, (unsigned long)missed,
-                (unsigned long)busErr, g_count, g_overflow,
-                (unsigned long)((millis() - g_markedAtMs) / 1000));
+                (unsigned long)busErr, count, ovf,
+                (unsigned long)((millis() - markedAt) / 1000));
 
-  for (uint16_t k = 0; k < g_count; k++) {
-    const IdSlot &s = g_slots[idx[k]];
+  for (uint16_t k = 0; k < count; k++) {
+    const IdSlot &s = slots[idx[k]];
 
     // Stop cleanly rather than emit half a row. A truncated snapshot would
     // parse as broken JSON and blank the page for no visible reason.
@@ -275,7 +300,6 @@ size_t snifferSnapshotJson(char *out, size_t cap,
 
   n += snprintf(out + n, cap - n, "]}");
 
-  unlockTable();
   return n;
 }
 

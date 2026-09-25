@@ -76,6 +76,13 @@ uint32_t recorderRawTotal();       // frames ever seen, including overwritten
 uint32_t recorderChangeStored();
 uint32_t recorderChangeDropped();  // appends refused because the log filled
 
+// "ok", or why the change log is off ("disabled: needs PSRAM", ...). Without
+// PSRAM there is no change log at all: see recorderBegin().
+const char *recorderChangeLogStatus();
+// Raw-ring frames canTask skipped because a raw.csv reader held the ring's
+// lock. canTask only ever TRIES that lock; it never waits.
+uint32_t recorderRawBusyDropped();
+
 // While frozen the raw ring stops accepting frames. A download takes seconds
 // and the ring wraps every few minutes, so without this a long transfer could
 // have the ground move under it and emit rows twice or not at all. Frames are

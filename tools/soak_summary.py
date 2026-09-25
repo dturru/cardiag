@@ -315,7 +315,8 @@ def judge(rows: list[dict], *, requested: int = 0,
     DROP_COLS = {"can_rx_missed": "TWAI RX queue full (rx_missed)",
                  "can_rx_overrun": "TWAI RX FIFO overrun",
                  "can_chg_dropped": "change-log ring full",
-                 "can_id_overflow": "sniffer id table full"}
+                 "can_id_overflow": "sniffer id table full",
+                 "can_raw_busy": "raw ring busy (canTask try-lock failed)"}
     drops: dict[str, int] | None = None
     if rows and any((r.get(c) or "").strip() for r in rows for c in DROP_COLS):
         drops = {}

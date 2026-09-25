@@ -36,8 +36,8 @@ FIELDS = sw.CSV_FIELDS
 
 def row(cycle: int, *, loop_cycle=38_000, stage="webui", loop_boot=42_000,
         boot_stage="webui", idle=0, panics=0, reboot=False, heap=200_000,
-        missed=0, overrun=0, chg=0, idovf=0, fs_us=9_000, fs_stage="snapshot",
-        fs_pass=12_000, fs_walks=0):
+        missed=0, overrun=0, chg=0, idovf=0, rawbusy=0, fs_us=9_000,
+        fs_stage="snapshot", fs_pass=12_000, fs_walks=0):
     return {"cycle": cycle, "detect_ms": "-1500.0", "rejoin_ms": "9000.0",
             "fallback_ms": 120, "drop_path": "event", "reason": 201,
             "heap": heap, "minheap": heap - 20_000, "largest_block": heap // 2,
@@ -51,7 +51,7 @@ def row(cycle: int, *, loop_cycle=38_000, stage="webui", loop_boot=42_000,
             "fs_pass_us": fs_pass, "fs_walks": fs_walks,
             "can_rx_missed": missed,
             "can_rx_overrun": overrun, "can_chg_dropped": chg,
-            "can_id_overflow": idovf}
+            "can_id_overflow": idovf, "can_raw_busy": rawbusy}
 
 
 def write(tmp_path: Path, rows: list[dict], fields=FIELDS) -> Path:
@@ -208,6 +208,7 @@ def test_run_soak_takes_done_from_the_verdict_file_only():
     ({"overrun": 1}, "FIFO overrun"),
     ({"chg": 12}, "change-log ring full"),
     ({"idovf": 2}, "sniffer id table full"),
+    ({"rawbusy": 1}, "raw ring busy"),
 ])
 def test_any_can_drop_fails(tmp_path, kw, what):
     rows = healthy()
@@ -247,13 +248,13 @@ def test_stats_line_parses_into_the_cycle():
             "heap=200000 minheap=180000 largest=100000 loopmax=2400000us "
             "loopstage=filestore loopwin=1200000us loopwinstage=filestore "
             "fswin=1100000us fswinstage=fs_size fswinpass=1180000us fswalks=3 "
-            "canmiss=0 canovr=0 chgdrop=4 idovf=0")
+            "canmiss=0 canovr=0 chgdrop=4 idovf=0 rawbusy=0")
     tap = types.SimpleNamespace(snapshot=lambda: [sw.Line(0.0, line)])
     cyc, tot = sw.Cycle(n=1), sw.Totals()
     sw.scan_window(tap, 0, 1, cyc, tot)
     assert (cyc.fs_sub_max_us, cyc.fs_sub_stage, cyc.fs_pass_us) == (
         1_100_000, "fs_size", 1_180_000)
-    assert (cyc.can_rx_missed, cyc.can_chg_dropped) == (0, 4)
+    assert (cyc.can_rx_missed, cyc.can_chg_dropped, cyc.can_raw_busy) == (0, 4, 0)
     assert cyc.fs_walks == 3
     assert (cyc.loop_cycle_max_us, cyc.loop_cycle_stage) == (1_200_000,
                                                              "filestore")
