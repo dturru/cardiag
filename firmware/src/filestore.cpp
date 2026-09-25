@@ -8,24 +8,31 @@
 // loop()'s watchdog window, so they feed it after each unit of progress. See
 // the esp_task_wdt_reset() calls below; each one documents what bought it.
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <stdio.h>
 
 // Feed the task watchdog ONLY if this task is actually subscribed to it.
 //
-// 🐛 WHY THE GUARD (found on the bench 2026-09-24). enforceRetention() runs
-// from filestoreBegin(), which runs in setup() -- and the watchdog is not
-// armed until LATER in setup(). Calling esp_task_wdt_reset() before that
-// prints `E task_wdt: esp_task_wdt_reset(707): task not found` on every single
-// boot. It is harmless, the call just fails, but a benign error printed every
-// boot is exactly the noise that hides a real one six months from now.
+// 🐛 WHY THE GUARD (found on the bench 2026-09-24): calling
+// esp_task_wdt_reset() from a task that is not subscribed prints
+// `E task_wdt: esp_task_wdt_reset(707): task not found`. Harmless, but a
+// benign error printed every boot is the noise that hides a real one.
 //
-// Deliberately NOT solved by moving the arming earlier: the watchdog is armed
-// late on purpose, because a corrupt-partition format in filestoreBegin() can
-// take longer than WDT_TIMEOUT_S and would otherwise reboot into itself.
+// ⚠️ NOT CALLED ANYWHERE UNDER filestoreBegin(). Since 2026-09-25 the watchdog
+// is armed BEFORE filestoreBegin() with the boot budget (FS_BOOT_WDT_S), and
+// that budget is the bound on the whole start: feeding it from inside would
+// let a slow-but-progressing scan run forever, which is the 187 s boot this
+// replaced. Feeds are for loop()-time work that is bought with progress --
+// retention, hydration, downloads.
 static inline void wdtFeedIfArmed() {
   if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
 }
 
 #include "filestore.h"
+#include "fsindex.h"
+#include "bootguard_rt.h"
 #include "recorder.h"
 #include "sniffer.h"
 #include "session.h"
@@ -73,20 +80,17 @@ struct __attribute__((packed)) SnapFileHeader {
 };
 static_assert(sizeof(SnapFileHeader) == 16, "SnapFileHeader must be 16 bytes");
 
-struct FileEntry {
-  uint32_t index;
-  uint32_t bytes;
-  uint32_t bootId;
-  uint8_t  sha[32];
-  char     kind;          // tier is fsTierForKind(kind); never stored twice
-  uint8_t  mode;
-  bool     closed;
-  bool     hasSha;
-};
-
-static FileEntry g_files[FS_MAX_FILES];
-static uint16_t  g_fileCount = 0;
+// The index. GROWS -- see fsindex.h for why a fixed FS_MAX_FILES array was
+// the bug. FS_MAX_FILES is now retention's file-count cap, not a table size.
+typedef FsEntry FileEntry;
+static FsTable g_tab;
 static FileStoreStats g_st;
+
+// Set when a retention pass ran out of budget with work left, so the next
+// loop() pass continues instead of waiting for the 5 s timer.
+static bool g_retentionMore = false;
+// Next entry to look at when hydrating; wraps.
+static uint16_t g_hydrateCursor = 0;
 
 static Preferences g_fsPrefs;
 static bool  g_enabled = false;
@@ -126,83 +130,60 @@ static void makeName(char *out, size_t cap, uint32_t index, char kind,
            (unsigned long)bootId, ext);
 }
 
-static bool parseName(const char *name, uint32_t *index, char *kind,
-                      uint32_t *bootId, char *ext, size_t extCap) {
-  // NNNNNN_TK_BBBBBBBB.ext
-  unsigned long idx = 0, boot = 0;
-  char t = 0, k = 0;
-  char e[8] = {0};
-  if (sscanf(name, "%6lu_%c%c_%8lX.%7s", &idx, &t, &k, &boot, e) != 5) return false;
-  if (k != FS_KIND_RAW && k != FS_KIND_CHANGES &&
-      k != FS_KIND_SNAPSHOT && k != FS_KIND_BOOKEND) return false;
-  // The tier is DERIVED from the kind, never read from the name: a file whose
-  // two letters disagree is a file written by a version that had the mapping
-  // wrong, and trusting its tier letter would put it in the wrong retention
-  // class. The kind is the fact; the tier is a function of it.
-  if (t != fsTierForKind(k)) {
-    Serial.printf("[fs] %s: tier '%c' disagrees with kind '%c'; using '%c'\n",
-                  name, t, k, fsTierForKind(k));
-  }
-  *index = (uint32_t)idx;
-  *kind = k;
-  *bootId = (uint32_t)boot;
-  snprintf(ext, extCap, "%s", e);
-  return true;
+// Full VFS path for a file, for the POSIX calls. LittleFS is mounted at
+// FS_VFS_ROOT (config.h) explicitly, so this cannot drift from the mount.
+static void makeVfsName(char *out, size_t cap, uint32_t index, char kind,
+                        uint32_t bootId, const char *ext) {
+  char rel[64];
+  makeName(rel, sizeof(rel), index, kind, bootId, ext);
+  snprintf(out, cap, "%s%s", FS_VFS_ROOT, rel);
 }
 
 // ---------------------------------------------------------------------------
-// Index table
+// Index table -- thin wrappers over fsindex.cpp
 // ---------------------------------------------------------------------------
 
-static FileEntry *findEntry(uint32_t index) {
-  for (uint16_t i = 0; i < g_fileCount; i++) {
-    if (g_files[i].index == index) return &g_files[i];
-  }
-  return nullptr;
+// PSRAM first: the table is ~52 B per file and the soak image had 690 files.
+// Internal RAM only as a fallback, and nullptr is a real answer -- the scan
+// then evicts oldest-first with loss accounting instead of dropping.
+static void *growInPsram(void *old, size_t, size_t newBytes) {
+  void *p = heap_caps_realloc(old, newBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = heap_caps_realloc(old, newBytes, MALLOC_CAP_8BIT);
+  return p;
 }
 
-static FileEntry *addEntry(uint32_t index) {
-  FileEntry *e = findEntry(index);
-  if (e) return e;
-  if (g_fileCount >= FS_MAX_FILES) return nullptr;
-  e = &g_files[g_fileCount++];
-  memset(e, 0, sizeof(*e));
-  e->index = index;
-  return e;
-}
+static FileEntry *findEntry(uint32_t index) { return fsTableFind(&g_tab, index); }
+static void sortEntries() { fsTableSort(&g_tab); }
+static void dropEntry(uint16_t i) { fsTableDrop(&g_tab, i); }
 
-static void sortEntries() {
-  // Insertion sort: at most FS_MAX_FILES entries and nearly sorted already.
-  for (uint16_t i = 1; i < g_fileCount; i++) {
-    FileEntry tmp = g_files[i];
-    int16_t j = (int16_t)i - 1;
-    while (j >= 0 && g_files[j].index > tmp.index) {
-      g_files[j + 1] = g_files[j];
-      j--;
-    }
-    g_files[j + 1] = tmp;
-  }
-}
-
-static void recomputeUsage() {
-  g_st.files = g_fileCount;
+// `withFsTotals` = also ask LittleFS for used/total bytes. That call walks
+// the whole filesystem (lfs_fs_size), so the per-pass hydration skips it: it
+// only changes the per-tier sums, never what is on disk.
+static void recomputeUsage(bool withFsTotals = true) {
+  g_st.files = g_tab.count;
   g_st.openFiles = 0;
   g_st.pendingUnacked = 0;
+  g_st.unhydrated = 0;
   g_st.tierABytes = g_st.tierBBytes = g_st.tierCBytes = 0;
-  for (uint16_t i = 0; i < g_fileCount; i++) {
-    const FileEntry &e = g_files[i];
+  for (uint16_t i = 0; i < g_tab.count; i++) {
+    const FileEntry &e = g_tab.v[i];
+    if (!e.hydrated) g_st.unhydrated++;
     if (!e.closed) g_st.openFiles++;
     // Closed and above the watermark: finished, and the hub does not have it.
     // Only the logger can count this -- the hub cannot derive it from files,
     // open and acked_through, because evictions punch holes in the index
     // range. Between trips this is normally non-zero; see protocol 2.3.1.
     else if ((int32_t)e.index > g_st.ackedThrough) g_st.pendingUnacked++;
+    // Byte totals count only what has been read. Partial until the index is
+    // hydrated; they can only grow as it fills in, never overstate.
+    if (!e.hydrated) continue;
     switch (fsTierForKind(e.kind)) {
       case FS_TIER_SNAPSHOT: g_st.tierBBytes += e.bytes; break;
       case FS_TIER_BOOKEND:  g_st.tierCBytes += e.bytes; break;
       default:               g_st.tierABytes += e.bytes; break;
     }
   }
+  if (!withFsTotals) return;
   g_st.usedBytes = LittleFS.usedBytes();
   g_st.totalBytes = LittleFS.totalBytes();
 }
@@ -225,32 +206,34 @@ static void recomputeUsage() {
 // The Tier B header already carries the mode, so the fact is on the disk; it
 // simply was not being read back. Content wins over the label, as everywhere
 // else in this project.
-static uint8_t readModeFromContent(uint32_t index, char kind, uint32_t bootId) {
+static uint8_t readModeFromContent(const FileEntry &e) {
   // Only Tier B is self-describing. A CSV has a column header and no room for
   // provenance, so for those kinds the mode is genuinely unrecoverable and
   // must stay UNKNOWN rather than being guessed at.
-  if (kind != FS_KIND_SNAPSHOT) return FS_MODE_UNKNOWN;
+  if (e.kind != FS_KIND_SNAPSHOT) return FS_MODE_UNKNOWN;
 
-  char path[64];
-  makeName(path, sizeof(path), index, kind, bootId, "part");
-  File f = LittleFS.open(path, "r");
+  char path[80];
+  makeVfsName(path, sizeof(path), e.index, e.kind, e.bootId, "part");
+  FILE *f = fopen(path, "rb");
   if (!f) return FS_MODE_UNKNOWN;
   SnapFileHeader h{};
-  const size_t n = f.read((uint8_t *)&h, sizeof(h));
-  f.close();
+  const size_t n = fread(&h, 1, sizeof(h), f);
+  fclose(f);
   if (n != sizeof(h) || memcmp(h.magic, "CDGS", 4) != 0) return FS_MODE_UNKNOWN;
   return h.mode;
 }
 
-static void readMeta(FileEntry *e, uint32_t bootId) {
-  char path[64];
-  makeName(path, sizeof(path), e->index, e->kind, bootId, "meta");
-  File f = LittleFS.open(path, "r");
-  if (!f) return;
+// sha256 / mode / bytes from the .meta sidecar. Returns true if it held a
+// byte count, so the caller only stats the .log when it has to.
+static bool readMeta(FileEntry *e) {
+  char path[80];
+  makeVfsName(path, sizeof(path), e->index, e->kind, e->bootId, "meta");
+  FILE *f = fopen(path, "r");
+  if (!f) return false;
+  bool haveBytes = false;
   char line[128];
-  while (f.available()) {
-    const size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
-    line[n] = 0;
+  while (fgets(line, sizeof(line), f)) {
+    line[strcspn(line, "\r\n")] = 0;
     if (strncmp(line, "sha256=", 7) == 0 && strlen(line + 7) >= 64) {
       for (int i = 0; i < 32; i++) {
         char b[3] = {line[7 + i * 2], line[8 + i * 2], 0};
@@ -259,43 +242,131 @@ static void readMeta(FileEntry *e, uint32_t bootId) {
       e->hasSha = true;
     } else if (strncmp(line, "mode=", 5) == 0) {
       e->mode = (uint8_t)atoi(line + 5);
+    } else if (strncmp(line, "bytes=", 6) == 0) {
+      e->bytes = (uint32_t)strtoul(line + 6, nullptr, 10);
+      haveBytes = true;
     }
   }
-  f.close();
+  fclose(f);
+  return haveBytes;
 }
 
+// Fills in what the NAME does not say: size, digest, mode.
+//
+// ⭐ THIS IS WHERE THE PATH LOOKUPS WENT. Each open or stat on LittleFS walks
+// the directory to find the name, so doing this for every file inside the
+// boot scan made the scan quadratic: 1,376 entries, 174 s, measured
+// 2026-09-25. It now runs lazily -- a few entries per loop() pass, on demand
+// in the listing, and for an eviction victim just before it is counted --
+// so no single call does n of them.
+//
+// A closed file costs one lookup (its .meta, which also carries the byte
+// count). A .part costs a stat, plus one read of the header for Tier B.
+static void hydrate(FileEntry *e) {
+  if (e->hydrated) return;
+  e->mode = FS_MODE_UNKNOWN;
+  bool haveBytes = false;
+  if (e->closed) haveBytes = readMeta(e);
+  if (!haveBytes) {
+    char path[80];
+    makeVfsName(path, sizeof(path), e->index, e->kind, e->bootId,
+                e->closed ? "log" : "part");
+    struct stat st;
+    e->bytes = (stat(path, &st) == 0) ? (uint32_t)st.st_size : 0;
+  }
+  if (!e->closed) e->mode = readModeFromContent(*e);
+  e->hydrated = true;
+}
+
+// Declared here, defined with retention: a scan-time eviction goes through
+// the same accounting as every other one.
+static void removeFiles(const FileEntry &e);
+static void noteUnackedEviction(const FileEntry &e);
+
+// Rebuilds the index from the directory NAMES. No open, no stat.
+//
+// 🐛 THE OLD SCAN (measured 2026-09-25 on the 200-cycle soak image):
+//   * File::openNextFile() constructs a VFSFileImpl for every entry, which
+//     stats and opens it (vfs_api.cpp:481) -- a path lookup per entry, and
+//     each lookup walks the directory. readMeta() then opened the .meta too.
+//     1,376 entries took 174 s, k ~ 0.1 ms/entry^2.
+//   * The index was a fixed FS_MAX_FILES (96) array and a full table meant
+//     `continue`: 594 files dropped, invisible to retention forever.
+//
+// Now: readdir() over the VFS path returns names without opening anything,
+// fsScanFeed() classifies each one from its name, and the table grows. If it
+// cannot grow, the oldest file is evicted WITH loss accounting -- never
+// dropped. That eviction removes a file while the directory is open; LittleFS
+// is designed to fix up open directory handles on commit, but this path is
+// only reached when PSRAM refuses to grow the table and has NOT been
+// exercised on hardware.
 static void scanDir() {
-  g_fileCount = 0;
-  File dir = LittleFS.open(FS_DIR);
-  if (!dir || !dir.isDirectory()) {
+  fsTableInit(&g_tab, growInPsram);
+  g_hydrateCursor = 0;
+
+  char dirPath[48];
+  snprintf(dirPath, sizeof(dirPath), "%s%s", FS_VFS_ROOT, FS_DIR);
+  DIR *d = opendir(dirPath);
+  if (!d) {
     LittleFS.mkdir(FS_DIR);
+    recomputeUsage();
     return;
   }
-  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-    const char *full = f.name();
-    // LittleFS may hand back either a bare name or a full path depending on
-    // the core version. Take the last segment either way rather than assuming.
-    const char *base = strrchr(full, '/');
-    base = base ? base + 1 : full;
 
-    uint32_t index = 0, bootId = 0;
-    char kind = 0, ext[8] = {0};
-    if (!parseName(base, &index, &kind, &bootId, ext, sizeof(ext))) continue;
-    if (strcmp(ext, "meta") == 0) continue;     // read via its .log below
-
-    FileEntry *e = addEntry(index);
-    if (!e) continue;
-    e->kind = kind;
-    e->bootId = bootId;
-    e->bytes = (uint32_t)f.size();
-    e->closed = (strcmp(ext, "log") == 0);
-    e->mode = FS_MODE_UNKNOWN;
-    if (e->closed) readMeta(e, bootId);
-    else e->mode = readModeFromContent(index, kind, bootId);
+  FsScanStats st;
+  memset(&st, 0, sizeof(st));
+  struct dirent *de;
+  while ((de = readdir(d)) != nullptr) {
+    if (de->d_type == DT_DIR) continue;
+    FileEntry ev;
+    if (fsScanFeed(&g_tab, de->d_name, &st, &ev) != FS_SCAN_EVICT) continue;
+    // Table full and PSRAM refused to grow it. Oldest-first, and never
+    // silent: read its size so the loss record is exact, delete, account.
+    hydrate(&ev);
+    removeFiles(ev);
+    if ((int32_t)ev.index <= g_st.ackedThrough) g_st.deletedAcked++;
+    else noteUnackedEviction(ev);
   }
-  dir.close();
+  closedir(d);
+
+  g_st.scanEntries = st.entries;
+  g_st.scanFiles = st.files;
+  g_st.scanForeign = st.unparsed;
+  g_st.scanEvictedForRoom = st.evictedForRoom;
+  if (st.unparsed) {
+    Serial.printf("[fs] %lu name(s) in %s are not ours; left alone\n",
+                  (unsigned long)st.unparsed, FS_DIR);
+  }
+  if (st.evictedForRoom) {
+    Serial.printf("[fs] *** index could not grow: %lu file(s) evicted "
+                  "oldest-first to fit (each counted above) ***\n",
+                  (unsigned long)st.evictedForRoom);
+  }
   sortEntries();
   recomputeUsage();
+}
+
+// A few entries per call, so hydration never holds loop() for long. Returns
+// true once every entry is hydrated.
+static bool hydrateSome(uint16_t budget) {
+  if (!g_st.unhydrated) return true;
+  uint16_t done = 0;
+  for (uint16_t seen = 0; seen < g_tab.count && done < budget; seen++) {
+    if (g_hydrateCursor >= g_tab.count) g_hydrateCursor = 0;
+    FileEntry *e = &g_tab.v[g_hydrateCursor++];
+    if (e->hydrated) continue;
+    hydrate(e);
+    done++;
+    wdtFeedIfArmed();         // bought with progress: one entry read
+  }
+  if (done) recomputeUsage(/*withFsTotals=*/false);
+  if (!g_st.unhydrated) {
+    Serial.printf("[fs] index hydrated: %u files, tier A %lu B, tier B %lu B\n",
+                  g_tab.count, (unsigned long)g_st.tierABytes,
+                  (unsigned long)g_st.tierBBytes);
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,11 +379,6 @@ static void removeFiles(const FileEntry &e) {
   LittleFS.remove(path);
   makeName(path, sizeof(path), e.index, e.kind, e.bootId, "meta");
   LittleFS.remove(path);
-}
-
-static void dropEntry(uint16_t i) {
-  for (uint16_t j = i; j + 1 < g_fileCount; j++) g_files[j] = g_files[j + 1];
-  g_fileCount--;
 }
 
 // The ONE place an unacked deletion is accounted for. Both eviction paths go
@@ -354,110 +420,61 @@ static void noteUnackedEviction(const FileEntry &e) {
                 (unsigned long)fsLostFilesTotal(&g_st));
 }
 
-// Deletes exactly one file, choosing by the protocol's order. Returns false
-// when there is nothing left that may be deleted.
-static bool evictOne() {
-  const int32_t ack = g_st.ackedThrough;
-
-  // 1. Acked files, oldest first. The hub has them; they cost nothing to lose.
-  for (uint16_t i = 0; i < g_fileCount; i++) {
-    if (!g_files[i].closed) continue;
-    if ((int32_t)g_files[i].index > ack) continue;
-    Serial.printf("[fs] evict acked #%lu\n", (unsigned long)g_files[i].index);
-    removeFiles(g_files[i]);
-    dropEntry(i);
-    g_st.deletedAcked++;
-    return true;
-  }
-
-  // 2. Unacked Tier A (raw frames / change log), oldest first. Sub-second
-  //    detail: painful to lose, and collectable again on the next drive.
-  // 3. Unacked Tier B. The month-over-month record; a month that is gone
-  //    cannot be re-measured. Reaching here is a reportable event.
-  // 4. Unacked Tier C LAST, and mostly a formality -- trip bookends are bytes
-  //    per trip, so deleting one frees nothing. If C is what stands between
-  //    this device and a full disk, the disk is not the problem.
-  for (char tier : {FS_TIER_RAW, FS_TIER_SNAPSHOT, FS_TIER_BOOKEND}) {
-    for (uint16_t i = 0; i < g_fileCount; i++) {
-      if (!g_files[i].closed) continue;
-      if (fsTierForKind(g_files[i].kind) != tier) continue;
-      removeFiles(g_files[i]);
-      noteUnackedEviction(g_files[i]);
-      dropEntry(i);
-      return true;
-    }
-  }
-  return false;   // only open files remain; never delete what is being written
-}
-
 static uint32_t usableBytes() {
   const uint32_t total = LittleFS.totalBytes();
   return total ? total : (uint32_t)HUB_FS_USABLE_BYTES;
 }
 
-// Finds the oldest closed Tier A file, preferring acked ones. Returns
-// g_fileCount when there is no candidate.
-//
-// ⚠️ The two passes are the point. g_files is sorted by index, so a single
-// oldest-first sweep picks up whatever comes first -- which, once the hub has
-// acked a prefix and the newer files are still unacked, is an ACKED file by
-// luck of ordering rather than by rule. The moment an ack arrives out of that
-// shape the same sweep destroys unacked data while acked copies the hub
-// already holds sit right next to it.
-static uint16_t oldestTierACandidate(bool wantAcked) {
-  for (uint16_t i = 0; i < g_fileCount; i++) {
-    if (!g_files[i].closed) continue;
-    if (fsTierForKind(g_files[i].kind) != FS_TIER_RAW) continue;
-    const bool acked = (int32_t)g_files[i].index <= g_st.ackedThrough;
-    if (acked == wantAcked) return i;
+// --- the callbacks fsEnforceRetention() drives -------------------------------
+
+static void retHydrate(void *, FsEntry *e) { hydrate(e); }
+
+// Deletes and accounts. The ONE place retention's side effects live, so the
+// count cap, the Tier A cap and the reclaim all report a loss the same way --
+// the gap retention run 2 found was one path doing its own bookkeeping.
+static void retRemove(void *, const FsEntry *e, bool acked) {
+  if (acked) {
+    Serial.printf("[fs] evict acked #%lu\n", (unsigned long)e->index);
+    removeFiles(*e);
+    g_st.deletedAcked++;
+  } else {
+    removeFiles(*e);
+    noteUnackedEviction(*e);
   }
-  return g_fileCount;
+  // Bought with progress: one file is provably gone. The per-call budget
+  // bounds how many of these a single pass can do.
+  wdtFeedIfArmed();
 }
 
-// Keeps Tier A inside its share. Without this, Tier A's 50:1 rate advantage
-// lets it fill the partition between two snapshot blocks.
-//
-// Deletion order inside the cap mirrors the global one: acked first, because
-// the hub already has those and they cost nothing to lose.
-static void enforceTierACap() {
-  const uint32_t cap = (uint32_t)((uint64_t)usableBytes() * FS_TIER_A_MAX_PCT / 100);
-  while (g_st.tierABytes > cap) {
-    bool acked = true;
-    uint16_t i = oldestTierACandidate(true);
-    if (i == g_fileCount) {
-      acked = false;
-      i = oldestTierACandidate(false);
-    }
-    if (i == g_fileCount) break;      // only open Tier A left; leave it alone
+static uint32_t retUsed(void *) { return LittleFS.usedBytes(); }
 
-    removeFiles(g_files[i]);
-    if (acked) g_st.deletedAcked++;
-    else       noteUnackedEviction(g_files[i]);
-    dropEntry(i);
-    recomputeUsage();
-    // Bought with progress: one file is provably gone. A full partition can
-    // put many removes plus a recomputeUsage() back to back, and this runs
-    // inside loop()'s WDT window. The loop terminates on its own -- tierABytes
-    // strictly decreases, and it breaks when no candidate remains.
-    wdtFeedIfArmed();
-  }
-}
-
-static void enforceRetention() {
+// Protocol 2.3, plus the file-count cap. `reserve` keeps slots free for files
+// about to be opened. Evicts at most FS_EVICT_PER_PASS files per call; a
+// backlog (the soak image: ~600 files over the cap) drains across loop()
+// passes instead of in one call that holds the web server and the UDP stream.
+static void enforceRetention(uint16_t reserve = 0) {
   recomputeUsage();
-  enforceTierACap();
-  // LittleFS needs slack to do anything at all, including delete. Reclaim
-  // before it is full rather than at the moment a write fails.
-  const uint32_t limit = (uint32_t)((uint64_t)usableBytes() * 90 / 100);
-  uint8_t guard = 0;
-  while (LittleFS.usedBytes() > limit && guard++ < FS_MAX_FILES) {
-    if (!evictOne()) break;
-    recomputeUsage();
-    // Same contract as the cap: fed only after a file was provably deleted,
-    // and `guard` bounds the loop at FS_MAX_FILES regardless. A full-disk
-    // reclaim is a legitimate long operation; rebooting through it would drop
-    // the open files it is trying to make room for.
-    wdtFeedIfArmed();
+  const uint32_t total = usableBytes();
+  const FsRetentionCfg cfg = {
+      FS_MAX_FILES,
+      (uint32_t)((uint64_t)total * FS_TIER_A_MAX_PCT / 100),
+      // LittleFS needs slack to do anything at all, including delete.
+      // Reclaim before it is full rather than at the moment a write fails.
+      (uint32_t)((uint64_t)total * 90 / 100),
+  };
+  const FsRetentionOps ops = {nullptr, retHydrate, retRemove, retUsed};
+  const FsRetentionResult r = fsEnforceRetention(
+      &g_tab, g_st.ackedThrough, &cfg, &ops, reserve, FS_EVICT_PER_PASS);
+  g_retentionMore = r.more;
+  if (r.stuck) {
+    // Over a limit with nothing evictable: only files being written right
+    // now are left. Not a loop -- say so and let the next close free one.
+    static uint32_t lastSaid = 0;
+    if (millis() - lastSaid > 60000) {
+      lastSaid = millis();
+      Serial.printf("[fs] retention: over a limit with only active files "
+                    "left (%u files)\n", g_tab.count);
+    }
   }
   recomputeUsage();
 }
@@ -471,6 +488,24 @@ static uint32_t nextIndex() {
   g_fsPrefs.putULong("idx", idx + 1);
   g_st.nextIndex = idx + 1;
   return idx;
+}
+
+// Runtime add. The table grows; if it cannot, the oldest evictable file
+// gives up its slot WITH the usual accounting -- a file on disk that the index
+// does not know about is the bug this replaced, so there is no path to one.
+// nullptr only if every other entry is active, which two writers cannot
+// produce against a cap of FS_MAX_FILES.
+static FileEntry *trackEntry(const FileEntry &in) {
+  FileEntry ev;
+  bool did = false;
+  FileEntry *e = fsTableAddOrEvict(&g_tab, &in, &ev, &did);
+  if (did && ev.index != in.index) {
+    hydrate(&ev);
+    removeFiles(ev);
+    if ((int32_t)ev.index <= g_st.ackedThrough) g_st.deletedAcked++;
+    else noteUnackedEviction(ev);
+  }
+  return e;
 }
 
 static void closeActive(Active &a) {
@@ -505,16 +540,19 @@ static void closeActive(Active &a) {
     Serial.printf("[fs] rename failed for #%lu\n", (unsigned long)a.index);
   }
 
-  FileEntry *e = addEntry(a.index);
-  if (e) {
-    e->kind = a.kind;
-    e->bytes = a.bytes;
-    e->bootId = boot;
-    e->closed = true;
-    e->mode = g_mode;
-    e->hasSha = true;
-    memcpy(e->sha, digest, 32);
-  }
+  FileEntry in;
+  memset(&in, 0, sizeof(in));
+  in.index = a.index;
+  in.kind = a.kind;
+  in.bytes = a.bytes;
+  in.bootId = boot;
+  in.closed = true;
+  in.mode = g_mode;
+  in.hasSha = true;
+  memcpy(in.sha, digest, 32);
+  in.active = false;       // closed: retention may take it from now on
+  in.hydrated = true;      // everything is known; nothing to read back
+  trackEntry(in);
   sortEntries();
   recomputeUsage();
   Serial.printf("[fs] closed #%lu tier %c kind %s, %lu B\n",
@@ -523,7 +561,9 @@ static void closeActive(Active &a) {
 }
 
 static bool openActive(Active &a, char kind) {
-  enforceRetention();
+  // Reserve one slot, so the file about to be opened cannot take the count
+  // back over FS_MAX_FILES.
+  enforceRetention(/*reserve=*/1);
 
   a.index = nextIndex();
   a.kind = kind;
@@ -543,14 +583,28 @@ static bool openActive(Active &a, char kind) {
   }
   a.open = true;
 
-  FileEntry *e = addEntry(a.index);
-  if (e) {
-    e->kind = kind;
-    e->bytes = 0;
-    e->bootId = sessionBootId();
-    e->closed = false;
-    e->mode = g_mode;
-    e->hasSha = false;
+  FileEntry in;
+  memset(&in, 0, sizeof(in));
+  in.index = a.index;
+  in.kind = kind;
+  in.bytes = 0;
+  in.bootId = sessionBootId();
+  in.closed = false;
+  in.mode = g_mode;
+  in.hasSha = false;
+  in.active = true;        // being written: retention never touches it
+  in.hydrated = true;
+  if (!trackEntry(in)) {
+    // Unreachable with two writers and a cap of FS_MAX_FILES, but if it ever
+    // happens the file must not exist unindexed: undo the open.
+    a.fh.close();
+    a.open = false;
+    mbedtls_sha256_free(&a.sha);
+    LittleFS.remove(path);
+    g_st.writeErrors++;
+    Serial.printf("[fs] index full with only active files; did not open #%lu\n",
+                  (unsigned long)a.index);
+    return false;
   }
   sortEntries();
   return true;
@@ -712,19 +766,17 @@ static void drainChangeLog() {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-bool filestoreBegin() {
+// ⚠️ NVS FIRST, BEFORE THE MOUNT, and deliberately so.
+//
+// The loss record must be correct even on the paths where the filesystem is
+// not: a failed mount, safe mode, a remote erase. Those are exactly when "has
+// this device ever destroyed uncollected data?" matters most, and loading it
+// afterwards would report a confident zero. NVS lives in its own partition,
+// so a LittleFS format does not touch it: the counters survive the most
+// destructive thing this device does, which is the point.
+static void loadLossRecord() {
   memset(&g_st, 0, sizeof(g_st));
   g_st.ackedThrough = -1;
-
-  // ⚠️ NVS FIRST, BEFORE THE MOUNT, and deliberately so.
-  //
-  // The loss record must be correct even on the paths where the filesystem is
-  // not. A failed mount returns early below, and a corrupt partition gets
-  // formatted -- both are exactly when "has this device ever destroyed
-  // uncollected data?" matters most, and loading these afterwards would have
-  // reported a confident zero. NVS lives in its own partition, so a LittleFS
-  // format does not touch it: the counters survive the most destructive thing
-  // this device does, which is the point.
   g_fsPrefs.begin("cardiagfs", false);
   g_st.nextIndex    = g_fsPrefs.getULong("idx", 0);
   g_st.ackedThrough = (int32_t)g_fsPrefs.getLong("ack", -1);
@@ -746,35 +798,79 @@ bool filestoreBegin() {
                   (unsigned long)g_st.lostAckedFiles,
                   lost > g_st.lostAckedFiles ? "  *** WARN STAYS SET ***" : "");
   }
+  g_st.erases = g_fsPrefs.getULong("erases", 0);
+}
+
+void filestoreBeginSafeMode(uint8_t priorAttempts) {
+  loadLossRecord();
+  g_st.safeMode = true;
+  g_st.bootAttempts = priorAttempts;
+  g_st.mounted = false;
+  Serial.printf("[fs] *** SAFE MODE: the last %u filestore start(s) never "
+                "finished. NOT mounting, NOT formatting. Files on the partition "
+                "are untouched. POST /api/v1/filestore/retry to try again, or "
+                "/api/v1/filestore/erase to erase (both need X-Hub-Token). ***\n",
+                (unsigned)priorAttempts);
+}
+
+bool filestoreSafeMode() { return g_st.safeMode; }
+
+bool filestoreBegin() {
+  loadLossRecord();
+  g_st.bootAttempts = bootguardPriorAttempts();
 
   // Partition is labelled "spiffs" (see partitions_cardiag_8mb.csv), which is
-  // what LittleFS.begin() looks for by default.
+  // what LittleFS.begin() looks for by default. Mounted at FS_VFS_ROOT
+  // explicitly, because the scan and hydration use POSIX paths under it.
   //
-  // ⭐ THE FORMAT IS SAFE FROM THE WATCHDOG BY CONSTRUCTION, NOT BY LUCK.
-  // formatOnFail=true can take far longer than WDT_TIMEOUT_S on a corrupt
-  // partition, but filestoreBegin() is called from setup() and the task
-  // watchdog is not armed until AFTER setup() has got this far -- so there is
-  // no window in which a format can trip it. ⚠️ Moving the arming earlier, or
-  // moving a format into loop(), reintroduces the hazard: a watchdog firing
-  // mid-format would reboot into the same format, forever.
-  if (!LittleFS.begin(/*formatOnFail=*/true)) {
-    Serial.println("[fs] LittleFS mount FAILED; the logger keeps running "
-                   "without persistence (rule 1) but files are not truth "
-                   "until this is fixed.");
+  // ⚠️ formatOnFail=false, ALWAYS. This used to be true, which meant any mount
+  // failure -- including a transient one -- silently destroyed every file the
+  // hub had not collected, with no loss record because the index was never
+  // built. A partition that will not mount now stays unmounted: the boot guard
+  // counts the failed start, and after BG_FAIL_LIMIT of them the board comes
+  // up in SAFE MODE, where erasing is a decision someone makes on purpose.
+  const uint32_t t0 = millis();
+  if (!LittleFS.begin(/*formatOnFail=*/false, FS_VFS_ROOT)) {
+    g_st.mountMs = millis() - t0;
+    Serial.println("[fs] LittleFS mount FAILED; NOT formatting. The logger "
+                   "keeps running without persistence (rule 1); the boot guard "
+                   "counts this as a failed start.");
     g_st.mounted = false;
     return false;
   }
+  g_st.mountMs = millis() - t0;
   g_st.mounted = true;
 
   if (!LittleFS.exists(FS_DIR)) LittleFS.mkdir(FS_DIR);
+  const uint32_t t1 = millis();
   scanDir();
+  g_st.scanMs = millis() - t1;
 
   Serial.printf("[fs] mounted %lu/%lu B, %u files (%u open), next index %lu, "
                 "acked through %ld\n",
                 (unsigned long)LittleFS.usedBytes(),
                 (unsigned long)LittleFS.totalBytes(),
-                g_fileCount, g_st.openFiles,
+                g_tab.count, g_st.openFiles,
                 (unsigned long)g_st.nextIndex, (long)g_st.ackedThrough);
+
+  // ⭐ THE NUMBERS FS_BOOT_WDT_S IS DERIVED FROM. Printed every boot so the
+  // budget is set from a measurement, and so a scan creeping towards its
+  // budget is seen in serial.log long before it becomes a watchdog reset.
+  const uint32_t budgetMs = (uint32_t)FS_BOOT_WDT_S * 1000u;
+  const uint32_t usedMs = g_st.mountMs + g_st.scanMs;
+  Serial.printf("[fs] BOOT TIMING: mount %lu ms + scan %lu ms (%lu entries, "
+                "%lu files) = %lu ms of %lu ms budget (%lu%%)%s\n",
+                (unsigned long)g_st.mountMs, (unsigned long)g_st.scanMs,
+                (unsigned long)g_st.scanEntries, (unsigned long)g_st.scanFiles,
+                (unsigned long)usedMs, (unsigned long)budgetMs,
+                (unsigned long)(usedMs * 100u / budgetMs),
+                usedMs * 3u > budgetMs ? "  *** OVER 1/3 OF BUDGET ***" : "");
+  if (g_tab.count > FS_MAX_FILES) {
+    Serial.printf("[fs] %u files on disk, cap %u: retention will evict %u "
+                  "oldest-first over the next few seconds, each one logged\n",
+                  g_tab.count, (unsigned)FS_MAX_FILES,
+                  (unsigned)(g_tab.count - FS_MAX_FILES));
+  }
 
   // ⭐ THE BOARD STATES ITS OWN EFFECTIVE LIMITS, so no run has to infer them
   // from the env it believes it flashed. A `-D` flag that a header quietly
@@ -851,8 +947,12 @@ void filestoreLoop() {
 
   g_st.rowsDropped = recorderChangeDropped();
 
+  // Fill in sizes/digests the boot scan skipped, a few per pass.
+  hydrateSome(FS_HYDRATE_PER_PASS);
+
+  // Every 5 s normally; every pass while a backlog is draining.
   static uint32_t lastCheck = 0;
-  if (now - lastCheck >= 5000) {
+  if (g_retentionMore || now - lastCheck >= 5000) {
     lastCheck = now;
     enforceRetention();
   }
@@ -929,14 +1029,22 @@ static bool fsTokenOk(WebServer &srv) {
 
 static void handleList(WebServer &srv) {
   // Streamed, not built in RAM: FS_MAX_FILES entries of ~170 chars is 16 KB,
-  // which is a heap spike this board should not take for a listing.
+  // and right after boot on an over-full disk the index can be many times
+  // that. A heap spike this board should not take for a listing.
   srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
   srv.send(200, "application/json", "");
 
   char buf[256];
   srv.sendContent("[");
-  for (uint16_t i = 0; i < g_fileCount; i++) {
-    const FileEntry &e = g_files[i];
+  for (uint16_t i = 0; i < g_tab.count; i++) {
+    // Every entry is listed, hydrated or not yet -- on demand here, so the
+    // hub never sees a placeholder size or a missing digest on a closed file.
+    // Each read is one path lookup; fed per entry, bought with progress.
+    if (!g_tab.v[i].hydrated) {
+      hydrate(&g_tab.v[i]);
+      wdtFeedIfArmed();
+    }
+    const FileEntry &e = g_tab.v[i];
     // "tier" is the RETENTION class and "kind" is what is in the file. They
     // are both published because they answer different questions: the hub
     // sorts retention by tier and picks a parser by kind, and Tier A carries
@@ -1109,13 +1217,81 @@ static void handleAck(WebServer &srv) {
            "{\"ok\":true,\"acked_through\":%ld,\"requested\":%ld,"
            "\"files\":%u,\"usage_pct\":%u,"
            "\"lost_files_total\":%lu,\"loss_recorded_files\":%lu,\"warn\":%s}",
-           (long)now, through, g_fileCount, filestoreUsagePct(),
+           (long)now, through, g_tab.count, filestoreUsagePct(),
            (unsigned long)fsLostFilesTotal(&g_st), (unsigned long)lossAcked,
            filestoreWarn() ? "true" : "false");
   srv.send(200, "application/json", buf);
 }
 
+// ---------------------------------------------------------------------------
+// Safe mode (bootguard.h)
+// ---------------------------------------------------------------------------
+
+static bool safeModeGate(WebServer &srv) {
+  if (!fsTokenOk(srv)) {
+    srv.send(401, "application/json",
+             "{\"error\":\"bad or missing X-Hub-Token\"}");
+    return false;
+  }
+  if (!g_st.safeMode) {
+    srv.send(409, "application/json",
+             "{\"error\":\"not in safe mode; the filestore is running\"}");
+    return false;
+  }
+  return true;
+}
+
+// POST /api/v1/filestore/retry -- clear the boot guard and reboot into a
+// normal filestore start. For when the failure was transient, or a fix has
+// been flashed... though a new build resets the guard by itself (appTag).
+static void handleRetry(WebServer &srv) {
+  if (!safeModeGate(srv)) return;
+  bootguardClear();
+  srv.send(200, "application/json",
+           "{\"ok\":true,\"action\":\"retry\",\"rebooting\":true}");
+  Serial.println("[fs] safe mode: retry requested; rebooting");
+  delay(200);                // let the response leave
+  ESP.restart();
+}
+
+// POST /api/v1/filestore/erase  body {"confirm":"erase"}
+//
+// ⚠️ THE ONLY WAY THIS FIRMWARE FORMATS THE PARTITION. Never automatic: it
+// destroys every file the hub has not collected, and in safe mode the index
+// was never built, so those files CANNOT be counted into the loss record. The
+// lifetime `erases` counter is bumped instead, so the event itself survives.
+static void handleErase(WebServer &srv) {
+  if (!safeModeGate(srv)) return;
+  const String body = srv.arg("plain");
+  if (body.indexOf("\"confirm\"") < 0 || body.indexOf("\"erase\"") < 0) {
+    srv.send(400, "application/json",
+             "{\"error\":\"need {\\\"confirm\\\":\\\"erase\\\"}\"}");
+    return;
+  }
+  g_st.erases++;
+  g_fsPrefs.putULong("erases", g_st.erases);
+  Serial.printf("[fs] *** REMOTE ERASE requested (lifetime erase #%lu). Files "
+                "on the partition were never indexed and are NOT counted in "
+                "the loss record. ***\n", (unsigned long)g_st.erases);
+  // A format outlasts any sane watchdog window, and a watchdog that fired
+  // mid-format would reboot into safe mode with a half-formatted partition.
+  // Unsubscribe for the duration; the restart below ends it either way.
+  esp_task_wdt_delete(nullptr);
+  const bool ok = LittleFS.format();
+  bootguardClear();
+  char buf[96];
+  snprintf(buf, sizeof(buf),
+           "{\"ok\":%s,\"action\":\"erase\",\"erases\":%lu,\"rebooting\":true}",
+           ok ? "true" : "false", (unsigned long)g_st.erases);
+  srv.send(ok ? 200 : 500, "application/json", buf);
+  Serial.printf("[fs] erase %s; rebooting\n", ok ? "done" : "FAILED");
+  delay(200);
+  ESP.restart();
+}
+
 void filestoreRegister(WebServer &srv) {
+  srv.on("/api/v1/filestore/retry", HTTP_POST, [&srv]() { handleRetry(srv); });
+  srv.on("/api/v1/filestore/erase", HTTP_POST, [&srv]() { handleErase(srv); });
   srv.on("/api/v1/files", HTTP_GET, [&srv]() { handleList(srv); });
   srv.on("/api/v1/files/ack", HTTP_POST, [&srv]() { handleAck(srv); });
   // Registered AFTER /ack so the literal route wins; UriBraces would otherwise

@@ -162,6 +162,27 @@ struct FileStoreStats {
   uint32_t writeErrors;
   uint32_t rowsDropped;      // change-log appends the recorder refused
   bool     mounted;
+
+  // ⭐ THE BOOT SCAN, AS MEASURED ON THIS BOOT. FS_BOOT_WDT_S (config.h) is
+  // derived from these, not guessed -- a scan that gets close to its budget
+  // is visible on /api/v1/session before it is a watchdog reset.
+  uint32_t mountMs;
+  uint32_t scanMs;
+  uint32_t scanEntries;      // everything readdir() returned
+  uint32_t scanFiles;        // .log + .part among them
+  uint32_t scanForeign;      // names that are not ours (reported, never deleted)
+  uint32_t scanEvictedForRoom;  // table could not grow; evicted, never dropped
+  // Entries whose size/digest/mode have not been read yet. The scan reads
+  // names only; filestoreLoop() fills the rest in a few per pass. Tier byte
+  // totals are partial until this reaches zero.
+  uint16_t unhydrated;
+
+  // SAFE MODE (bootguard.h). The filestore was not started on this boot
+  // because the last BG_FAIL_LIMIT starts never finished. Everything above
+  // except the NVS-backed loss record is then zero because nothing was read.
+  bool     safeMode;
+  uint8_t  bootAttempts;     // unfinished starts before this boot
+  uint32_t erases;           // lifetime, NVS: remote erases performed
 };
 
 // Total lost files across all tiers, lifetime. The quantity the hub's
@@ -180,10 +201,26 @@ static inline uint8_t fsTierSlot(char tier) {
   }
 }
 
-// Mounts LittleFS, rebuilds the index by scanning FS_DIR, and loads the
-// watermark from NVS. Safe to call when the partition is empty or corrupt --
-// it reports and degrades rather than refusing to boot.
+// Loads the watermark and the lifetime loss record from NVS, mounts LittleFS
+// and rebuilds the index from the directory NAMES (no file is opened). Returns
+// false on a mount failure, which it reports and degrades on rather than
+// refusing to boot.
+//
+// ⚠️ NEVER FORMATS. A partition that will not mount stays unmounted; the boot
+// guard counts it as a failed start and, after BG_FAIL_LIMIT of them, the
+// board comes up in safe mode where a person or the hub can decide to erase.
+//
+// Bounded by the early task watchdog (FS_BOOT_WDT_S), armed by the caller, so
+// it deliberately does NOT feed the watchdog: a start that is still running
+// when the budget runs out is exactly what the boot guard exists to catch.
 bool filestoreBegin();
+
+// Safe mode: the filestore is NOT started. Loads only the NVS loss record, so
+// /api/v1/session still reports what has been lost rather than a confident
+// zero, and marks the store failed.
+void filestoreBeginSafeMode(uint8_t priorAttempts);
+
+bool filestoreSafeMode();
 
 // Call from loop(). Writes the 1 Hz snapshot block, drains the recorder's
 // change log, rotates files and enforces retention. Bounded per call so a
@@ -250,7 +287,9 @@ bool filestoreWarn();
 // watermark in force afterwards.
 uint32_t filestoreAckLoss(uint32_t throughFiles);
 
-// Registers /api/v1/files, /api/v1/files/<index> and /api/v1/files/ack.
+// Registers /api/v1/files, /api/v1/files/<index> and /api/v1/files/ack, and
+// the two safe-mode endpoints, POST /api/v1/filestore/erase and
+// POST /api/v1/filestore/retry (both X-Hub-Token, both 409 outside safe mode).
 void filestoreRegister(WebServer &srv);
 
 // Applies a watermark ack (protocol §2.1). Idempotent, never moves backwards.

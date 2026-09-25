@@ -297,10 +297,68 @@
 // above the 9.5 KB/s the change log produces.
 #define FS_FLUSH_BUDGET_BYTES 2048u
 
-// Index-table ceiling. At FS_FILE_MAX_BYTES this covers the whole partition
-// with room to spare; files past it are on disk but not listed, which the
-// stats report rather than hide.
+// ⭐ RETENTION'S FILE-COUNT CAP. Retention evicts (protocol order, with the
+// usual loss accounting) until at most this many files remain.
+//
+// 🐛 THIS USED TO BE THE INDEX TABLE'S SIZE, and the comment here claimed that
+// files past it were "on disk but not listed, which the stats report rather
+// than hide". Neither half was true: the stats never reported them, and a file
+// not in the index was invisible to retention, so it was never evicted and the
+// directory only grew. Measured 2026-09-25 on the 200-cycle soak image: 690
+// files, 594 of them unindexed, and a boot scan that took 174 s because every
+// LittleFS path lookup walks the directory. The index now grows (fsindex.h)
+// and this number bounds the DIRECTORY, which is what bounds the scan.
+//
+// 96 = the old table size, kept so the listing and the hub see the same
+// ceiling as before. At FS_FILE_MAX_BYTES the byte limits bind long before
+// this does (57 full files fill the partition); it binds when files are small,
+// which is exactly the soak's failure shape (~5 KB each).
+#ifndef FS_MAX_FILES
 #define FS_MAX_FILES 96
+#endif
+
+// Where LittleFS is mounted in the VFS. The boot scan and hydration use POSIX
+// opendir()/readdir()/stat()/fopen() under this path, because readdir() is the
+// only way to list names without opening each file. Passed to LittleFS.begin()
+// explicitly so the two cannot drift.
+#define FS_VFS_ROOT "/littlefs"
+
+// Index entries whose size/digest/mode are read per filestoreLoop() pass. The
+// boot scan reads names only; this fills in the rest in the background. Each
+// read is one path lookup.
+#define FS_HYDRATE_PER_PASS 8
+
+// Most files one retention call may evict. A backlog (the soak image: ~600
+// over the cap) drains across loop() passes instead of in one call; the loop
+// re-runs retention every pass while work remains.
+#define FS_EVICT_PER_PASS 8
+
+// ⭐ BOOT-TIME WATCHDOG BUDGET for filestoreBegin(), in seconds. Armed BEFORE
+// the mount; the loop watchdog (WDT_TIMEOUT_S) replaces it right after. Two
+// starts in a row that exceed it => safe mode (bootguard.h).
+//
+// DERIVED, NOT GUESSED. The rule:
+//
+//     FS_BOOT_WDT_S = max(WDT_TIMEOUT_S, ceil(3 x (mount + worst-case scan)))
+//
+// with the scan measured AFTER the fix, at the worst state the disk can be in.
+// Inputs, and where each came from:
+//
+//   mount, preserved soak image ........ ~2.8 s     MEASURED 2026-09-25 (local)
+//   scan, pre-fix, 1,376 entries ....... 174 s      MEASURED -- the bug; not an input
+//   scan, post-fix, same image ......... PENDING    the board prints it:
+//                                                   "[fs] BOOT TIMING: mount .. + scan .."
+//   scan, post-fix, at the count cap ... PENDING    same line, steady state
+//
+// ⚠️ UNTIL THE PENDING ROWS ARE FILLED IN FROM THAT LINE, THIS IS THE RULE'S
+// FLOOR (WDT_TIMEOUT_S), not a derived value. It is 10x the one measured term,
+// and the scan no longer does a path lookup per entry, but "should be fast" is
+// the reasoning that shipped the 187 s boot. Replace it from the measurement
+// and delete this paragraph. The boot line flags any start that uses more
+// than a third of the budget, so the margin is visible on every boot.
+#ifndef FS_BOOT_WDT_S
+#define FS_BOOT_WDT_S 30
+#endif
 
 // Compact the change log once this share of it has been written to flash.
 // Compaction memmoves the tail down, so it wants to be rare and bulk.

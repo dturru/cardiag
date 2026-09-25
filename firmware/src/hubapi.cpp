@@ -60,7 +60,11 @@ static void handleSession(WebServer &srv) {
   // task, so the extra half-kB is not the constraint. jsonAppend() truncates
   // rather than overflowing if this is ever wrong, and a truncated body fails
   // the hub's parse loudly instead of corrupting the stack.
-  char buf[2560];
+  //
+  // 2560 -> 3072 (2026-09-25): safe mode and the boot-scan block add ~300
+  // bytes, which took the worst case to ~2.1 kB of 2.5. Same reasoning as
+  // above: another half-kB on an 8 kB loop stack is not the constraint.
+  char buf[3072];
   int n = jsonAppend(buf, sizeof(buf), 0,
       "{\"proto\":%d,"
       "\"device_id\":%lu,"
@@ -163,7 +167,15 @@ static void handleSession(WebServer &srv) {
       "\"lost_bytes\":{\"A\":%llu,\"B\":%llu,\"C\":%llu},"
       "\"lost_files\":{\"A\":%lu,\"B\":%lu,\"C\":%lu},"
       "\"lost_files_total\":%lu,\"loss_recorded_files\":%lu,"
-      "\"write_errors\":%lu,\"rows_dropped\":%lu},",
+      "\"write_errors\":%lu,\"rows_dropped\":%lu,"
+      // Safe mode and the boot scan. `filestore_failed` is true when the
+      // store is not running for ANY reason -- safe mode or a failed mount --
+      // so the hub has one field to alert on; `safe_mode` says which.
+      "\"filestore_failed\":%s,\"safe_mode\":%s,\"boot_attempts\":%u,"
+      "\"erases\":%lu,\"max_files\":%u,\"unhydrated\":%u,"
+      "\"scan\":{\"mount_ms\":%lu,\"scan_ms\":%lu,\"entries\":%lu,"
+      "\"files\":%lu,\"foreign\":%lu,\"evicted_for_room\":%lu,"
+      "\"budget_ms\":%lu}},",
       fs->mounted ? "true" : "false",
       (unsigned long)fs->usedBytes, (unsigned long)fs->totalBytes,
       (unsigned)filestoreUsagePct(), (unsigned)FS_WARN_USAGE_PCT,
@@ -181,7 +193,15 @@ static void handleSession(WebServer &srv) {
       (unsigned long)fs->lostFiles[2],
       (unsigned long)fsLostFilesTotal(fs),
       (unsigned long)fs->lostAckedFiles,
-      (unsigned long)fs->writeErrors, (unsigned long)fs->rowsDropped);
+      (unsigned long)fs->writeErrors, (unsigned long)fs->rowsDropped,
+      (fs->safeMode || !fs->mounted) ? "true" : "false",
+      fs->safeMode ? "true" : "false",
+      (unsigned)fs->bootAttempts, (unsigned long)fs->erases,
+      (unsigned)FS_MAX_FILES, (unsigned)fs->unhydrated,
+      (unsigned long)fs->mountMs, (unsigned long)fs->scanMs,
+      (unsigned long)fs->scanEntries, (unsigned long)fs->scanFiles,
+      (unsigned long)fs->scanForeign, (unsigned long)fs->scanEvictedForRoom,
+      (unsigned long)FS_BOOT_WDT_S * 1000ul);
 
   // Link transition counters, for the AP<->STA soak test. A fault that
   // RECOVERED leaves no other trace.

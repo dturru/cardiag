@@ -1,6 +1,8 @@
 name: checks
 
-# Python-only. No hardware, no secrets, no board on the runner.
+# No hardware, no secrets, no board on the runner. Two jobs:
+#   checks    Python: config guards, harness verdict tests, tools compile
+#   firmware  PlatformIO: compile the board envs and run the native tests
 #
 # What this is for: the two failures that cost bench sessions were both
 # checkable without a board, and both slipped through because nothing ran them.
@@ -44,3 +46,71 @@ jobs:
       # Cheap insurance: the tools must at least import and parse.
       - name: Tools compile
         run: python -m compileall -q tools/
+
+  # ---------------------------------------------------------------------------
+  # FIRMWARE: compile-check before anything is flashed.
+  #
+  # Compiles only. It proves the firmware BUILDS against the pinned platform
+  # (platformio.ini) and that the host tests pass; it proves nothing about how
+  # it behaves on the board. No upload, no board, no secrets.
+  # ---------------------------------------------------------------------------
+  firmware:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The platform zip, toolchains and Arduino core are ~1 GB and pinned by
+      # URL in platformio.ini, so the cache key is that file: a platform bump
+      # busts the cache, nothing else does.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade pip platformio
+
+      # secrets.h is gitignored on purpose. The example has placeholder values
+      # only, which is all a compile needs.
+      - name: Placeholder secrets.h
+        run: cp include/secrets.h.example include/secrets.h
+
+      # The partition table is part of the build, so it must be COMMITTED.
+      # It was kept out of the repo by .gitignore's `*.csv` until 3d6745c, and
+      # CI used to paper over that with a stand-in copy. No longer: if the file
+      # is missing, or present but untracked, the build is not reproducible and
+      # this job fails here rather than building against something else.
+      - name: Partition table is committed
+        run: |
+          if [ ! -f partitions_cardiag_8mb.csv ]; then
+            echo "::error file=firmware/platformio.ini::firmware/partitions_cardiag_8mb.csv is missing; platformio.ini's board_build.partitions needs it"
+            exit 1
+          fi
+          git ls-files --error-unmatch partitions_cardiag_8mb.csv > /dev/null || {
+            echo "::error::firmware/partitions_cardiag_8mb.csv exists but is not tracked by git"
+            exit 1
+          }
+
+      # The shipping env, plus captest: the one that overrides a #ifndef-guarded
+      # macro with -D, which is the class of build bug this repo has been bitten
+      # by. splittest/fstest differ from these only by -D flags.
+      - name: Build esp32-can-x2
+        run: pio run -e esp32-can-x2
+
+      - name: Build esp32-can-x2-captest
+        run: pio run -e esp32-can-x2-captest
+
+      - name: Native tests
+        run: pio test -e native

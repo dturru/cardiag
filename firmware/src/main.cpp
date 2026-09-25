@@ -36,6 +36,8 @@
 #include "selftest_profile.h"
 #include "filestore.h"
 #include "transceiver.h"
+#include "bootguard.h"
+#include "bootguard_rt.h"
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason() -- why this boot was a boot
 #include <esp_core_dump.h>  // and, on a crash, WHERE it died
@@ -611,7 +613,40 @@ void setup() {
   // Persistence. A mount failure is NOT fatal: rule 1 says the logger is
   // standalone, and a board that refuses to log to PSRAM because its flash is
   // unhappy would be worse than one that says so and carries on.
-  filestoreBegin();
+  //
+  // ========================================================================
+  // ⭐ BOUNDED, AND REMEMBERED IF IT IS NOT.
+  //
+  // 🐛 2026-09-25: after a 200-cycle soak this call took 187 s (a quadratic
+  // directory scan), with no watchdog, because the watchdog was deliberately
+  // armed only AFTER it -- to protect an automatic format that no longer
+  // exists. A slower disk, or a real hang, would have held the board here
+  // forever, awake on an unswitched feed with no radio up to say so.
+  //
+  // Now: the watchdog is armed FIRST with the boot budget FS_BOOT_WDT_S, the
+  // attempt is recorded (RTC + NVS) before the start and cleared only after it
+  // finishes, and BG_FAIL_LIMIT unfinished starts in a row boot SAFE MODE:
+  // no filestore, radio and API up, `filestore_failed` on /api/v1/session,
+  // and a person or the hub decides between retry and erase. Never a format
+  // on its own.
+  // ========================================================================
+  static_assert(FS_BOOT_WDT_S >= WDT_TIMEOUT_S,
+                "FS_BOOT_WDT_S is floored at WDT_TIMEOUT_S; see config.h");
+  {
+    const uint8_t prior = bootguardBegin();
+    if (bgShouldSafeMode(prior)) {
+      filestoreBeginSafeMode(prior);
+    } else {
+      bootguardArmTaskWdt(FS_BOOT_WDT_S);
+      Serial.printf("[wdt] boot watchdog armed, %us, covering the filestore "
+                    "start\n", (unsigned)FS_BOOT_WDT_S);
+      bootguardMarkStart(prior);
+      // A mount failure returns false WITHOUT clearing: it counts as a failed
+      // start, so a partition that never mounts reaches safe mode instead of
+      // being retried (or, as before, formatted) on every boot.
+      if (filestoreBegin()) bootguardClear();
+    }
+  }
 
   // ========================================================================
   // FAILSAFE LAYER 2 -- BOOT-TIME CHECK.
@@ -630,6 +665,29 @@ void setup() {
   //
   // ⚠ On the dev board this can only log; there is no INH path to switch. On
   // the carrier it removes power here.
+  //
+  // ========================================================================
+  // FAILSAFE LAYER 1 -- HARDWARE TASK WATCHDOG.
+  //
+  // The TCAN1043**G** on the carrier has NO tINACTIVE / SWE failsafe (the A
+  // variant does; ours does not), and INH sits on the UNSWITCHED OBD pin 16.
+  // So nothing in hardware will ever turn this board off, and a firmware hang
+  // with INH asserted is an ESP32 awake on the car battery until the battery
+  // is flat. The other two layers are code and cannot help when the code is
+  // what stopped running; this one can.
+  //
+  // Already armed (with the boot budget) above; this narrows it to the loop
+  // window. There is no longer any unwatched stretch of setup(). Everything
+  // slow that runs after this point feeds the watchdog as it makes progress
+  // -- see the esp_task_wdt_reset() calls in filestore.cpp's retention,
+  // hydration and download paths. A watchdog that fires during a legitimate
+  // long operation is worse than no watchdog.
+  // ========================================================================
+  bootguardArmTaskWdt(WDT_TIMEOUT_S);
+  Serial.printf("[wdt] task watchdog armed, %us (no hardware failsafe on "
+                "the TCAN1043G -- this is the only one that survives a "
+                "hang)\n", (unsigned)WDT_TIMEOUT_S);
+
   transceiverRequestSleep();
 
   applyMode(stored, false);
@@ -642,43 +700,10 @@ void setup() {
   //
   // hublinkBegin() tries the hub network FIRST and falls back to webuiStart(),
   // so the standalone behaviour above is preserved exactly. If the radio was
-  // deliberately switched off with 'w', respect that and start nothing.
-  // ========================================================================
-  // FAILSAFE LAYER 1 -- HARDWARE TASK WATCHDOG.
-  //
-  // The TCAN1043**G** on the carrier has NO tINACTIVE / SWE failsafe (the A
-  // variant does; ours does not), and INH sits on the UNSWITCHED OBD pin 16.
-  // So nothing in hardware will ever turn this board off, and a firmware hang
-  // with INH asserted is an ESP32 awake on the car battery until the battery
-  // is flat. The other two layers are code and cannot help when the code is
-  // what stopped running; this one can.
-  // ========================================================================
-  {
-    esp_task_wdt_config_t wdt = {
-        .timeout_ms = (uint32_t)WDT_TIMEOUT_S * 1000u,
-        .idle_core_mask = 0,
-        .trigger_panic = true,   // reset, do not just complain
-    };
-    // Already initialised by the Arduino core on some builds; reconfigure
-    // rather than treating "already exists" as a failure.
-    if (esp_task_wdt_init(&wdt) == ESP_ERR_INVALID_STATE) {
-      esp_task_wdt_reconfigure(&wdt);
-    }
-    esp_task_wdt_add(nullptr);   // watch loop()
-    // ⚠️ ARMED HERE, DELIBERATELY LATE. filestoreBegin() above can format a
-    // corrupt LittleFS partition, which may take far longer than
-    // WDT_TIMEOUT_S; arming before it would reboot into the same format on
-    // every boot, forever. Everything slow that runs AFTER this point feeds
-    // the watchdog as it makes progress instead -- see the
-    // esp_task_wdt_reset() calls in filestore.cpp's retention and download
-    // paths. A watchdog that fires during a legitimate long operation is worse
-    // than no watchdog.
-    Serial.printf("[wdt] task watchdog armed, %us (no hardware failsafe on "
-                  "the TCAN1043G -- this is the only one that survives a "
-                  "hang)\n", (unsigned)WDT_TIMEOUT_S);
-  }
-
-  if (g_prefs.getBool("ap", true)) {
+  // deliberately switched off with 'w', respect that and start nothing --
+  // EXCEPT in safe mode, where the radio is the only way anyone can reach the
+  // board to retry or erase. A safe mode nobody can talk to is just a hang.
+  if (g_prefs.getBool("ap", true) || filestoreSafeMode()) {
     hublinkBegin();
     hubstreamBegin();
   }
