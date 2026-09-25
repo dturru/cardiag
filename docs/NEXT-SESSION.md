@@ -174,6 +174,49 @@ blocked on his VIN option decode.
 marginal link on demand.
 
 ---
+## 🧭 5. OPEN DESIGN ITEM — wake/sleep on the BMW if the OBD bus is silent
+
+**Design only. No code until the first-day car checks in
+`carhub/docs/bmw-f30-electrical.md` are done.** That file holds the car-specific
+reasons and the checks; none of it belongs in this public repo.
+
+**The problem.** The current sleep design (`sleepguard.h`, `CAN_BUS_IDLE_CLOSE_MS`,
+`CAN_MAX_AWAKE_MS`) assumes the bus at the OBD port goes quiet when the car does
+and is busy when it is not. That may not hold on this car: the port can be
+silent unless something polls it, so "bus quiet" would be neither a key-off
+signal nor, the other way round, a wake signal. ⚪ UNVERIFIED — the 60 s
+`MODE_LISTEN` capture on the car settles it.
+
+**The proposal — two wake levels:**
+
+| Level | Entered on | Does | Never |
+|---|---|---|---|
+| **1 — passive** | an early event: accelerometer interrupt, or a pin-16 voltage event (e.g. a door opening loads the battery) | logs pin-16 voltage only: resting voltage before the crank, the crank dip, the recovery | **transmits on the bus** — a diagnostic request can wake the car's modules, and a logger that wakes the car is a battery drain |
+| **2 — polling** | a **standalone** ignition signal: a switched OBD pin (if the meter check finds one), or the **crank signature on pin 16** (dip, then a sustained rise to charging voltage) | polling, plus everything level 1 does | starts without one of those two signals |
+
+- **KL15 from the hub is an optional CONFIRMATION, never a requirement.** The
+  standing invariant is that the logger never depends on the hub; a level 2 that
+  waited for the hub would break it.
+- **Guard against a failed crank.** A dip with no sustained rise afterwards (a
+  crank that did not start, a starter test, a jump attempt) is NOT ignition.
+  Level 2 needs the post-crank rise held for a debounce window; if it does not
+  come, stay in level 1.
+- **Timeouts both ways.** Level 1 with no ignition signal inside a timeout →
+  back to sleep. Level 2 with the ignition signal gone → close files, then
+  sleep, the same invariant as today (never sleep on an open file).
+- **No thresholds here.** Crank-dip depth, charging voltage, debounce and
+  timeouts come from pin-16 traces on the actual car, not from memory.
+
+**How it maps onto what exists.** `INH` stays the sleep owner (decided in the
+carhub doc). On a silent bus the transceiver's bus wake never fires, so the wake
+has to arrive on its local `WAKE` pin — where an accelerometer interrupt or a
+pin-16 comparator would land. ⚠️ The pin-level wiring is carrier work and is not
+designed yet.
+
+**What decides it:** the 60 s `MODE_LISTEN` capture, the OBD pin meter check,
+and a pin-16 trace through a normal start and a deliberately failed one.
+
+---
 ## 0. Where the measurements are
 
 ⚠️ **These are gitignored and therefore LOCAL TO THIS MACHINE.** `.gitignore`

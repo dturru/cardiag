@@ -66,3 +66,18 @@ Full project history and design rationale live in the vault:
 - 📡 **Never filter on `logger_ip`.** Windows ICS has no reservation mechanism and the bench address
   has already been four different values. **The `device_id` allowlist is the real one.**
 - Uploads need `PYTHONIOENCODING=utf-8`.
+
+## Cloud session conventions (token budget)
+Cloud sessions run on a limited credit. Spend it on code, not narration.
+
+- Reports: results only. PR link, CI status, findings with file:line, open questions. No recaps of earlier work, no restating the request, no diff walkthroughs; the PR shows the diff.
+- No polling. Rely on PR subscriptions for CI failures and review comments. Never schedule check-ins.
+- CI logs: read only on failure, and grep for the error; don't read full logs of green runs.
+- Tests: run the relevant subset while iterating; run the full suite once before pushing. Let CI do the rest.
+- Edit, don't rewrite: targeted edits, never regenerate whole files.
+- Read narrowly: grep for symbols before opening files; don't re-read files already in context.
+- Batch: one push per logical change, not per fix.
+- No simulated merges of all open PRs unless asked.
+- No Socratic questions or "something to think about" prompts. If a decision is mine, state it in one line with your recommendation.
+- If a task is ambiguous, ask one short question before starting, not after building.
+- Hardware, local files (secrets.env, analysis/, MEMORY.md, the vault) and the Pi are out of scope. Say "needs local" and stop.
