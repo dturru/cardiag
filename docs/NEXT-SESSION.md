@@ -1,5 +1,39 @@
 # Handoff — next session
 
+## ▶ §0-START HERE — 2026-09-24 overnight soak
+
+📂 **READ `analysis/soak-2026-09-24-2251/SUMMARY.md` AND `DONE` FIRST.**
+Launched 22:52:30 on AC, 200 cycles, ETA ~06:30. Repo `eeded7b`, pushed.
+
+- `DONE` says `complete-pass` / `complete-fail` / a `preflight-*` or gate state.
+  **No `DONE` = it was killed** — `SUMMARY.md` is still valid and will say
+  **PARTIAL** with the cycle count, because `soak.csv` fsyncs every cycle.
+- ⚠️ **Unacked-eviction warnings are COUNTED, NOT failures** — nothing acks
+  overnight, so retention destroys unacked data and says so. That is the
+  "never silent" guarantee working. **The verdict is resets and heap only.**
+- ⚠️ **Negative `detect_ms` is EXPECTED** — measured against the RETURN of the
+  hotspot-stop call; the board's STA-lost event fires ~1.5 s earlier. Only a
+  **sign change or drift** across the run means anything, and SUMMARY.md
+  checks for exactly that.
+- 🔌 Ran **USB-only, CAN harness DISCONNECTED** (the soak never touches the
+  bus; SELFTEST is internal loopback), so a `BROWNOUT` is about the board or
+  the cable, not the harness.
+
+### Then, in order
+
+1. **Fill the UNTESTED rows** in `CLAUDE.md` §Hardware guardrails, **one tool
+   at a time, reading `boot_id` before and after**: raw pyserial at DEFAULTS,
+   then `pio device monitor`. Needs the board free.
+2. **Ventis Pi backup** (held all night, deliberately). Pi on the **laptop
+   hotspot or direct Ethernet — NEVER Dartmouth Wi-Fi** (client isolation).
+   `ls -la ~ ~/ventis` FIRST, copy **both** `~/ventis/` and
+   `/home/diegot1466/ventis_data.csv`, **sha256 both ends**, record in
+   `carhub/docs/deploy-pi.md`. 🚨 **NO REIMAGE until the hashes match.**
+   Run it as uninterruptible work.
+3. Then the Pi hub setup → `carhub/docs/deploy-pi.md` §1a, §2.
+
+🏁 **Retention is CLOSED** (§ below). Do not re-open claim 2.
+
 ## 🚨 §0-AUDIT — "the firmware does X" claims, checked against the source (2026-09-24)
 
 **One claim in this file was FALSE and cost three sessions.** It said the
