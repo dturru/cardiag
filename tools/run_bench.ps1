@@ -88,6 +88,21 @@ if ($sleepAC -ne '0x00000000') {
 }
 Log "sleep on AC: Never"
 
+# --- CONFIG GUARD CHECK -----------------------------------------------------
+# A -D flag that a header quietly redefines does nothing, and the run still
+# produces numbers that get believed. That has now cost two bench campaigns
+# (FS_SNAPSHOT_PERIOD_MS, then FS_TIER_A_MAX_PCT). Refuse to start rather than
+# spend 20 minutes measuring a cap the board does not have.
+Log "--- config guard check ---"
+& python (Join-Path $PSScriptRoot 'check_config_guards.py') 2>&1 |
+  Tee-Object -FilePath (Join-Path $out "guards.log") -Append |
+  ForEach-Object { Log "  $_" }
+if ($LASTEXITCODE -ne 0) {
+  Log "!! unguarded overridable macro(s) -- a build flag would be SILENTLY"
+  Log "   IGNORED and this run would measure the wrong thing. ABORTING."
+  exit 7
+}
+
 $hs = & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'hotspot.ps1') -Action state
 if ($hs -notmatch 'On') {
   Log "hotspot off -> starting"
@@ -183,6 +198,28 @@ if (-not $ip) {
   exit 5
 }
 Log "board at $ip"
+
+# --- 5b. ASSERT THE BOARD IS RUNNING THE FLAGS WE ASKED FOR -----------------
+# The guard check above stops the KNOWN cause. This checks the EFFECT, on the
+# board, and so catches causes nobody has thought of yet: a misspelled flag, a
+# stale binary that never reflashed, an `extends` that does not inherit what it
+# appears to, a value clamped at runtime.
+#
+# The board printed its effective caps at mount and serial.log already has the
+# line by now -- IP discovery above read past it. Abort, not warn: a run under
+# a flag that did not take effect measures something other than what it claims,
+# and the 18:40 run proved those numbers get believed.
+Log "--- asserting effective caps match $Env ---"
+& python (Join-Path $PSScriptRoot 'assert_effective_caps.py') `
+    '--env' $Env '--serial' (Join-Path $out 'serial.log') 2>&1 |
+  Tee-Object -FilePath (Join-Path $out "caps.log") -Append |
+  ForEach-Object { Log "  $_" }
+if ($LASTEXITCODE -ne 0) {
+  Log "!! effective caps do not match the requested build flags (or could not"
+  Log "   be read). See caps.log. ABORTING before wasting the window."
+  if (-not $serial.HasExited) { Stop-Process -Id $serial.Id -Force }
+  exit 8
+}
 
 # --- 6. TOKEN ---------------------------------------------------------------
 $secrets = Join-Path $repo 'firmware\include\secrets.h'

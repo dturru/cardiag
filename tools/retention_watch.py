@@ -232,12 +232,33 @@ class Watcher:
             # eviction against an earlier unacked one without this produces a
             # false FAIL -- those files were not acked yet when the earlier
             # one went.
-            acked_available = sum(
+            # ⚠️ SCOPED TO THE SAME TIER, and this is a correctness fix, not a
+            # relaxation to make a red run go green.
+            #
+            # enforceTierACap() only ever considers TIER A candidates -- that
+            # is what the cap is: Tier A's share of the partition. An acked
+            # Tier B file sitting on the disk is not a candidate it declined to
+            # take, so it is not evidence of anything.
+            #
+            # Counting every tier produced a FALSE FAIL on 2026-09-24 19:01:
+            # #436 and #442 are Tier B snapshots below the ack watermark, so
+            # the unacked Tier A eviction at t=1032.6 was reported as a
+            # violation while the firmware had in fact evicted all six acked
+            # Tier A files first. The all-tier count is kept alongside, because
+            # the global evictOne() path DOES order across tiers and a future
+            # claim may want it.
+            tier = f.get("tier")
+            acked_same_tier = sum(
+                1 for j, g in self.seen_indices.items()
+                if wm is not None and j <= wm and j != i
+                and g.get("tier") == tier)
+            acked_available_any = sum(
                 1 for j in self.seen_indices
                 if wm is not None and j <= wm and j != i)
-            self.evicted.append({"t": t, "index": i, "tier": f.get("tier"),
+            self.evicted.append({"t": t, "index": i, "tier": tier,
                                  "bytes": f.get("bytes"), "acked": was_acked,
-                                 "acked_available": acked_available})
+                                 "acked_available": acked_same_tier,
+                                 "acked_available_any": acked_available_any})
             self.events.append(
                 f"[t={t:7.1f}] EVICTED "
                 f"#{i} tier={f.get('tier')} kind={f.get('kind')} "
@@ -384,7 +405,10 @@ class Watcher:
             v = violations[0]
             print(f"  ** FAIL **: unacked #{v['index']} (tier {v['tier']}) was "
                   f"deleted at t={v['t']:.1f} while {v['acked_available']} "
-                  f"acked file(s) were still on the disk.")
+                  f"acked TIER {v['tier']} file(s) were still on the disk "
+                  f"({v.get('acked_available_any', '?')} acked across all "
+                  f"tiers, which is NOT the test -- the cap only chooses "
+                  f"within a tier).")
         elif not any(e["acked"] for e in self.evicted):
             ne("2", "NOT EXERCISED as an ordering test: no acked file was ever "
                     "on the disk to compete, so going straight to unacked is "
