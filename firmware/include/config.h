@@ -129,14 +129,14 @@
 #endif
 // How long to wait for the hub network before falling back to AP mode.
 #define WIFI_STA_TIMEOUT_MS 8000
-// Retry the hub network periodically, so the logger joins when the car gets home.
+// Retry the hub network on a backoff, so the logger joins when the car gets
+// home: WIFI_STA_BACKOFF_FIRST_MS, doubling after each failed join, capped at
+// WIFI_STA_RETRY_MS (5, 10, 20, 40, 60 s). The schedule restarts on every STA
+// disconnect -- a fresh drop is when the hub is most likely to come back
+// quickly. See retrybackoff.h for why the old one-shot 10 s + fixed 60 s
+// cadence cost ~58 s per rejoin.
+#define WIFI_STA_BACKOFF_FIRST_MS 5000
 #define WIFI_STA_RETRY_MS   60000
-// First retry after an UNEXPECTED drop. A dropped link may be a blip rather
-// than a hub that went home, and 60 s of AP for a blip is a bad trade -- but
-// retrying every 10 s forever would tear the AP down repeatedly for a hub that
-// is genuinely absent, so this is a one-shot and the cadence then returns to
-// WIFI_STA_RETRY_MS. See hublink.cpp.
-#define WIFI_STA_QUICK_RETRY_MS 10000
 
 // Shared token for the mutating /api/v1 endpoints. Protocol v1 2.4.
 // Override in secrets.h. A default this obvious is intentional: it should look

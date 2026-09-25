@@ -536,9 +536,10 @@ def report(cycles: list[Cycle], tot: Totals, args):
     print(stat_block("fallback->AP", fallbacks, unit="ms"))
     print()
     print("READ 'detect' AS THE RESULT. 'rejoin' is dominated by the firmware's")
-    print("own 60s retry timer, not by anything the radio did: the board is in")
-    print("AP mode and only looks for the hub on that cadence, so a rejoin of")
-    print("tens of seconds is the timer working, not a fault. The number that")
+    print("retry backoff (5, 10, 20, 40, 60 s from each drop), not by anything")
+    print("the radio did: the board is in AP mode and only looks for the hub on")
+    print("that schedule, so rejoin tracks where in it the hotspot came back.")
+    print("A rejoin near 60 s on every cycle is the old fixed cadence. The number that")
     print("matters is how long the board spends with NO interface, which is")
     print("detect + fallback.")
     print()
@@ -658,10 +659,10 @@ def main(argv=None) -> int:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--cycles", type=int, default=50)
     ap.add_argument("--dwell", type=float, default=20.0,
-                    help="seconds to sit in each state. Must exceed the "
-                         "firmware's quick retry (10s) so a rejoin is "
-                         "attributable to the hotspot coming back rather than "
-                         "to the retry timer.")
+                    help="seconds to sit in each state. Should exceed the "
+                         "first two backoff steps (5 s + 10 s after a drop) so "
+                         "a rejoin is attributable to the hotspot coming back "
+                         "rather than to the retry timer.")
     ap.add_argument("--drop-timeout", type=float, default=180.0,
                     help="how long to wait for a drop before calling it missed."
                          " Generous on purpose: the OLD firmware took ~150s.")
@@ -674,8 +675,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if args.dwell < 12:
-        print("WARNING: dwell below the 10s quick retry; rejoin timings will "
-              "be confounded by the retry timer.")
+        print("WARNING: dwell below the first backoff steps (5 s, 10 s); "
+              "rejoin timings will be confounded by the retry timer.")
     try:
         return run(args)
     except KeyboardInterrupt:
