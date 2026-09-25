@@ -525,6 +525,18 @@ void setup() {
       case ESP_RST_DEEPSLEEP: name = "DEEPSLEEP"; break;
       case ESP_RST_BROWNOUT:  name = "BROWNOUT";  break;
       case ESP_RST_SDIO:      name = "SDIO";      break;
+      // ⚠️ THE TAIL OF THE ENUM IS NOT OPTIONAL. Reason 11 (USB) is what a
+      // host-side esptool reset produces, and it showed up on the very first
+      // bench check -- printed as "UNKNOWN (11)", which reads exactly like
+      // firmware too old to classify. On an overnight soak that would send
+      // someone chasing a stale flash instead of a USB event. PWR_GLITCH and
+      // CPU_LOCKUP matter for the same reason: both are real findings and
+      // neither is "unknown".
+      case ESP_RST_USB:       name = "USB";       break;
+      case ESP_RST_JTAG:      name = "JTAG";      break;
+      case ESP_RST_EFUSE:     name = "EFUSE";     break;
+      case ESP_RST_PWR_GLITCH: name = "PWR_GLITCH"; break;
+      case ESP_RST_CPU_LOCKUP: name = "CPU_LOCKUP"; break;
       default:                name = "UNKNOWN";   break;
     }
     Serial.printf("[boot] RESET REASON: %s (%d)\n", name, (int)rr);

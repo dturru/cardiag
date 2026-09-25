@@ -31,7 +31,10 @@ from pathlib import Path
 # BROWNOUT is a real finding about the board or the cable.
 SUPPLY = {"BROWNOUT"}
 # Resets that are ours, and the actual point of a stability soak.
-OURS = {"PANIC", "TASK_WDT", "INT_WDT", "WDT"}
+OURS = {"PANIC", "TASK_WDT", "INT_WDT", "WDT", "CPU_LOCKUP"}
+# Host-side or electrical events that are neither a firmware bug nor a supply
+# sag. USB is what an esptool reset produces; PWR_GLITCH is the rail, not us.
+HOST = {"USB", "JTAG", "SW", "EXT"}
 
 
 def num(v):
@@ -177,6 +180,15 @@ def main() -> int:
         if ours:
             L.append(f"- 🔴 **{ours} PANIC/WDT — these ARE ours** and are the "
                      f"real finding of this run.")
+        host = sum(len(v) for k, v in reasons.items() if k in HOST)
+        if host:
+            L.append(f"- 💻 **{host} USB/JTAG/SW — a HOST-SIDE reset**, not the "
+                     f"board misbehaving. Expected if anything touched the "
+                     f"port mid-run; unexpected otherwise, and then worth "
+                     f"asking what did.")
+        if "PWR_GLITCH" in reasons:
+            L.append(f"- ⚡ **PWR_GLITCH** — the rail glitched. Same class as "
+                     f"BROWNOUT: supply, not firmware.")
         if unrep:
             L.append(f"- ⚪ **{unrep} UNREPORTED** — the board booted without "
                      f"printing `[boot] RESET REASON`, so it is running "

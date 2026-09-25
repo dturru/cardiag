@@ -67,6 +67,11 @@ if ($Resume) {
 }
 
 $pio = "C:\Users\turru\.platformio\penv\Scripts\pio.exe"
+# `pio pkg exec -p tool-esptoolpy -- esptool` fails with WinError 2 on this
+# install; call the script through PlatformIO's own interpreter instead.
+# Used ONLY for a deterministic hard reset before the boot capture.
+$pioPy   = "C:\Users\turru\.platformio\penv\Scripts\python.exe"
+$esptool = "C:\Users\turru\.platformio\packages\tool-esptoolpy\esptool.py"
 # Known trap: without this, pio upload dies after ~10 min on a cp1252
 # UnicodeEncodeError that names nothing relevant.
 $env:PYTHONIOENCODING = "utf-8"
@@ -179,7 +184,6 @@ if ($SkipFlash) {
   Pop-Location
   if ($rc -ne 0) { Log "!! flash FAILED (see flash.log). ABORTING."; Finish 4 "flash" }
   Log "flashed"
-  Start-Sleep -Seconds 3
 }
 
 # --- 3b. ENTER SELFTEST, AND PROVE IT ---------------------------------------
@@ -191,15 +195,42 @@ if ($SkipFlash) {
 # 🔑 And then it is VERIFIED, not assumed. Without this the soak would happily
 # run 200 cycles of Wi-Fi churn in LISTEN with no CAN traffic at all, report a
 # clean PASS, and answer a question nobody asked.
+#
+# ⚠️ `--reset` IS LOAD-BEARING, NOT TIDINESS. setup() prints the banner --
+# RESET REASON, EFFECTIVE CAPS, the mount line -- about 2 s after boot, and
+# esptool resets the board the moment the upload finishes. Opening the port a
+# few seconds later therefore starts reading PAST the only lines the caps gate
+# can check, and the gate correctly aborts on evidence it never had a chance to
+# see. That happened on the 22:45 attempt. Resetting AFTER the port is already
+# open removes the race instead of timing around it.
 Log "--- entering SELFTEST + verifying ---"
 $boot = Join-Path $out "boot.log"
-& python (Join-Path $PSScriptRoot 'serial_capture.py') `
-    '--port' $Port '--seconds' '45' '--delay' '20' '--gap' '3' `
-    '--send' '3' '--send' 'y' '--out' $boot '--quiet' 2>&1 |
-  Out-Null
-
-if (-not (Test-Path $boot)) { Log "!! no serial captured. ABORTING."; Finish 9 "selftest-noserial" }
-$bootText = Get-Content $boot -Raw
+$bootText = ""
+for ($try = 1; $try -le 3; $try++) {
+  # 🔑 esptool's hard reset, THEN capture. Measured on this board 2026-09-24:
+  # serial_capture's --reset (DTR/RTS pulse) does NOT reset it -- uptime kept
+  # climbing through 122 s -- and neither does closing the port, despite the
+  # standing note that it does. esptool's `--after hard_reset` provably does.
+  # Without a deterministic reset this is a ~2 s race against setup()'s
+  # delay(2000), which the 22:45 attempt lost and correctly aborted on.
+  Log "  attempt $try -- hard reset via esptool, then capture"
+  & $pioPy $esptool --chip esp32s3 --port $Port --after hard_reset read_mac 2>&1 |
+    Out-File -FilePath (Join-Path $out "reset.log") -Append -Encoding utf8
+  & python (Join-Path $PSScriptRoot 'serial_capture.py') `
+      '--port' $Port '--seconds' '45' '--delay' '20' '--gap' '3' `
+      '--send' '3' '--send' 'y' '--out' $boot '--quiet' 2>&1 | Out-Null
+  if (Test-Path $boot) {
+    $bootText = Get-Content $boot -Raw
+    if ($bootText -match 'EFFECTIVE CAPS') { Log "  boot banner captured"; break }
+  }
+  Log "  no boot banner this attempt; retrying"
+}
+if (-not $bootText) { Log "!! no serial captured. ABORTING."; Finish 9 "selftest-noserial" }
+if ($bootText -notmatch 'EFFECTIVE CAPS') {
+  Log "!! never captured the boot banner in 3 attempts. ABORTING rather than"
+  Log "   soaking all night without knowing which caps the board carries."
+  Finish 9 "selftest-nobanner"
+}
 
 # (a) production caps, NOT the 10% bench cap. Script-checked, not eyeballed.
 Log "--- asserting PRODUCTION caps (tier A 40%) ---"
