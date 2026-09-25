@@ -31,6 +31,8 @@ static inline void wdtFeedIfArmed() {
 }
 
 #include "filestore.h"
+#include "busidle.h"
+#include <atomic>
 #include "fsindex.h"
 #include "bootguard_rt.h"
 #include "recorder.h"
@@ -112,11 +114,13 @@ static Active g_actChanges;    // Tier A
 
 static uint32_t g_nextSnapMs = 0;
 
-// Bus-idle tracking for the clean key-off close. Written by the CAN task,
-// read by loop(); a 32-bit aligned store is atomic on this core, and being a
-// few milliseconds stale cannot matter against a 3 s threshold.
-static volatile uint32_t g_lastBusMs = 0;
-static bool g_idleClosed = false;
+// Bus-idle tracking for the clean key-off close. Written by canTask on every
+// received frame (the other core), read by loop(). Atomic, and read ONCE per
+// comparison: canTask can store a timestamp NEWER than a `now` loop() sampled
+// earlier in the same pass. See busidle.h for the 49.7-day wrap that caused.
+static std::atomic<uint32_t> g_lastBusMs{0};
+// Cleared by canTask on traffic, set by loop() on the idle close.
+static std::atomic<bool> g_idleClosed{false};
 static RecCsvCursor g_chgCursor = {0, false};
 
 // ---------------------------------------------------------------------------
@@ -655,19 +659,18 @@ static bool ensureOpen(Active &a, char kind) {
 }
 
 void filestoreNoteBusActivity() {
-  g_lastBusMs = millis();
-  g_idleClosed = false;     // traffic is back; re-arm for the next key-off
+  g_lastBusMs.store(millis(), std::memory_order_relaxed);
+  g_idleClosed.store(false, std::memory_order_relaxed);  // re-arm for the next key-off
 }
 
-bool filestoreIdleClosed() { return g_idleClosed; }
+bool filestoreIdleClosed() { return g_idleClosed.load(std::memory_order_relaxed); }
 
 uint32_t filestoreBusQuietMs() {
   // No frame ever seen is NOT 'infinitely quiet'. Returning 0 means a
   // board that has never been on a bus can never satisfy the quiet test,
   // which is the safe reading: absence of traffic we never looked for is
   // not evidence the trip is over.
-  if (!g_lastBusMs) return 0;
-  return (uint32_t)(millis() - g_lastBusMs);
+  return busQuietMs(millis(), g_lastBusMs.load(std::memory_order_relaxed));
 }
 
 void filestoreCloseActive() {
@@ -929,15 +932,19 @@ void filestoreLoop() {
   // Deliberately not reliant on flushDue(): the 10 s bound is the crash
   // backstop, and on a normal key-off there must be nothing left to lose
   // rather than up to ten seconds of it.
-  if (!g_idleClosed && g_lastBusMs &&
-      (uint32_t)(now - g_lastBusMs) >= CAN_BUS_IDLE_CLOSE_MS &&
+  //
+  // `now` was sampled at the top of this pass; canTask may have stored a newer
+  // timestamp since. One read, signed comparison (busidle.h).
+  const uint32_t lastBus = g_lastBusMs.load(std::memory_order_relaxed);
+  if (!g_idleClosed.load(std::memory_order_relaxed) &&
+      busIdleFor(now, lastBus, CAN_BUS_IDLE_CLOSE_MS) &&
       (g_actSnapshot.open || g_actChanges.open)) {
     const uint32_t a = g_actSnapshot.bytes, b = g_actChanges.bytes;
     filestoreCloseActive();
-    g_idleClosed = true;
+    g_idleClosed.store(true, std::memory_order_relaxed);
     Serial.printf("[fs] bus idle %lums -> closed all files "
                   "(tierB=%lu B, tierA=%lu B); safe to lose power\n",
-                  (unsigned long)(now - g_lastBusMs),
+                  (unsigned long)busQuietMs(now, lastBus),
                   (unsigned long)a, (unsigned long)b);
   }
 
