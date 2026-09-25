@@ -342,6 +342,15 @@
 // It logs the drift between the two figures and adopts the real one.
 #define FS_USAGE_RESYNC_MS (60UL * 60UL * 1000UL)
 
+// Serial is written by the loop() task only (logq.h). Other tasks -- canTask's
+// frame prints, ESP-IDF's own logging -- queue whole lines here. 8 KB holds
+// ~180 frame lines, about 0.75 s of SELFTEST frame printing; past that lines
+// are dropped and counted (logdrop= on the [stats] line), never waited for.
+#define LOGQ_BYTES     8192u
+#define LOGQ_LINE_MAX  192u
+// Bytes loop() writes out per pass, so draining never becomes its own stall.
+#define LOGQ_DRAIN_PER_PASS 2048u
+
 // Index entries whose size/digest/mode are read per filestoreLoop() pass. The
 // boot scan reads names only; this fills in the rest in the background. Each
 // read is one path lookup.

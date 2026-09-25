@@ -131,15 +131,15 @@ def test_bus_idle_is_not_judged_outside_selftest(tmp_path):
 
 
 @pytest.mark.parametrize("missing", ["loop", "bus_idle_closes"])
-def test_a_missing_check_fails_rather_than_passes(tmp_path, missing):
+def test_a_missing_metric_is_inconclusive_not_pass(tmp_path, missing):
     if missing == "loop":
         fields = [f for f in FIELDS
                   if f not in ("loop_max_us", "loop_cycle_max_us")]
     else:
         fields = [f for f in FIELDS if f != "bus_idle_closes"]
     j = verdict_of(tmp_path, healthy(), fields=fields)
-    assert j["verdict"] == "FAIL"
-    assert any("cannot be judged" in f for f in j["fails"])
+    assert j["verdict"] == "INCONCLUSIVE"
+    assert j["coverage_short"] == ["loop" if missing == "loop" else "bus_idle"]
 
 
 def test_no_cycles_is_not_a_pass(tmp_path):
@@ -218,11 +218,11 @@ def test_any_can_drop_fails(tmp_path, kw, what):
     assert any(what in f and "first at cycle 6" in f for f in j["fails"])
 
 
-def test_drop_counters_missing_fails(tmp_path):
+def test_drop_counters_missing_is_inconclusive(tmp_path):
     fields = [f for f in FIELDS if not f.startswith("can_")]
     j = verdict_of(tmp_path, healthy(), fields=fields)
-    assert j["verdict"] == "FAIL"
-    assert any("CAN drop counters not reported" in f for f in j["fails"])
+    assert j["verdict"] == "INCONCLUSIVE"
+    assert "can_drops" in j["coverage_short"]
 
 
 def test_fs_sub_stage_is_reported_not_failed(tmp_path):
@@ -282,3 +282,80 @@ def test_stats_line_scan_counters_parse():
     sw.scan_window(tap, 0, 1, cyc, tot)
     assert (cyc.join_fail, cyc.scans, cyc.scan_seen) == (1, 41, 3)
     assert cyc.heap == 200_000
+
+
+# --- coverage -------------------------------------------------------------------
+
+def _garbled(r: dict) -> dict:
+    """A cycle whose [stats] line was split: counters and sub-stage unread."""
+    r = dict(r)
+    for c in ("fs_sub_max_us", "fs_sub_stage", "fs_pass_us", "can_rx_missed",
+              "can_rx_overrun", "can_chg_dropped", "can_id_overflow"):
+        r[c] = ""
+    return r
+
+
+def test_the_baseline_soak_shape_is_inconclusive(tmp_path):
+    # 16 of 40 cycles with unreadable counters: 60 % coverage. It was PASS.
+    rows = [_garbled(row(i)) if i % 5 in (0, 2) else row(i)
+            for i in range(1, 41)]
+    j = verdict_of(tmp_path, rows)
+    assert j["coverage"]["can_drops"]["readable"] == 24
+    assert j["verdict"] == "INCONCLUSIVE"
+    assert set(j["coverage_short"]) == {"can_drops", "fs_sub"}
+
+
+@pytest.mark.parametrize("unreadable,verdict", [(4, "PASS"), (5, "INCONCLUSIVE")])
+def test_coverage_threshold_is_90_percent(tmp_path, unreadable, verdict):
+    rows = [_garbled(row(i)) if i <= unreadable else row(i)
+            for i in range(1, 41)]
+    assert verdict_of(tmp_path, rows)["verdict"] == verdict   # 36/40 = 90 %
+
+
+def test_a_failure_on_readable_cycles_still_fails(tmp_path):
+    rows = [_garbled(row(i)) for i in range(1, 21)]
+    rows[3] = row(4, loop_cycle=1_500_000, stage="filestore")
+    j = verdict_of(tmp_path, rows)
+    assert j["verdict"] == "FAIL"
+
+
+def test_inconclusive_agrees_across_summary_verdict_file_and_log(tmp_path):
+    rows = [_garbled(row(i)) if i % 2 else row(i) for i in range(1, 21)]
+    csv_path = write(tmp_path, rows)
+    out, vfile = tmp_path / "SUMMARY.md", tmp_path / "verdict.json"
+    rc = ss.main(["--csv", str(csv_path), "--out", str(out),
+                  "--requested", "20", "--verdict-file", str(vfile)])
+    text = out.read_text("utf-8")
+    assert re.search(r"\*\*VERDICT: (\w+)\*\*", text)[1] == "INCONCLUSIVE"
+    assert "INCONCLUSIVE, not PASS" in text and "coverage" in text
+    assert json.loads(vfile.read_text("utf-8"))["verdict"] == "INCONCLUSIVE"
+    args = types.SimpleNamespace(csv=str(csv_path), cycles=20, dwell=20)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        wifi_rc = sw.report([], sw.Totals(), args)
+    assert re.search(r"^VERDICT: (\w+)", buf.getvalue(), re.M)[1] == "INCONCLUSIVE"
+    assert "coverage: can_drops readable on 10/20" in buf.getvalue()
+    assert rc == wifi_rc == 4
+
+
+def test_run_soak_maps_inconclusive():
+    ps1 = (REPO / "tools" / "run_soak.ps1").read_text(encoding="utf-8")
+    assert re.search(r'"INCONCLUSIVE"\s*\{\s*Finish 4 "inconclusive" \$verdict', ps1)
+
+
+def test_counters_parse_from_their_own_stats_line():
+    lines = [
+        "[hublink] rejoin state=sta joins=3 drops=2(evt=2 poll=0) joinfail=0 "
+        "apstarts=3 reason=201 fallback=120ms worst=150ms heap=200000 "
+        "minheap=180000 largest=100000 loopmax=90000us loopstage=webui "
+        "loopwin=80000us loopwinstage=webui",
+        "[stats] fswin=40000us fswinstage=snapshot fswinpass=60000us "
+        "canmiss=0 canovr=0 chgdrop=0 idovf=0 logdrop=12",
+    ]
+    tap = types.SimpleNamespace(
+        snapshot=lambda: [sw.Line(0.0, t) for t in lines])
+    cyc, tot = sw.Cycle(n=1), sw.Totals()
+    sw.scan_window(tap, 0, 2, cyc, tot)
+    assert (cyc.heap, cyc.loop_cycle_max_us) == (200_000, 80_000)
+    assert (cyc.fs_sub_max_us, cyc.can_rx_missed, cyc.can_id_overflow) == (
+        40_000, 0, 0)

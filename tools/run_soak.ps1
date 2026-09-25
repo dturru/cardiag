@@ -309,6 +309,8 @@ Log "read results from: $out"
 switch ($verdict) {
   "PASS"    { Finish 0 "complete-pass" $verdict }
   "PARTIAL" { Finish 3 "partial" $verdict }
+  # A required metric unreadable on >= 10 % of cycles: not a PASS.
+  "INCONCLUSIVE" { Finish 4 "inconclusive" $verdict }
   "FAIL"    { Finish 1 "complete-fail" $verdict }
   default   { Finish 8 "summary-missing" $verdict }
 }

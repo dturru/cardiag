@@ -6,6 +6,7 @@
 #include "webui.h"
 #include "looptime.h"
 #include "candrops.h"
+#include "logq.h"
 #include "filestore.h"
 #include "scansched.h"
 #include "config.h"
@@ -102,13 +103,7 @@ void hublinkPrintStats(const char *what) {
                 // Max pass since the PREVIOUS stats line, which this line
                 // resets. The soak takes the max of these per cycle, so a
                 // cycle's loop max is that cycle's, not the whole boot's.
-                "loopwin=%luus loopwinstage=%s "
-                // Worst filestore sub-stage (fsprof.h) since the previous
-                // stats line, and the whole tick in that pass.
-                "fswin=%luus fswinstage=%s fswinpass=%luus fswalks=%lu "
-                // Frames lost before the file (candrops.h). Any non-zero
-                // fails the soak.
-                "canmiss=%lu canovr=%lu chgdrop=%lu idovf=%lu\n",
+                "loopwin=%luus loopwinstage=%s\n",
                 what, hublinkStateName(),
                 (unsigned long)s.staJoins, (unsigned long)s.staDrops,
                 (unsigned long)s.eventDrops, (unsigned long)s.pollDrops,
@@ -124,13 +119,27 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)cardiagLoopStats()->maxUs,
                 (bootStage && *bootStage) ? bootStage : "-",
                 (unsigned long)win.maxUs,
-                (win.maxStage && *win.maxStage) ? win.maxStage : "-",
+                (win.maxStage && *win.maxStage) ? win.maxStage : "-");
+  // ⭐ THE COUNTERS ON THEIR OWN SHORT LINE. At the end of a ~335-char line
+  // they were the part a split cut off (16 of 40 cycles unreadable in the
+  // baseline soak). Short and separate, and since only loop() writes Serial
+  // now (logq.h), whole.
+  Serial.printf("[stats] "
+                // Worst filestore sub-stage (fsprof.h) since the previous
+                // stats line, and the whole tick in that pass.
+                "fswin=%luus fswinstage=%s fswinpass=%luus fswalks=%lu "
+                // Frames lost before the file (candrops.h). Any non-zero
+                // fails the soak.
+                "canmiss=%lu canovr=%lu chgdrop=%lu idovf=%lu "
+                // Serial lines other tasks queued that did not fit (logq.h).
+                "logdrop=%lu\n",
                 (unsigned long)fsw.worstUs,
                 fsw.worstUs ? fsSubName(fsw.worstSub) : "-",
                 (unsigned long)fsw.passUs, (unsigned long)fsw.walks,
                 (unsigned long)drops.rxMissed, (unsigned long)drops.rxOverrun,
                 (unsigned long)drops.changelogDropped,
-                (unsigned long)drops.idOverflow);
+                (unsigned long)drops.idOverflow,
+                (unsigned long)logqDropped());
 }
 
 // ---------------------------------------------------------------------------
