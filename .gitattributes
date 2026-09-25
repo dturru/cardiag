@@ -1,0 +1,11 @@
+# Line endings, pinned. Mixed CRLF/LF edits from Windows and Linux sessions
+# turned one-line changes into whole-file diffs and conflicts (2026-09-25).
+# The repo stores LF; *.ps1 checks out CRLF for Windows PowerShell.
+*.md   text eol=lf
+*.py   text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.ini  text eol=lf
+*.yml  text eol=lf
+*.ps1  text eol=crlf
+*.bin  binary
