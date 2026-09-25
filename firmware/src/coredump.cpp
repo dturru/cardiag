@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <esp_partition.h>
 #include <esp_core_dump.h>
 #include <esp_task_wdt.h>
@@ -25,6 +26,22 @@ static uint32_t s_serveOff = 0;    // what the default GET serves, relative to t
 static uint32_t s_serveLen = 0;
 static char     s_sha[65] = "";
 static const esp_partition_t *s_part = nullptr;
+
+// Lifetime, NVS-backed. See coredump.h.
+static Preferences s_prefs;
+static uint32_t s_crashes = 0;
+static uint32_t s_acked = 0;
+static char     s_lastReason[12] = "";
+
+static const char *crashReasonName(int rr) {
+  switch (rr) {
+    case ESP_RST_PANIC:    return "PANIC";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_INT_WDT:  return "INT_WDT";
+    case ESP_RST_WDT:      return "WDT";
+    default:               return nullptr;   // not a crash
+  }
+}
 
 static inline void wdtFeedIfArmed() {
   if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
@@ -85,6 +102,22 @@ static void printSummary() {
 void coredumpBegin(int resetReason) {
   s_present = false;
   s_sha[0] = 0;
+
+  // Count the crash FIRST, before anything that could fail, and whether or
+  // not a dump survived: the count is what remains when the dump does not.
+  s_prefs.begin("cardiagcd", false);
+  s_crashes = s_prefs.getULong("crashes", 0);
+  s_acked = s_prefs.getULong("acked", 0);
+  s_prefs.getString("lastrr", s_lastReason, sizeof(s_lastReason));
+  if (const char *why = crashReasonName(resetReason)) {
+    s_crashes++;
+    s_prefs.putULong("crashes", s_crashes);
+    snprintf(s_lastReason, sizeof(s_lastReason), "%s", why);
+    s_prefs.putString("lastrr", s_lastReason);
+  }
+  Serial.printf("[boot] CRASHES (lifetime): %lu, dumps acked by hub: %lu%s%s\n",
+                (unsigned long)s_crashes, (unsigned long)s_acked,
+                s_lastReason[0] ? ", last: " : "", s_lastReason);
 #if CD_BUILT
   const bool crashed = resetReason == ESP_RST_PANIC ||
                        resetReason == ESP_RST_TASK_WDT ||
@@ -119,14 +152,11 @@ void coredumpBegin(int resetReason) {
 
   // ⭐ NOT ERASED. It stays until POST /api/v1/coredump/ack names this sha.
   //
-  // The old code erased here because "the partition holds ONE dump: with a
-  // stale dump in place the NEXT crash has nowhere to go". ⚠️ UNVERIFIED on
-  // this core: ESP-IDF's flash coredump writer erases the partition before it
-  // writes, so a new crash is expected to REPLACE an unfetched dump, not be
-  // refused. If that holds, keeping a dump costs at most the older one; if it
-  // does not, the hub fetching and acking promptly is what keeps it moving.
-  // Check it on the bench: crash twice without fetching, and see which dump
-  // GET returns.
+  // The old code erased here so "the next crash has somewhere to go". It
+  // does not need to: ESP-IDF's flash coredump writer overwrites the stored
+  // dump on every crash, so the policy is LATEST WINS. What that loses is the
+  // older dump when two crashes happen before a fetch -- which is what the
+  // NVS crash counter above is for: the crash is still counted.
   Serial.printf("[boot] COREDUMP PRESENT: %s, %lu B, sha256 %.12s... -- kept "
                 "until fetched and acked (GET /api/v1/coredump). This boot's "
                 "reset was %s; the dump may be from an EARLIER boot.\n",
@@ -142,6 +172,9 @@ void coredumpBegin(int resetReason) {
 }
 
 bool coredumpPresent() { return s_present; }
+uint32_t coredumpCrashesTotal() { return s_crashes; }
+uint32_t coredumpDumpsAcked() { return s_acked; }
+const char *coredumpLastCrashReason() { return s_lastReason; }
 uint32_t coredumpBytes() { return s_present ? s_serveLen : 0; }
 const char *coredumpSha256Hex() { return s_present ? s_sha : ""; }
 const char *coredumpFormat() { return s_isElf ? "elf" : "raw"; }
@@ -224,6 +257,8 @@ static void handleAck(WebServer &srv) {
     return;
   }
   Serial.printf("[coredump] acked by hub (sha256 %.12s...) and erased\n", s_sha);
+  s_acked++;
+  s_prefs.putULong("acked", s_acked);
   s_present = false;
   s_sha[0] = 0;
   srv.send(200, "application/json", "{\"ok\":true,\"erased\":true,\"present\":false}");

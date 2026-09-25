@@ -144,11 +144,17 @@ static void handleSession(WebServer &srv) {
   // so `present` is a to-do for the hub, not a history.
   n = jsonAppend(buf, sizeof(buf), n,
       "\"coredump\":{\"present\":%s,\"bytes\":%lu,\"format\":\"%s\","
-      "\"sha256\":%s%s%s},",
+      "\"sha256\":%s%s%s,"
+      // LIFETIME, NVS. The board keeps one dump and a new crash overwrites
+      // it, so crashes_total - dumps_acked - present = crashes whose dump
+      // the hub never got.
+      "\"crashes_total\":%lu,\"dumps_acked\":%lu,\"last_crash_reason\":\"%s\"},",
       coredumpPresent() ? "true" : "false",
       (unsigned long)coredumpBytes(), coredumpFormat(),
       coredumpPresent() ? "\"" : "", coredumpPresent() ? coredumpSha256Hex() : "null",
-      coredumpPresent() ? "\"" : "");
+      coredumpPresent() ? "\"" : "",
+      (unsigned long)coredumpCrashesTotal(), (unsigned long)coredumpDumpsAcked(),
+      coredumpLastCrashReason());
 
   // Storage. Protocol 2.3 says the logger warns "well before" it has to delete
   // anything -- it has no MQTT client, so it reports here and the hub's sync

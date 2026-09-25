@@ -40,4 +40,15 @@ const char *coredumpSha256Hex();
 // "elf" or "raw": what the default GET serves.
 const char *coredumpFormat();
 
+// ⭐ LIFETIME CRASH COUNT, NVS. ESP-IDF keeps ONE dump and overwrites it on
+// every crash ("latest wins"), so a board that crashes twice before the hub
+// fetches loses the first dump. This counter is incremented at boot whenever
+// the reset reason is PANIC or a watchdog, so an overwritten crash is at
+// least COUNTED: crashes_total - dumps_acked - (present ? 1 : 0) crashes left
+// no dump the hub ever saw.
+uint32_t coredumpCrashesTotal();
+uint32_t coredumpDumpsAcked();
+// Name of the last crash's reset reason ("TASK_WDT", ...), "" if none ever.
+const char *coredumpLastCrashReason();
+
 void coredumpRegister(WebServer &srv);

@@ -398,9 +398,48 @@ static void requestMode(uint8_t m) {
   applyMode(m, true);
 }
 
+#if defined(CARDIAG_DEBUG_PANIC) && CARDIAG_DEBUG_PANIC
+// ⚠️ CAPTEST-ONLY DEBUG: a deliberate crash, so the coredump path can be
+// tested on hardware end to end -- crash, reboot, GET /api/v1/coredump, ack,
+// confirm it is erased and crashes_total went up. Built only when the env sets
+// CARDIAG_DEBUG_PANIC (platformio.ini, captest); no shipping build has it.
+//
+// A store through a null pointer, not abort(): it goes through the same
+// exception -> panic -> coredump path as a real firmware bug. noinline so the
+// function name shows up in the dump's backtrace.
+static uint32_t g_panicArmedMs = 0;
+static void __attribute__((noinline)) debugPanicNow() {
+  Serial.println("[debug] DELIBERATE PANIC now (CARDIAG_DEBUG_PANIC build)");
+  Serial.flush();
+  delay(100);
+  volatile uint32_t *p = nullptr;
+  *p = 0xDEADC0DE;
+}
+#endif
+
 static void handleKeys() {
   while (Serial.available()) {
     const int ch = Serial.read();
+
+#if defined(CARDIAG_DEBUG_PANIC) && CARDIAG_DEBUG_PANIC
+    // '!' arms, 'y' within the confirm window fires. Anything else disarms.
+    if (g_panicArmedMs) {
+      const bool go = (ch == 'y' || ch == 'Y') &&
+                      millis() - g_panicArmedMs < POLL_CONFIRM_WINDOW_MS;
+      g_panicArmedMs = 0;
+      if (go) debugPanicNow();
+      Serial.println("panic cancelled.");
+      continue;
+    }
+    if (ch == '!') {
+      g_panicArmedMs = millis();
+      if (!g_panicArmedMs) g_panicArmedMs = 1;
+      Serial.printf("\n*** DEBUG: press 'y' within %us to PANIC the board "
+                    "(coredump test). ***\n",
+                    (unsigned)(POLL_CONFIRM_WINDOW_MS / 1000));
+      continue;
+    }
+#endif
 
     if (g_pendingMode != 0xFF) {
       if (ch == 'y' || ch == 'Y') {
