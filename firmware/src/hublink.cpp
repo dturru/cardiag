@@ -90,7 +90,7 @@ void hublinkPrintStats(const char *what) {
                 "loopwin=%luus loopwinstage=%s "
                 // Worst filestore sub-stage (fsprof.h) since the previous
                 // stats line, and the whole tick in that pass.
-                "fswin=%luus fswinstage=%s fswinpass=%luus "
+                "fswin=%luus fswinstage=%s fswinpass=%luus fswalks=%lu "
                 // Frames lost before the file (candrops.h). Any non-zero
                 // fails the soak.
                 "canmiss=%lu canovr=%lu chgdrop=%lu idovf=%lu\n",
@@ -110,7 +110,7 @@ void hublinkPrintStats(const char *what) {
                 (win.maxStage && *win.maxStage) ? win.maxStage : "-",
                 (unsigned long)fsw.worstUs,
                 fsw.worstUs ? fsSubName(fsw.worstSub) : "-",
-                (unsigned long)fsw.passUs,
+                (unsigned long)fsw.passUs, (unsigned long)fsw.walks,
                 (unsigned long)drops.rxMissed, (unsigned long)drops.rxOverrun,
                 (unsigned long)drops.changelogDropped,
                 (unsigned long)drops.idOverflow);

@@ -33,6 +33,7 @@ static inline void wdtFeedIfArmed() {
 #include "filestore.h"
 #include "busidle.h"
 #include "fsprof.h"
+#include "fsusage.h"
 #include <atomic>
 #include "fsindex.h"
 #include "bootguard_rt.h"
@@ -124,6 +125,15 @@ static std::atomic<uint32_t> g_lastBusMs{0};
 static std::atomic<bool> g_idleClosed{false};
 static RecCsvCursor g_chgCursor = {0, false};
 
+// Used/total bytes, measured ONCE at boot and kept by deltas (fsusage.h).
+// Nothing after boot asks LittleFS how full it is: that is a walk of the
+// whole filesystem, and retention used to do it 5+ times per run.
+static FsUsage g_usage = {FS_BLOCK_BYTES, FS_INLINE_MAX, 0, 0, false};
+static uint32_t g_walksTotal = 0;        // lifetime, boot walks included
+static uint32_t g_resyncs = 0;
+static int32_t  g_lastDrift = 0;         // actual - tracked at the last resync
+static uint32_t g_lastResyncMs = 0;      // or the boot measurement
+
 // Sub-stage profile of the tick (fsprof.h). Only filestoreLoop() opens a
 // pass, so the same code reached from a web handler is not counted here.
 static FsProf g_prof = {};
@@ -135,6 +145,21 @@ struct FsSubScope {
   ~FsSubScope() { fsProfExit(&g_prof, micros()); }
 };
 #define FS_SUB(s) FsSubScope fsSubScope_(s)
+
+// The ONLY two calls that walk the filesystem. Every one is timed as fs_size
+// and counted, in the tick (fsprof) and for life.
+static uint32_t walkUsedBytes() {
+  FS_SUB(FS_SUB_FSSIZE);
+  fsProfWalk(&g_prof);
+  g_walksTotal++;
+  return LittleFS.usedBytes();
+}
+static uint32_t walkTotalBytes() {
+  FS_SUB(FS_SUB_FSSIZE);
+  fsProfWalk(&g_prof);
+  g_walksTotal++;
+  return LittleFS.totalBytes();
+}
 
 // ---------------------------------------------------------------------------
 // Names
@@ -200,10 +225,9 @@ static void recomputeUsage(bool withFsTotals = true) {
       default:               g_st.tierABytes += e.bytes; break;
     }
   }
-  if (!withFsTotals) return;
-  FS_SUB(FS_SUB_FSSIZE);
-  g_st.usedBytes = LittleFS.usedBytes();
-  g_st.totalBytes = LittleFS.totalBytes();
+  (void)withFsTotals;   // kept for callers; there is no walk to skip any more
+  g_st.usedBytes = g_usage.usedBytes;
+  g_st.totalBytes = g_usage.totalBytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +417,13 @@ static bool hydrateSome(uint16_t budget) {
 // ---------------------------------------------------------------------------
 
 static void removeFiles(const FileEntry &e) {
+  // Give back the blocks the data file held. Needs its size: retention and
+  // trackEntry() hydrate victims first, so this stat is the rare case.
+  if (g_usage.live) {
+    FileEntry c = e;
+    if (!c.hydrated) hydrate(&c);
+    fsUsageResize(&g_usage, c.bytes, 0);
+  }
   char path[64];
   makeName(path, sizeof(path), e.index, e.kind, e.bootId, e.closed ? "log" : "part");
   LittleFS.remove(path);
@@ -440,7 +471,7 @@ static void noteUnackedEviction(const FileEntry &e) {
 }
 
 static uint32_t usableBytes() {
-  const uint32_t total = LittleFS.totalBytes();
+  const uint32_t total = g_usage.totalBytes;
   return total ? total : (uint32_t)HUB_FS_USABLE_BYTES;
 }
 
@@ -465,10 +496,7 @@ static void retRemove(void *, const FsEntry *e, bool acked) {
   wdtFeedIfArmed();
 }
 
-static uint32_t retUsed(void *) {
-  FS_SUB(FS_SUB_FSSIZE);
-  return LittleFS.usedBytes();
-}
+static uint32_t retUsed(void *) { return g_usage.usedBytes; }
 
 // Protocol 2.3, plus the file-count cap. `reserve` keeps slots free for files
 // about to be opened. Evicts at most FS_EVICT_PER_PASS files per call; a
@@ -646,6 +674,7 @@ static bool writeActive(Active &a, const uint8_t *data, size_t len) {
     return false;
   }
   mbedtls_sha256_update(&a.sha, data, len);
+  fsUsageResize(&g_usage, a.bytes, a.bytes + (uint32_t)len);
   a.bytes += (uint32_t)len;
   FileEntry *e = findEntry(a.index);
   if (e) e->bytes = a.bytes;
@@ -874,10 +903,23 @@ bool filestoreBegin() {
   scanDir();
   g_st.scanMs = millis() - t1;
 
-  Serial.printf("[fs] mounted %lu/%lu B, %u files (%u open), next index %lu, "
+  // ⭐ THE ONLY FILESYSTEM WALK. usedBytes() and totalBytes() each traverse
+  // every block (lfs_fs_size via esp_littlefs_info); from here on usage is
+  // kept by deltas in fsusage.h. After the scan, so its evictions are in it.
+  const uint32_t tw = millis();
+  {
+    const uint32_t total = walkTotalBytes();
+    fsUsageMeasured(&g_usage, total, walkUsedBytes());
+    g_lastResyncMs = millis();
+  }
+  const uint32_t walkMs = millis() - tw;
+  recomputeUsage();
+
+  Serial.printf("[fs] mounted %lu/%lu B (measured once, %lu ms; kept in RAM "
+                "from here), %u files (%u open), next index %lu, "
                 "acked through %ld\n",
-                (unsigned long)LittleFS.usedBytes(),
-                (unsigned long)LittleFS.totalBytes(),
+                (unsigned long)g_usage.usedBytes,
+                (unsigned long)g_usage.totalBytes, (unsigned long)walkMs,
                 g_tab.count, g_st.openFiles,
                 (unsigned long)g_st.nextIndex, (long)g_st.ackedThrough);
 
@@ -952,6 +994,19 @@ void filestoreLoop() {
   fsSubWindowNote(&g_subWin[0], worst, worstUs, passUs);
   fsSubWindowNote(&g_subWin[1], worst, worstUs, passUs);
   fsSubWindowNote(&g_subBoot, worst, worstUs, passUs);
+  fsSubWindowAddWalks(&g_subWin[0], g_prof.walks);
+  fsSubWindowAddWalks(&g_subWin[1], g_prof.walks);
+  fsSubWindowAddWalks(&g_subBoot, g_prof.walks);
+}
+
+FsUsageReport filestoreUsageReport() {
+  FsUsageReport r;
+  r.walksTotal = g_walksTotal;
+  r.resyncs = g_resyncs;
+  r.lastDriftBytes = g_lastDrift;
+  r.sinceResyncMs = g_usage.live ? millis() - g_lastResyncMs : 0;
+  r.tracked = g_usage.live;
+  return r;
 }
 
 FsSubWindow filestoreTakeSubWindow(uint8_t which) {
@@ -1009,15 +1064,33 @@ static void filestoreTick() {
     lastCheck = now;
     enforceRetention();
   }
+
+  // ⭐ RARE, IDLE-ONLY RESYNC of the tracked usage against one real walk.
+  // Idle = every file closed (after a bus-idle key-off, or before the first
+  // frame): nothing is being written, so the walk costs nobody a sample.
+  // Hourly at most. The drift is logged and published, then the real figure
+  // is adopted, so a slow error in fsusage.h's model is visible AND bounded.
+  if (!g_actSnapshot.open && !g_actChanges.open &&
+      now - g_lastResyncMs >= FS_USAGE_RESYNC_MS) {
+    g_lastResyncMs = now;
+    const uint32_t tracked = g_usage.usedBytes;
+    const uint32_t actual = walkUsedBytes();
+    g_lastDrift = (int32_t)(actual - tracked);
+    g_resyncs++;
+    fsUsageMeasured(&g_usage, g_usage.totalBytes, actual);
+    recomputeUsage();
+    Serial.printf("[fs] usage resync #%lu: tracked %lu B, actual %lu B, "
+                  "drift %+ld B (%+ld blocks of %lu B)\n",
+                  (unsigned long)g_resyncs, (unsigned long)tracked,
+                  (unsigned long)actual, (long)g_lastDrift,
+                  (long)(g_lastDrift / (int32_t)FS_BLOCK_BYTES),
+                  (unsigned long)FS_BLOCK_BYTES);
+  }
 }
 
 const FileStoreStats *filestoreStats() { return &g_st; }
 
-uint8_t filestoreUsagePct() {
-  const uint32_t total = LittleFS.totalBytes();
-  if (!total) return 0;
-  return (uint8_t)((uint64_t)LittleFS.usedBytes() * 100 / total);
-}
+uint8_t filestoreUsagePct() { return fsUsagePct(&g_usage); }
 
 bool filestoreWarn() {
   // Arm 1: the partition is filling. Arm 2: data has been destroyed that the

@@ -100,6 +100,8 @@ RE_LOOPWIN = re.compile(r"loopwin=(\d+)us loopwinstage=(\S+)")
 # never goes quiet, so every one of these is false (soak_summary.py fails it).
 # Worst filestore sub-stage since the previous stats line (fsprof.h).
 RE_FSWIN = re.compile(r"fswin=(\d+)us fswinstage=(\S+) fswinpass=(\d+)us")
+# Filesystem walks since the previous stats line (usedBytes()/totalBytes()).
+RE_FSWALKS = re.compile(r"fswalks=(\d+)")
 # Frames lost before the file (candrops.h). Counters since boot / driver start.
 RE_DROPS = re.compile(r"canmiss=(\d+) canovr=(\d+) chgdrop=(\d+) idovf=(\d+)")
 RE_BUSIDLE = re.compile(r"\[fs\] bus idle \d+ms -> closed all files")
@@ -149,6 +151,9 @@ class Cycle:
     fs_sub_max_us: int | None = None
     fs_sub_stage: str = ""
     fs_pass_us: int | None = None
+    # Filesystem walks in this cycle (sum of fswalks= windows). None = the
+    # firmware does not report it.
+    fs_walks: int | None = None
     # Highest value of each drop counter seen this cycle. None = not reported.
     can_rx_missed: int | None = None
     can_rx_overrun: int | None = None
@@ -161,6 +166,7 @@ CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
               "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
               "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes",
               "panics", "fs_sub_max_us", "fs_sub_stage", "fs_pass_us",
+              "fs_walks",
               "can_rx_missed", "can_rx_overrun", "can_chg_dropped",
               "can_id_overflow"]
 
@@ -204,6 +210,7 @@ def write_cycle_row(args, c) -> None:
                     c.loop_cycle_stage, c.bus_idle_closes, c.panics,
                     *("" if v is None else v for v in (
                         c.fs_sub_max_us, c.fs_sub_stage or None, c.fs_pass_us,
+                        c.fs_walks,
                         c.can_rx_missed, c.can_rx_overrun,
                         c.can_chg_dropped, c.can_id_overflow))])
         fh.flush()
@@ -371,6 +378,9 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
                 cyc.fs_sub_max_us = us
                 cyc.fs_sub_stage = "" if m.group(2) == "-" else m.group(2)
                 cyc.fs_pass_us = int(m.group(3))
+        m = RE_FSWALKS.search(ln.text)
+        if m:
+            cyc.fs_walks = (cyc.fs_walks or 0) + int(m.group(1))
         m = RE_DROPS.search(ln.text)
         if m:
             for attr, v in zip(("can_rx_missed", "can_rx_overrun",

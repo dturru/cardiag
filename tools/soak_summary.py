@@ -221,7 +221,14 @@ def judge_fs_sub(rows: list[dict]) -> dict | None:
             best = (us, r.get("cycle", "?"), st, num(r.get("fs_pass_us")))
     if best is None:
         return None
-    return {"worst": best, "stage_counts": stages}
+    walks = [num(r.get("fs_walks")) for r in rows]
+    walks = [w for w in walks if w is not None]
+    return {"worst": best, "stage_counts": stages,
+            # None = not reported by this firmware. After the in-RAM usage fix
+            # only the rare idle resync walks, so any cycle with walks is worth
+            # a look; reported, not failed on.
+            "walks_total": sum(walks) if walks else None,
+            "cycles_with_walks": sum(1 for w in walks if w) if walks else None}
 
 
 def judge(rows: list[dict], *, requested: int = 0,
@@ -387,6 +394,11 @@ def main(argv=None) -> int:
                  f"at cycle {cyc}" + (f" (whole tick {pass_us / 1000:.1f} ms)"
                                       if pass_us else "")
                  + f"; worst stage per cycle: {counts}")
+        if fsub.get("walks_total") is not None:
+            L.append(f"- **filesystem walks in the tick:** "
+                     f"{fsub['walks_total']} over the run, in "
+                     f"{fsub['cycles_with_walks']} cycle(s) _(only the idle "
+                     f"resync should walk)_")
     else:
         L.append("- **worst filestore sub-stage:** not reported")
     cd = j["can_drops"]
