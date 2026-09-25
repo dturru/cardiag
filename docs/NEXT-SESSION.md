@@ -1,6 +1,50 @@
 # Handoff — next session
 
-## 🏁 VERDICT — clean-partition run, 2026-09-24 17:36
+## 🚨 §0-AUDIT — "the firmware does X" claims, checked against the source (2026-09-24)
+
+**One claim in this file was FALSE and cost three sessions.** It said the
+firmware printed a reset reason on boot. It did not. `grep -rn
+'esp_reset_reason\|ESP_RST_' firmware/src firmware/include` returned **nothing**
+until `27a490d`. So every run that recorded the 09-24 reboot as "unexplained"
+recorded a thing it had no way to explain — and each session re-inherited the
+belief that the evidence had been looked for.
+
+🔑 **A handoff note asserting firmware behaviour is a claim, not a fact. Cite
+`file:line` or mark it unverified.** Every such claim in this file is now one of
+the three below.
+
+| Claim | Status | Implemented at |
+|---|---|---|
+| Boot line prints the **reset reason** | ❌ **WAS FALSE** → ✅ true from `27a490d` | `firmware/src/main.cpp` §setup, `[boot] RESET REASON:` |
+| Boot line prints a **coredump summary** on PANIC/WDT, then erases it | ✅ new, `esp_core_dump_get_summary()` | `firmware/src/main.cpp` §setup, `[boot] COREDUMP:` |
+| Board prints its **effective caps** at mount | ✅ added `c0c2645` | `firmware/src/filestore.cpp` (`EFFECTIVE CAPS`) |
+| Boot line prints the **lifetime loss record** | ✅ verified | `firmware/src/filestore.cpp:740` |
+| `*** EVICTED UNACKED TIER x ... DATA LOST ***` on unacked eviction | ✅ verified | `firmware/src/filestore.cpp:346` |
+| `pending_unacked` on `/api/v1/session` | ✅ verified | `firmware/src/hubapi.cpp:159` |
+| WDT fed only when armed (`wdtFeedIfArmed`) | ✅ verified | `firmware/src/filestore.cpp:24`, called `:442`, `:460` |
+| Hub prints `[deploy] profile=pi` | ✅ verified | `carhub/carhub/web/__main__.py:124`, `carhub/carhub/ingest/udp_listener.py:241` |
+| WDT **timing margin** under a marginal link | ⚪ **UNVERIFIED — reasoned, never measured.** The bench cannot produce a marginal link on demand | — |
+| 60 s `MODE_LISTEN` id-count on a real bus | ⚪ **UNVERIFIED** — needs the car | — |
+
+---
+
+## 🏁 VERDICT — retention CLOSED, 2026-09-24 22:18
+
+📂 **READ: `analysis/bench-2026-09-24-2218/SUMMARY.md`.**
+
+**All five claims PASS, 0 NOT EXERCISED**, on a verdict that is now three-valued
+so a pass cannot be silence. Confirms `bench-2026-09-24-1901` claim for claim.
+
+| Claim | Verdict |
+|---|---|
+| 2 — the cap's OWN acked-before-unacked choice | ✅ **PASS at last** (4 runs unexercised). 6 acked evicted t=542.9→954.1, then 3 unacked t=1031.7→1194.5 |
+| 3 · 3b · 4 · 5 | ✅ PASS |
+| reboot | none — no resets in the window |
+
+`[fs] EFFECTIVE CAPS: tier A max 10% = 406323 B` — asserted by the runner, not
+read by a human.
+
+## 🏁 (SUPERSEDED) clean-partition run, 2026-09-24 17:36
 
 📂 **READ: `analysis/bench-2026-09-24-1736/SUMMARY.md`** (then `retention.log`,
 `retention.csv`, `serial.log` in that folder).
@@ -220,8 +264,9 @@ through at all. ⚠️ **Re-capture those fixtures from hardware when the firmwa
 JSON changes; never hand-edit them to make a test pass.**
 
 🔴 **Reboot cause from the original observation is STILL UNCONFIRMED** — capture
-serial alongside the HTTP poll on the next bench run; the boot line prints the
-reset reason. If it was the task watchdog, that independently confirms the §2
+serial alongside the HTTP poll on the next bench run; ~~the boot line prints the
+reset reason~~ — ❌ **FALSE WHEN WRITTEN (see §0-AUDIT); true only from
+`27a490d`.** If it was the task watchdog, that independently confirms the §2
 fix was needed.
 
 ## 🗄 1. (HISTORICAL) THE BIGGEST THING FOUND TODAY — the loss counters were volatile
@@ -249,8 +294,10 @@ Full reasoning and the alternatives → `analysis/retention-2026-09-24/claim2-ha
 the board was on the fstest build flashed *before* the §2 WDT fix, so the
 retention path fed nothing, at 87-89% with eviction running constantly, which is
 exactly §2's hypothesis — or an unrelated crash. **Capture serial alongside the
-HTTP poll next run**; the firmware prints the reset reason on boot and settles it
-in one line. If it was the watchdog, that independently confirms the §2 fix.
+HTTP poll next run**; ~~the firmware prints the reset reason on boot and settles
+it in one line~~ — ❌ **FALSE WHEN WRITTEN. See §0-AUDIT at the top.** Nothing
+logged a reset reason until `27a490d`, so there was no line to read. That is
+why this question survived three sessions. It is true **now**.
 
 ## 🔬 2. QUEUED FOR THE NEXT BENCH SESSION
 

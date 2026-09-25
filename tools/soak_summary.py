@@ -123,6 +123,19 @@ def main() -> int:
     L.append(f"- **reboots:** {len(reboots)}")
     L.append(f"- **netstack 12308 events:** {netstack}")
 
+    # ⚠️ COUNTED, NEVER FAILED ON. Nothing acks overnight, so retention WILL
+    # destroy unacked data and the board WILL say so -- loudly and correctly.
+    # That is the "never silent" guarantee working, not a soak failure.
+    # THE SOAK VERDICT IS RESETS AND HEAP ONLY.
+    losses = 0
+    if args.log and Path(args.log).exists():
+        losses = len(re.findall(r"EVICTED UNACKED TIER",
+                                Path(args.log).read_text(encoding="utf-8",
+                                                         errors="replace")))
+    L.append(f"- **unacked-eviction warnings:** {losses} "
+             f"_(expected with nothing acking — counted, NOT a failure. "
+             f"The verdict above is resets and heap only.)_")
+
     L.append("\n## Reset classification\n")
     if not reboots:
         L.append("No resets observed. ✅ That is the stability claim.")
@@ -155,14 +168,43 @@ def main() -> int:
         for f in fails:
             L.append(f"- {f}")
 
+    # ⭐ A FAIL MUST ARRIVE WITH ITS EVIDENCE. The firmware prints a coredump
+    # summary on any PANIC/WDT boot -- the task that died, its PC and the first
+    # frames. Copying those lines in here is the difference between "1 TASK_WDT
+    # at cycle 137" and knowing where it died, without reproducing it.
     if args.log and Path(args.log).exists():
         text = Path(args.log).read_text(encoding="utf-8", errors="replace")
+
+        dump = [ln.strip() for ln in text.splitlines()
+                if "[boot] COREDUMP" in ln]
+        if dump:
+            L.append("\n## Coredump evidence\n")
+            L.append("From the board's own `[boot] COREDUMP` lines, printed on "
+                     "the boot AFTER each crash and then erased so the next "
+                     "crash is not masked by a stale dump.\n")
+            L.append("```")
+            L.extend(dump[:40])
+            if len(dump) > 40:
+                L.append(f"... (+{len(dump) - 40} more lines in soak.log)")
+            L.append("```")
+            L.append("\n🔍 Resolve the addresses with:\n")
+            L.append("```")
+            L.append("xtensa-esp32s3-elf-addr2line -pfiaC -e "
+                     ".pio/build/esp32-can-x2/firmware.elf <pc> <bt...>")
+            L.append("```")
+        elif any(r.get("reset_reason") in OURS for r in reboots):
+            L.append("\n## Coredump evidence\n")
+            L.append("🔴 **A PANIC/WDT reset was recorded but NO "
+                     "`[boot] COREDUMP` line appeared.** Either the board is "
+                     "running firmware older than that line, or the dump could "
+                     "not be read. The crash is real; the evidence is missing.")
+
         hits = re.findall(r"^.*(Guru Meditation|abort\(\) was called|"
-                          r"StoreProhibited|LoadProhibited|RESET REASON).*$",
+                          r"StoreProhibited|LoadProhibited).*$",
                           text, re.MULTILINE)
         if hits:
-            L.append(f"\n## Notable serial lines\n\n_{len(hits)} match(es); "
-                     f"full text in `soak.log`._")
+            L.append(f"\n## Other notable serial lines\n\n_{len(hits)} "
+                     f"match(es); full text in `soak.log`._")
 
     L.append("\n---\n")
     L.append(f"per-cycle CSV -> `{path.name}` (flushed every cycle, so this "
