@@ -63,6 +63,8 @@ static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
 void hublinkPrintStats(const char *what) {
   const HubLinkStats &s = g_stats;
+  const LoopStats win = cardiagLoopTakeWindow(LOOP_WIN_LOG);
+  const char *bootStage = cardiagLoopStats()->maxStage;
   Serial.printf("[hublink] %s state=%s joins=%lu drops=%lu(evt=%lu poll=%lu) "
                 "joinfail=%lu apstarts=%lu reason=%u fallback=%lums "
                 // largest= is the fragmentation half of the story. Free heap
@@ -71,9 +73,13 @@ void hublinkPrintStats(const char *what) {
                 // reason: a flat `heap` with a falling `largest` is still a
                 // board on its way to a failed allocation.
                 "worst=%lums heap=%lu minheap=%lu largest=%lu "
-                // Max loop() pass since boot. The non-blocking join exists to
-                // keep this small; the soak CSV records it per cycle.
-                "loopmax=%luus\n",
+                // Max loop() pass since boot, and its slowest stage. The
+                // non-blocking join exists to keep this small.
+                "loopmax=%luus loopstage=%s "
+                // Max pass since the PREVIOUS stats line, which this line
+                // resets. The soak takes the max of these per cycle, so a
+                // cycle's loop max is that cycle's, not the whole boot's.
+                "loopwin=%luus loopwinstage=%s\n",
                 what, hublinkStateName(),
                 (unsigned long)s.staJoins, (unsigned long)s.staDrops,
                 (unsigned long)s.eventDrops, (unsigned long)s.pollDrops,
@@ -84,7 +90,10 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMinFreeHeap(),
                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                (unsigned long)cardiagLoopStats()->maxUs);
+                (unsigned long)cardiagLoopStats()->maxUs,
+                (bootStage && *bootStage) ? bootStage : "-",
+                (unsigned long)win.maxUs,
+                (win.maxStage && *win.maxStage) ? win.maxStage : "-");
 }
 
 // ---------------------------------------------------------------------------
