@@ -7,6 +7,7 @@
 #include "hubproto.h"
 #include "looptime.h"
 #include "candrops.h"
+#include "logq.h"
 #include "hublink.h"
 #include "hubstream.h"
 #include "filestore.h"
@@ -197,6 +198,11 @@ static void handleSession(WebServer &srv) {
         (unsigned long)d.idOverflow, (unsigned long)d.rawRingBusy,
         d.changeLog ? d.changeLog : "");
   }
+
+  // Serial lines the lossy log queue dropped since boot (logq.h). Not frames:
+  // console output only, but a dropped line is a value the soak could not read.
+  n = jsonAppend(buf, sizeof(buf), n, "\"serial_log\":{\"dropped\":%lu},",
+                 (unsigned long)logqDropped());
 
   // Stream counters. The hub counts datagrams it RECEIVED; these are what the
   // logger SENT. Publishing both is what lets a disagreement be attributed to

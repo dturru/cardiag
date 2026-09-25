@@ -1,5 +1,20 @@
 # Handoff — next session
 
+## ✅ Known and acceptable for now — final bench soak, 2026-09-25
+
+The final bench soak passed every target. Two behaviours it showed are
+**recorded, not fixed**. Neither is a bug to chase until something depends on it:
+
+- **~1 failed join per cycle, right after a positive scan.** The scan sees the
+  hub SSID, the join fails, and the retry 2 s later succeeds. The cost is ~2 s
+  of rejoin per cycle, and the `join_fail` column counts it. Revisit only if
+  rejoin time becomes a target, or if failed joins stop being followed by a
+  good retry.
+- **Filestore flush takes 50-500 ms on `loop()`.** This is inside the
+  loop-pass budget the soak judges, and no pass failed. Revisit if a `loop()`
+  consumer gets a tighter deadline. The on-hold writer-task refactor is where
+  flush would move.
+
 ## §0-BRICK — 2026-09-25, board slow-boot root-caused (LOCAL NOTE, uncommitted)
 
 📂 **Preserved failing image: `analysis/brick-2026-09-25-0748/`** — `README.md`

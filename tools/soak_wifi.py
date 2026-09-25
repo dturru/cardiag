@@ -109,6 +109,8 @@ RE_FSWALKS = re.compile(r"fswalks=(\d+)")
 # Frames lost before the file (candrops.h). Counters since boot / driver start.
 RE_DROPS = re.compile(r"canmiss=(\d+) canovr=(\d+) chgdrop=(\d+) idovf=(\d+)"
                       r"(?: rawbusy=(\d+))?")
+# Serial lines the lossy log queue dropped, since boot (logq.h).
+RE_LOGDROP = re.compile(r"logdrop=(\d+)")
 RE_BUSIDLE = re.compile(r"\[fs\] bus idle \d+ms -> closed all files")
 RE_PANIC = re.compile(r"(Guru Meditation|abort\(\) was called|StoreProhibited|"
                       r"LoadProhibited|assert failed)")
@@ -169,6 +171,8 @@ class Cycle:
     can_chg_dropped: int | None = None
     can_id_overflow: int | None = None
     can_raw_busy: int | None = None
+    # Highest logdrop= seen this cycle (since boot). None = not reported.
+    log_dropped: int | None = None
 
 
 CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
@@ -179,7 +183,7 @@ CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
               "panics", "fs_sub_max_us", "fs_sub_stage", "fs_pass_us",
               "fs_walks",
               "can_rx_missed", "can_rx_overrun", "can_chg_dropped",
-              "can_id_overflow", "can_raw_busy"]
+              "can_id_overflow", "can_raw_busy", "log_dropped"]
 
 
 def csv_path(args) -> str:
@@ -226,7 +230,7 @@ def write_cycle_row(args, c) -> None:
                         c.fs_walks,
                         c.can_rx_missed, c.can_rx_overrun,
                         c.can_chg_dropped, c.can_id_overflow,
-                        c.can_raw_busy))])
+                        c.can_raw_busy, c.log_dropped))])
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -411,6 +415,11 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
                     continue           # firmware before rawbusy=
                 cur = getattr(cyc, attr)
                 setattr(cyc, attr, int(v) if cur is None else max(cur, int(v)))
+        m = RE_LOGDROP.search(ln.text)
+        if m:
+            v = int(m.group(1))
+            cyc.log_dropped = v if cyc.log_dropped is None else max(
+                cyc.log_dropped, v)
         m = RE_LOOPWIN.search(ln.text)
         if m:
             us = int(m.group(1))

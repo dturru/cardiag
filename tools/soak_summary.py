@@ -84,11 +84,58 @@ def slope(ys: list[int]) -> float:
     return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
 
 
-# Slope thresholds, bytes per cycle, applied inside a segment. -64 B/cycle is
-# the existing free-heap threshold; the largest block uses the same one, since
-# a fragmenting heap fails an allocation with free heap to spare.
+# Free-heap slope threshold, bytes per cycle, applied inside a segment.
 HEAP_SLOPE_FAIL = -64.0
 MIN_SEGMENT_ROWS = 10
+
+# ⭐ THE LARGEST BLOCK IS NOT JUDGED BY SLOPE. The final bench soak showed its
+# real shape: a two-level flip 8 KB apart (HHHH...LLLL...HH...LLLL), stable at
+# both levels. A least-squares line through that is steeply negative whenever
+# the run happens to end on the low level, though nothing is being lost. What
+# fragmentation looks like instead is a STAIRCASE: every step a new low.
+#
+# So, still strict (any byte below the previous low counts), two checks:
+#   1. a new all-time low in the last third of the segment -> FAIL. Early lows
+#      are the heap settling; a late one is a floor that is still moving.
+#   2. the low level's share of cycles growing in EVERY quarter -> FAIL. A
+#      two-level flip whose low level takes over steadily is drifting, even
+#      if it never sets a new low.
+# "The low level" is every value within LARGEST_LEVEL_TOL of the all-time low:
+# half the 8 KB gap, so the two observed levels never merge.
+LARGEST_LEVEL_TOL = 4096
+LARGEST_QUARTERS = 4
+
+
+def judge_largest(vals: list[int]) -> dict:
+    """Shape check for one segment's largest-free-block series."""
+    n = len(vals)
+    out = {"low": min(vals) if vals else None, "new_low_at": [],
+           "late_new_lows": [], "low_share": [], "fails": []}
+    if n < MIN_SEGMENT_ROWS:
+        return out
+    lo = vals[0]
+    for i, v in enumerate(vals[1:], 1):
+        if v < lo:
+            out["new_low_at"].append(i)
+            lo = v
+    late_from = n - n // 3
+    out["late_new_lows"] = [i for i in out["new_low_at"] if i >= late_from]
+    floor = out["low"] + LARGEST_LEVEL_TOL
+    q = LARGEST_QUARTERS
+    bounds = [round(k * n / q) for k in range(q + 1)]
+    out["low_share"] = [
+        sum(1 for v in vals[a:b] if v <= floor) / (b - a)
+        for a, b in zip(bounds, bounds[1:])]
+    if out["late_new_lows"]:
+        out["fails"].append(
+            f"new all-time low in the last third ({len(out['late_new_lows'])} "
+            f"time(s), low {out['low']} B)")
+    sh = out["low_share"]
+    if all(b > a for a, b in zip(sh, sh[1:])):
+        out["fails"].append(
+            "low level's share growing every quarter ("
+            + " -> ".join(f"{x:.0%}" for x in sh) + ")")
+    return out
 
 # One loop() pass over this fails the run. The design budget is ~100 ms per
 # call; a second is past any plausible single HTTP request and means something
@@ -135,7 +182,9 @@ def judge_heap(rows: list[dict]) -> dict:
             "heap_first": heaps[0] if heaps else None,
             "heap_last": heaps[-1] if heaps else None,
             "heap_slope": slope(heaps) if len(heaps) >= 2 else None,
+            # Shown, not judged: see judge_largest().
             "largest_slope": slope(larges) if len(larges) >= 2 else None,
+            "largest": judge_largest(larges),
             # HEADROOM, not a leak signal: the lowest free heap this boot ever
             # reached. Worth knowing how close it came; meaningless across boots.
             "min_free": min(mins) if mins else None,
@@ -145,12 +194,10 @@ def judge_heap(rows: list[dict]) -> dict:
             out["fails"].append(
                 f"segment {i} (cycles {d['first_cycle']}-{d['last_cycle']}): "
                 f"free heap trending down {d['heap_slope']:+.0f} B/cycle")
-        if (len(larges) >= MIN_SEGMENT_ROWS
-                and d["largest_slope"] < HEAP_SLOPE_FAIL):
+        for f in d["largest"]["fails"]:
             out["fails"].append(
                 f"segment {i} (cycles {d['first_cycle']}-{d['last_cycle']}): "
-                f"largest free block trending down {d['largest_slope']:+.0f} "
-                f"B/cycle -- fragmentation")
+                f"largest free block: {f} -- fragmentation")
     return out
 
 
@@ -264,22 +311,65 @@ REQUIRED = {
     "fs_sub": ("fs_sub_max_us",),
     "can_drops": ("can_rx_missed", "can_rx_overrun", "can_chg_dropped",
                   "can_id_overflow"),
+    # Whether lines were lost at all. Without it a clean coverage figure could
+    # hide a queue that dropped the very lines it was counting.
+    "log_drops": ("log_dropped",),
     # SELFTEST only; the harness writes it, so it is missing only from a CSV
     # an older harness produced.
     "bus_idle": ("bus_idle_closes",),
 }
 
 
+def logdrop_cycles(rows: list[dict]) -> set:
+    """Cycles in which the lossy Serial queue dropped lines (logq.h).
+
+    log_dropped is a since-boot counter, so a cycle dropped lines when it
+    reads higher than the last readable value in the same boot segment. The
+    first row of a segment counts if it is above zero (drops since boot).
+    """
+    out = set()
+    for seg in segments(rows):
+        prev = 0
+        for r in seg:
+            v = num(r.get("log_dropped"))
+            if v is None:
+                continue
+            if v > prev:
+                out.add(r.get("cycle"))
+            prev = v
+    return out
+
+
+def judge_logdrop(rows: list[dict]) -> dict | None:
+    """logdrop is NOT a failure: the queue is lossy by design and drops only
+    console lines, never frames. It is reported, and coverage accounts for it."""
+    if not any((r.get("log_dropped") or "").strip() for r in rows):
+        return None
+    cyc = logdrop_cycles(rows)
+    total = sum(max((num(r.get("log_dropped")) or 0) for r in seg)
+                for seg in segments(rows))
+    return {"total": total, "cycles": sorted(cyc, key=lambda c: num(c) or 0)}
+
+
 def coverage(rows: list[dict], mode: str = "SELFTEST") -> dict:
-    """Per required metric: cycles where every one of its columns was read."""
+    """Per required metric: cycles where every one of its columns was read.
+
+    `in_logdrop_cycles` counts the unreadable ones that fell in a cycle whose
+    log queue dropped lines: a gap there may be the queue, not the capture.
+    It explains a gap; it never makes one readable.
+    """
     out = {}
+    dropped = logdrop_cycles(rows)
     for metric, cols in REQUIRED.items():
         if metric == "bus_idle" and mode.upper() != "SELFTEST":
             continue
-        ok = sum(1 for r in rows
-                 if all((r.get(c) or "").strip() for c in cols))
+        bad = [r for r in rows
+               if not all((r.get(c) or "").strip() for c in cols)]
+        ok = len(rows) - len(bad)
         out[metric] = {"readable": ok, "total": len(rows),
-                       "pct": 100.0 * ok / len(rows) if rows else 0.0}
+                       "pct": 100.0 * ok / len(rows) if rows else 0.0,
+                       "in_logdrop_cycles": sum(
+                           1 for r in bad if r.get("cycle") in dropped)}
     return out
 
 
@@ -354,7 +444,7 @@ def judge(rows: list[dict], *, requested: int = 0,
             "loop": loop, "reboots": reboots, "bus_idle_closes": idle,
             "panics": panics, "can_drops": drops, "fs_sub": judge_fs_sub(rows),
             "coverage": cov, "coverage_short": sorted(short),
-            "joins": judge_joins(rows)}
+            "joins": judge_joins(rows), "logdrop": judge_logdrop(rows)}
 
 
 def read_rows(csv_path) -> list[dict]:
@@ -443,9 +533,18 @@ def main(argv=None) -> int:
     if j["coverage"]:
         cells = ", ".join(
             f"{m} {c['readable']}/{c['total']} ({c['pct']:.0f}%)"
+            + (f", {c['in_logdrop_cycles']} missing in log-drop cycles"
+               if c["in_logdrop_cycles"] else "")
             + (" ⚠️" if m in j["coverage_short"] else "")
             for m, c in j["coverage"].items())
         L.append(f"- **coverage (cycles with readable values):** {cells}")
+    ld = j["logdrop"]
+    L.append("- **serial lines dropped (log queue, not a failure):** " + (
+        "not reported" if ld is None else
+        f"{ld['total']} in {len(ld['cycles'])} cycle(s)" + (
+            f" (cycles {', '.join(str(c) for c in ld['cycles'][:12])}"
+            f"{' ...' if len(ld['cycles']) > 12 else ''})"
+            if ld["cycles"] else "")))
     if verdict == "INCONCLUSIVE":
         L.append(f"\n> ⚠️ **INCONCLUSIVE, not PASS.** No check failed on the "
                  f"cycles that could be read, but "
@@ -493,20 +592,26 @@ def main(argv=None) -> int:
     # min-free low-water mark, so a trend is only meaningful inside one boot.
     if heap["segments"]:
         L.append("\n## Heap, per boot segment\n")
-        L.append("_Leak signal: the trend of free heap and of the largest free "
-                 "block inside a segment. **min free** is headroom — the lowest "
+        L.append("_Leak signal: the trend of free heap inside a segment, and "
+                 "the SHAPE of the largest free block (a new all-time low in "
+                 "the last third, or the low level's share growing every "
+                 "quarter, fails; its slope is shown, not judged). **min free** is headroom — the lowest "
                  "this boot reached — and restarts at every reset, so it is "
                  "never compared across segments. A reboot row belongs to "
                  "neither side; each segment starts at the first post-boot "
                  "row._\n")
-        L.append("| Segment | Cycles | Rows | Free heap | Slope | Largest-block slope | Min free (headroom) |")
-        L.append("|---|---|---|---|---|---|---|")
+        L.append("| Segment | Cycles | Rows | Free heap | Slope | Largest-block slope | Largest low (late new lows) | Low-level share by quarter | Min free (headroom) |")
+        L.append("|---|---|---|---|---|---|---|---|---|")
         for d in heap["segments"]:
             hs = "—" if d["heap_slope"] is None else f"{d['heap_slope']:+.1f} B/cyc"
             ls = "—" if d["largest_slope"] is None else f"{d['largest_slope']:+.1f} B/cyc"
+            lg = d["largest"]
+            low = "—" if lg["low"] is None else (
+                f"{lg['low']} ({len(lg['late_new_lows'])})")
+            share = " / ".join(f"{x:.0%}" for x in lg["low_share"]) or "—"
             L.append(f"| {d['n']} | {d['first_cycle']}–{d['last_cycle']} | "
                      f"{d['rows']} | {d['heap_first']} → {d['heap_last']} | "
-                     f"{hs} | {ls} | {d['min_free']} |")
+                     f"{hs} | {ls} | {low} | {share} | {d['min_free']} |")
         short = [d for d in heap["segments"] if d["rows"] < MIN_SEGMENT_ROWS]
         if short:
             L.append(f"\n> ℹ️ {len(short)} segment(s) under "
