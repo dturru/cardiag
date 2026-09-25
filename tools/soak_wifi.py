@@ -87,6 +87,9 @@ RE_BOOT = re.compile(r"(rst:0x[0-9a-fA-F]+|ESP-ROM:esp32)")
 # Strictly better than decoding rst:0x.. by hand, and it is the line that
 # separates "the bench supply sagged" from "our code hung".
 RE_RESET_REASON = re.compile(r"\[boot\] RESET REASON:\s*(\w+)")
+# Max loop() pass since boot, appended to the hublink stats line. Resets with
+# the board. The non-blocking join is supposed to keep it well under a second.
+RE_LOOPMAX = re.compile(r"loopmax=(\d+)us")
 RE_PANIC = re.compile(r"(Guru Meditation|abort\(\) was called|StoreProhibited|"
                       r"LoadProhibited|assert failed)")
 
@@ -120,11 +123,14 @@ class Cycle:
     # harness or the USB cable -- and is a DIFFERENT finding from TASK_WDT or
     # PANIC, which are ours. Empty when no reset was observed this cycle.
     reset_reason: str = ""
+    # Max loop() pass since boot, microseconds, last value seen this cycle.
+    # Firmware older than the non-blocking join does not print it: None.
+    loop_max_us: int | None = None
 
 
 CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
               "reason", "heap", "minheap", "largest_block", "netstack_12308",
-              "reboot", "reset_reason"]
+              "reboot", "reset_reason", "loop_max_us"]
 
 
 def csv_path(args) -> str:
@@ -159,7 +165,8 @@ def write_cycle_row(args, c) -> None:
                     c.drop_path, c.reason if c.reason is not None else "",
                     c.heap or "", c.minheap or "",
                     c.largest or "", c.netstack, int(c.reboot),
-                    c.reset_reason])
+                    c.reset_reason,
+                    c.loop_max_us if c.loop_max_us is not None else ""])
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -310,6 +317,9 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
         m = RE_FALLBACK.search(ln.text)
         if m:
             cyc.fallback_ms = int(m.group(1))
+        m = RE_LOOPMAX.search(ln.text)
+        if m:
+            cyc.loop_max_us = int(m.group(1))
 
 
 def run(args) -> int:
@@ -530,9 +540,25 @@ def report(cycles: list[Cycle], tot: Totals, args):
     #
     # A run that only prints numbers gets read optimistically. These are the
     # agreed pass criteria for "the leak is fixed", checked rather than eyeballed.
+    # --- loop latency ---------------------------------------------------
+    # Since-boot max, so the last cycle's value covers the whole run (per
+    # boot). One second is far past the ~100 ms-per-call design and past any
+    # plausible single HTTP request; crossing it means something in loop()
+    # still blocks the way the old 8 s join did.
+    loops = [c.loop_max_us for c in cycles if c.loop_max_us is not None]
     mins = [(c.n, c.minheap) for c in cycles if c.minheap]
     larges = [(c.n, c.largest) for c in cycles if c.largest]
     fails: list[str] = []
+    if loops:
+        worst = max(loops)
+        print(f"loop max            {worst / 1000:.1f} ms (since boot, worst "
+              f"cycle)")
+        if worst > 1_000_000:
+            fails.append(f"a loop() pass took {worst / 1000:.0f} ms -- "
+                         f"something still blocks")
+    else:
+        print("loop max            not reported -- firmware predates "
+              "`loopmax=` in the stats line")
 
     if len(heaps) >= 2:
         d = [h - ph for (_, ph), (_, h) in zip(heaps, heaps[1:])

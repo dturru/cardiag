@@ -34,6 +34,7 @@
 #include "session.h"
 #include "hublink.h"
 #include "hubstream.h"
+#include "looptime.h"
 #include "selftest_profile.h"
 #include "filestore.h"
 #include "transceiver.h"
@@ -44,6 +45,7 @@
 #include <esp_core_dump.h>  // and, on a crash, WHERE it died
 
 static void selfTestReset();
+static void selfTestTask(void *);
 
 // ---------------------------------------------------------------------------
 // Rolling stats. On a live bus the useful first question is not "what does
@@ -78,6 +80,11 @@ static uint32_t g_pendingAtMs = 0;
 static TaskHandle_t  g_canTask  = nullptr;
 static volatile bool g_canPause = false;
 static volatile bool g_canIdle  = false;
+
+// SELFTEST's transmitter has its own task too, and honours the same pause.
+// See selfTestTask() for why it left loop().
+static TaskHandle_t  g_stTask = nullptr;
+static volatile bool g_stIdle = true;
 
 static void noteId(uint32_t id, bool extended) {
   if (extended || id >= 2048) return;   // standard IDs only
@@ -217,10 +224,16 @@ static void pollEnter() {
 // Ask the receive task to step away from the driver, and wait for it to say it
 // has. Bounded: worst case is one twai_receive timeout.
 static void canPause() {
-  if (!g_canTask) return;
+  if (!g_canTask && !g_stTask) return;
   g_canPause = true;
   const uint32_t t0 = millis();
-  while (!g_canIdle && millis() - t0 < CAN_RX_WAIT_MS * 3) delay(1);
+  // Both tasks must be off the driver: the receiver, and the SELFTEST
+  // transmitter, which would otherwise call twai_transmit() on a driver
+  // being uninstalled.
+  while (((g_canTask && !g_canIdle) || (g_stTask && !g_stIdle)) &&
+         millis() - t0 < CAN_RX_WAIT_MS * 3) {
+    delay(1);
+  }
 }
 
 static void canResume() { g_canPause = false; }
@@ -698,6 +711,10 @@ void setup() {
 
   xTaskCreatePinnedToCore(canTask, "can", CAN_TASK_STACK, nullptr,
                           CAN_TASK_PRIO, &g_canTask, CAN_TASK_CORE);
+  // Idle unless the mode is SELFTEST; same core as loop() (see the task).
+  xTaskCreatePinnedToCore(selfTestTask, "selftest", SELFTEST_TASK_STACK,
+                          nullptr, SELFTEST_TASK_PRIO, &g_stTask,
+                          SELFTEST_TASK_CORE);
 
   // On by default: the whole point is that the board is usable with no laptop,
   // and a board that needs one to switch its radio on would defeat that.
@@ -833,7 +850,79 @@ static void selfTestTick() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SELFTEST RUNS IN ITS OWN TASK, LIKE A REAL BUS.
+//
+// 🐛 WHY (2026-09-25). selfTestTick() used to be called from loop(), so any
+// loop() stall -- an 8 s Wi-Fi join, a slow HTTP client -- stopped the
+// board's own loopback traffic. On a car the bus keeps talking whatever
+// loop() is doing; on the bench it went silent, the filestore read >= 3 s of
+// silence as key-off and closed every file, and the 200-cycle soak ended with
+// 686 ~5 KB files. A bench workload that pauses when the firmware is busy
+// also hides exactly the stalls a soak is meant to find.
+//
+// Same core as loop(), so the pause handshake with canPause() needs no
+// cross-core ordering: `g_stIdle = false` is published BEFORE the pause flag
+// is re-read, so canPause() can never see "idle" while a tick is starting.
+// ---------------------------------------------------------------------------
+static void selfTestTask(void *) {
+  for (;;) {
+    g_stIdle = false;
+    if (g_canPause || !g_twaiUp || g_mode != MODE_SELFTEST) {
+      g_stIdle = true;
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    selfTestTick();
+    vTaskDelay(pdMS_TO_TICKS(SELFTEST_TASK_PERIOD_MS));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LOOP LATENCY. The non-blocking join's promise is "no call in loop() blocks
+// more than ~100 ms"; this is how that is checked instead of believed.
+// Max pass since boot, which stage was slowest in that pass, and how many
+// passes went over 100 ms. On /api/v1/session ("loop") and in the hublink
+// stats line the soak parses.
+// ---------------------------------------------------------------------------
+static LoopStats g_loopStats = {0, 0, "", 0, 0};
+
+const LoopStats *cardiagLoopStats() { return &g_loopStats; }
+
+#define LOOP_SLOW_US 100000u
+
+// Times one stage and remembers the slowest stage of this pass.
+#define LOOP_STAGE(name, stmt)                                  \
+  do {                                                          \
+    const uint32_t _t = micros();                               \
+    stmt;                                                       \
+    const uint32_t _d = micros() - _t;                          \
+    if (_d > slowUs) { slowUs = _d; slow = (name); }            \
+  } while (0)
+
+static void loopAccount(uint32_t t0, const char *slow, uint32_t slowUs) {
+  const uint32_t pass = micros() - t0;
+  g_loopStats.passes++;
+  if (pass > LOOP_SLOW_US) g_loopStats.over100ms++;
+  if (pass > g_loopStats.maxUs) {
+    g_loopStats.maxUs = pass;
+    g_loopStats.maxStage = slow;
+    g_loopStats.maxStageUs = slowUs;
+    // Loud only past the budget, and only when the record moves, so a
+    // healthy board says nothing and a regression says what and where.
+    if (pass > LOOP_SLOW_US) {
+      Serial.printf("[loop] new max pass %lu ms; slowest stage %s %lu ms\n",
+                    (unsigned long)(pass / 1000), slow,
+                    (unsigned long)(slowUs / 1000));
+    }
+  }
+}
+
 void loop() {
+  const uint32_t t0 = micros();
+  const char *slow = "";
+  uint32_t slowUs = 0;
+
   // Layer 1: feed the watchdog. If loop() stops running, the chip resets and
   // layer 2 decides what to do about it on the way back up.
   esp_task_wdt_reset();
@@ -844,28 +933,32 @@ void loop() {
   // closing any file that is somehow still open at the backstop.
   if (filestoreBusQuietMs() >= CAN_MAX_AWAKE_MS) transceiverRequestSleep();
 
-  handleKeys();
-  handleButton();
-  webuiLoop();
-  hublinkLoop();
-  hubstreamLoop();
-  filestoreLoop();
+  LOOP_STAGE("keys",      handleKeys());
+  LOOP_STAGE("button",    handleButton());
+  LOOP_STAGE("webui",     webuiLoop());
+  LOOP_STAGE("hublink",   hublinkLoop());
+  LOOP_STAGE("hubstream", hubstreamLoop());
+  LOOP_STAGE("filestore", filestoreLoop());
   // millis() wraps at ~49.7 d; this closes the session and starts a new
   // boot_id so relative time stays monotonic within a session.
-  if (sessionTick()) hubstreamRequestFullSnapshot();
+  LOOP_STAGE("session", if (sessionTick()) hubstreamRequestFullSnapshot());
 
-  if (!g_twaiUp) { delay(10); return; }
+  if (!g_twaiUp) {
+    loopAccount(t0, slow, slowUs);
+    delay(10);
+    return;
+  }
 
   // Receiving happens in canTask. This loop only transmits, prints and serves.
   if (g_mode == MODE_POLL) {
     static uint32_t lastPoll = 0;
     if (millis() - lastPoll >= OBD_POLL_INTERVAL_MS) {
       lastPoll = millis();
-      pollTick();
+      LOOP_STAGE("poll", pollTick());
     }
   }
 
-  if (g_mode == MODE_SELFTEST) selfTestTick();
+  // SELFTEST transmits from selfTestTask(), not from here -- see above.
 
   const uint32_t now      = millis();
   const uint32_t interval =
@@ -931,5 +1024,6 @@ void loop() {
     g_lastStatsMs = now;
   }
 
+  loopAccount(t0, slow, slowUs);
   delay(1);
 }

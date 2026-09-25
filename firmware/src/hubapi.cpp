@@ -5,6 +5,7 @@
 
 #include "hubapi.h"
 #include "hubproto.h"
+#include "looptime.h"
 #include "hublink.h"
 #include "hubstream.h"
 #include "filestore.h"
@@ -125,6 +126,19 @@ static void handleSession(WebServer &srv) {
       (unsigned long long)tierBFloor,
       (unsigned long long)fsTotal,
       (unsigned)(100 - FS_TIER_A_MAX_PCT));
+
+  // loop() latency since boot. The Wi-Fi join is a step-per-pass state
+  // machine on the promise that no call blocks more than ~100 ms; this is the
+  // measurement. `over_100ms` should stay 0; `max_stage` names the culprit.
+  {
+    const LoopStats *ls = cardiagLoopStats();
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"loop\":{\"max_us\":%lu,\"max_stage\":\"%s\",\"max_stage_us\":%lu,"
+        "\"passes\":%lu,\"over_100ms\":%lu},",
+        (unsigned long)ls->maxUs, ls->maxStage ? ls->maxStage : "",
+        (unsigned long)ls->maxStageUs, (unsigned long)ls->passes,
+        (unsigned long)ls->over100ms);
+  }
 
   // Stream counters. The hub counts datagrams it RECEIVED; these are what the
   // logger SENT. Publishing both is what lets a disagreement be attributed to

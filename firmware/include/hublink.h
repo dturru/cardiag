@@ -13,10 +13,13 @@ enum HubLinkState : uint8_t {
   HUBLINK_AP  = 2,   // standalone, serving its own AP (pre-hub behaviour)
 };
 
-// Tries STA first, falls back to webuiStart(). Call once from setup().
+// Starts a join attempt and RETURNS -- it no longer blocks setup(). loop()
+// drives it; on failure the board falls back to its own AP. Call once.
 void hublinkBegin();
 
-// Call from loop(). Handles STA loss and periodic re-join attempts.
+// Call from loop(). Drives the join/fallback state machine one step per call
+// (at most one Wi-Fi mode switch, never a wait), handles STA loss and the
+// periodic re-join attempts.
 void hublinkLoop();
 
 HubLinkState hublinkState();
