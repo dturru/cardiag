@@ -107,7 +107,8 @@ RE_FSWIN = re.compile(r"fswin=(\d+)us fswinstage=(\S+) fswinpass=(\d+)us")
 # Filesystem walks since the previous stats line (usedBytes()/totalBytes()).
 RE_FSWALKS = re.compile(r"fswalks=(\d+)")
 # Frames lost before the file (candrops.h). Counters since boot / driver start.
-RE_DROPS = re.compile(r"canmiss=(\d+) canovr=(\d+) chgdrop=(\d+) idovf=(\d+)")
+RE_DROPS = re.compile(r"canmiss=(\d+) canovr=(\d+) chgdrop=(\d+) idovf=(\d+)"
+                      r"(?: rawbusy=(\d+))?")
 RE_BUSIDLE = re.compile(r"\[fs\] bus idle \d+ms -> closed all files")
 RE_PANIC = re.compile(r"(Guru Meditation|abort\(\) was called|StoreProhibited|"
                       r"LoadProhibited|assert failed)")
@@ -167,6 +168,7 @@ class Cycle:
     can_rx_overrun: int | None = None
     can_chg_dropped: int | None = None
     can_id_overflow: int | None = None
+    can_raw_busy: int | None = None
 
 
 CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
@@ -177,7 +179,7 @@ CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
               "panics", "fs_sub_max_us", "fs_sub_stage", "fs_pass_us",
               "fs_walks",
               "can_rx_missed", "can_rx_overrun", "can_chg_dropped",
-              "can_id_overflow"]
+              "can_id_overflow", "can_raw_busy"]
 
 
 def csv_path(args) -> str:
@@ -223,7 +225,8 @@ def write_cycle_row(args, c) -> None:
                         c.fs_sub_max_us, c.fs_sub_stage or None, c.fs_pass_us,
                         c.fs_walks,
                         c.can_rx_missed, c.can_rx_overrun,
-                        c.can_chg_dropped, c.can_id_overflow))])
+                        c.can_chg_dropped, c.can_id_overflow,
+                        c.can_raw_busy))])
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -402,8 +405,10 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
         m = RE_DROPS.search(ln.text)
         if m:
             for attr, v in zip(("can_rx_missed", "can_rx_overrun",
-                                "can_chg_dropped", "can_id_overflow"),
-                               m.groups()):
+                                "can_chg_dropped", "can_id_overflow",
+                                "can_raw_busy"), m.groups()):
+                if v is None:
+                    continue           # firmware before rawbusy=
                 cur = getattr(cyc, attr)
                 setattr(cyc, attr, int(v) if cur is None else max(cur, int(v)))
         m = RE_LOOPWIN.search(ln.text)

@@ -130,7 +130,7 @@ void hublinkPrintStats(const char *what) {
                 "fswin=%luus fswinstage=%s fswinpass=%luus fswalks=%lu "
                 // Frames lost before the file (candrops.h). Any non-zero
                 // fails the soak.
-                "canmiss=%lu canovr=%lu chgdrop=%lu idovf=%lu "
+                "canmiss=%lu canovr=%lu chgdrop=%lu idovf=%lu rawbusy=%lu "
                 // Serial lines other tasks queued that did not fit (logq.h).
                 "logdrop=%lu\n",
                 (unsigned long)fsw.worstUs,
@@ -139,6 +139,7 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)drops.rxMissed, (unsigned long)drops.rxOverrun,
                 (unsigned long)drops.changelogDropped,
                 (unsigned long)drops.idOverflow,
+                (unsigned long)drops.rawRingBusy,
                 (unsigned long)logqDropped());
 }
 

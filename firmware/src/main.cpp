@@ -327,7 +327,8 @@ static uint32_t statusField(bool wantMissed) {
 uint32_t    cardiagMissed()   { return statusField(true); }
 
 CanDrops cardiagCanDrops() {
-  CanDrops d = {g_twaiUp, 0, 0, recorderChangeDropped(), snifferOverflow()};
+  CanDrops d = {g_twaiUp, 0, 0, recorderChangeDropped(), snifferOverflow(),
+                recorderRawBusyDropped(), recorderChangeLogStatus()};
   if (g_twaiUp) {
     twai_status_info_t st;
     if (twai_get_status_info(&st) == ESP_OK) {

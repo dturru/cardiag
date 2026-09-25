@@ -12,6 +12,8 @@
 //                      (recorder.h), rows refused rather than wrapped
 //   id_overflow        sniffer table full: frames of ids past SNIFF_MAX_IDS
 //                      never reach the Tier B snapshot
+//   raw_ring_busy      raw ring's lock was held by a reader; canTask only
+//                      TRIES it and counts the frame instead of waiting
 //
 // The two TWAI counters are the driver's, and restart whenever the driver is
 // reinstalled (a mode change). The other two are since boot or since the
@@ -27,6 +29,8 @@ struct CanDrops {
   uint32_t rxOverrun;
   uint32_t changelogDropped;
   uint32_t idOverflow;
+  uint32_t rawRingBusy;
+  const char *changeLog;   // recorderChangeLogStatus(): "ok" or why it is off
 };
 
 CanDrops cardiagCanDrops();
