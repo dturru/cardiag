@@ -55,6 +55,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 try:
     import serial  # pyserial
@@ -72,9 +73,12 @@ RE_STA_LOST = re.compile(r"\[hublink\] STA lost \((\w+), reason=(\d+)\)")
 RE_STA_UP = re.compile(r"\[hublink\] STA up: ip=(\S+)")
 RE_FALLBACK = re.compile(r"\[hublink\] fallback .*fallback=(\d+)ms")
 RE_HEAP = re.compile(r"heap=(\d+) minheap=(\d+)(?: largest=(\d+))?")
-# min_free only ever FALLS, so it is the leak signal that survives a
-# reboot -- current free heap is restored by every crash and therefore
-# looks healthy right after the worst moment.
+# ❌ CORRECTED 2026-09-25. This comment used to say min_free "only ever FALLS,
+# so it is the leak signal that survives a reboot". It does not survive one:
+# minheap= is esp_get_minimum_free_heap_size(), a PER-BOOT low-water mark that
+# restarts at every reset. Within a boot it is headroom (how close the board
+# came); across boots it compares two different runs. The leak signal is the
+# trend of heap= and largest= INSIDE a boot segment -- soak_summary.py.
 RE_NETSTACK = re.compile(r"netstack cb reg failed with (\d+)")
 # The ROM prints these on every reset. Seeing one MID-RUN means the board
 # restarted, which is the failure mode a recovering fault would otherwise hide.
@@ -127,6 +131,13 @@ def csv_path(args) -> str:
     return args.csv or os.path.join(HERE, "soak_wifi_result.csv")
 
 
+def raw_log_path(args) -> str:
+    """Next to the CSV unless given: <csv stem>.serial.log."""
+    if getattr(args, "raw_log", None):
+        return args.raw_log
+    return os.path.splitext(csv_path(args))[0] + ".serial.log"
+
+
 def write_cycle_row(args, c) -> None:
     """Append ONE cycle and flush.
 
@@ -171,8 +182,30 @@ class SerialTap:
     clocks as well as the thing being tested.
     """
 
-    def __init__(self, port: str, baud: int = 115200):
-        self.ser = serial.Serial(port, baud, timeout=0.2)
+    def __init__(self, port: str, baud: int = 115200,
+                 raw_path: str | None = None):
+        # 🐛 DTR/RTS PINNED BEFORE OPEN, exactly as tools/serial_capture.py does.
+        # This used to be serial.Serial(port, baud, ...), which opens with
+        # pyserial's defaults: DTR asserted on open, both dropped on close. On
+        # the S3's native USB-Serial-JTAG those lines are EN/BOOT, so a soak
+        # tool at defaults can reset the board it is counting resets of
+        # (CLAUDE.md, hardware guardrails). ⚪ Whether it DID in any past run is
+        # untested -- the guardrail table lists raw pyserial at defaults as
+        # "assume it resets".
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = baud
+        self.ser.timeout = 0.2
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.dsrdtr = False
+        self.ser.open()
+        # ⭐ RAW SERIAL, PER LINE, ON DISK AS IT ARRIVES. The in-memory list
+        # dies with the process; this file does not. Each line carries the
+        # host wall clock (to line up with the hotspot calls and other logs)
+        # and the monotonic clock every latency here is measured on.
+        self._raw = open(raw_path, "a", encoding="utf-8", newline="") \
+            if raw_path else None
         self.lines: list[Line] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -185,9 +218,7 @@ class SerialTap:
             try:
                 chunk = self.ser.read(4096)
             except Exception as exc:              # port yanked mid-run
-                with self._lock:
-                    self.lines.append(Line(time.monotonic(),
-                                           f"<<serial error: {exc}>>"))
+                self._record(f"<<serial error: {exc}>>")
                 return
             if not chunk:
                 continue
@@ -195,8 +226,23 @@ class SerialTap:
             while b"\n" in self._buf:
                 raw, self._buf = self._buf.split(b"\n", 1)
                 text = raw.decode("utf-8", "replace").rstrip("\r")
-                with self._lock:
-                    self.lines.append(Line(time.monotonic(), text))
+                self._record(text)
+
+    def _record(self, text: str) -> None:
+        """One line: into memory for the matchers, and onto disk for good.
+
+        Flushed AND fsynced per line. A reset, a panic or a killed run then
+        costs at most the line being received, never the lines before it --
+        the lines right before a crash are the ones that matter.
+        """
+        t = time.monotonic()
+        with self._lock:
+            self.lines.append(Line(t, text))
+        if self._raw is not None:
+            wall = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            self._raw.write(f"{wall}\t{t:.3f}\t{text}\n")
+            self._raw.flush()
+            os.fsync(self._raw.fileno())
 
     def snapshot(self) -> list[Line]:
         with self._lock:
@@ -224,10 +270,18 @@ class SerialTap:
     def close(self):
         self._stop.set()
         self._th.join(timeout=2)
+        # A line still waiting for its newline is kept, and marked as such.
+        if self._buf:
+            self._record(self._buf.decode("utf-8", "replace").rstrip("\r")
+                         + "  <<partial: no newline before close>>")
+            self._buf = b""
         try:
             self.ser.close()
         except Exception:
             pass
+        if self._raw is not None:
+            self._raw.close()
+            self._raw = None
 
 
 def hotspot(action: str, timeout: float = 90.0) -> str:
@@ -266,7 +320,9 @@ def run(args) -> int:
         return 2
     print(f"hotspot state at start: {state}")
 
-    tap = SerialTap(args.port, args.baud)
+    tap = SerialTap(args.port, args.baud, raw_path=raw_log_path(args))
+    print(f"raw serial -> {raw_log_path(args)}  (every line, host-timestamped, "
+          f"fsynced as it arrives)")
     time.sleep(1.0)
     if tap.count() == 0:
         print("WARNING: nothing on the serial port yet. If the PlatformIO "
@@ -487,13 +543,13 @@ def report(cycles: list[Cycle], tot: Totals, args):
                 fails.append(f"median per-cycle heap delta {med:+.0f} B "
                              f"(want approximately 0)")
     if len(mins) >= 2:
-        # min_free only ever falls, so ANY net fall across the run is real --
-        # and unlike free heap it is not reset by a reboot.
-        drop = mins[0][1] - mins[-1][1]
-        print(f"min free heap       {mins[0][1]} -> {mins[-1][1]} B "
-              f"({-drop:+d})")
-        if drop > 4096:
-            fails.append(f"min free heap fell {drop} B across the run")
+        # HEADROOM, not a verdict. minheap= is a per-boot low-water mark and
+        # restarts at every reset, so a "fall across the run" can be two
+        # different boots. The leak verdict is per boot segment, in
+        # soak_summary.py.
+        lo = min(v for _, v in mins)
+        print(f"min free heap       lowest {lo} B (headroom; per-boot, "
+              f"restarts at each reset -- not a leak signal)")
     else:
         print("min free heap       not reported -- firmware predates "
               "`minheap=` in the stats line")
@@ -554,8 +610,8 @@ def report(cycles: list[Cycle], tot: Totals, args):
         for f in fails:
             print(f"  - {f}")
     else:
-        print(f"VERDICT: PASS over {len(cycles)} cycles -- heap flat, min free "
-              f"heap stable, no fragmentation trend, no reboots or panics.")
+        print(f"VERDICT: PASS over {len(cycles)} cycles -- heap flat, no "
+              f"fragmentation trend, no reboots or panics.")
 
     out = csv_path(args)
     print()
@@ -581,6 +637,10 @@ def main(argv=None) -> int:
                          " Generous on purpose: the OLD firmware took ~150s.")
     ap.add_argument("--join-timeout", type=float, default=120.0)
     ap.add_argument("--csv")
+    ap.add_argument("--raw-log", dest="raw_log",
+                    help="raw serial, one line per board line, host-"
+                         "timestamped and fsynced (default: <csv stem>"
+                         ".serial.log next to the CSV)")
     args = ap.parse_args(argv)
 
     if args.dwell < 12:
