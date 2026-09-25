@@ -257,3 +257,28 @@ def test_stats_line_parses_into_the_cycle():
     assert cyc.fs_walks == 3
     assert (cyc.loop_cycle_max_us, cyc.loop_cycle_stage) == (1_200_000,
                                                              "filestore")
+
+
+# --- scan-then-join ---------------------------------------------------------------
+
+def test_failed_joins_are_counted_from_the_cumulative_counter(tmp_path):
+    rows = healthy(10)
+    fails = [0, 0, 1, 1, 1, 2, 2, 2, 2, 3]            # cumulative joinfail=
+    for r, v in zip(rows, fails):
+        r["join_fail"] = v
+    fields = FIELDS + [f for f in ("join_fail",) if f not in FIELDS]
+    j = verdict_of(tmp_path, rows, fields=fields)
+    assert j["joins"]["failed_joins"] == 3
+    assert j["verdict"] == "PASS"                      # reported, not failed on
+
+
+def test_stats_line_scan_counters_parse():
+    line = ("[hublink] rejoin state=sta joins=3 drops=2(evt=2 poll=0) "
+            "joinfail=1 apstarts=3 reason=201 fallback=120ms scans=41 seen=3 "
+            "scanfail=0 worst=150ms heap=200000 minheap=180000 largest=100000 "
+            "loopmax=90000us loopstage=webui loopwin=80000us loopwinstage=webui")
+    tap = types.SimpleNamespace(snapshot=lambda: [sw.Line(0.0, line)])
+    cyc, tot = sw.Cycle(n=1), sw.Totals()
+    sw.scan_window(tap, 0, 1, cyc, tot)
+    assert (cyc.join_fail, cyc.scans, cyc.scan_seen) == (1, 41, 3)
+    assert cyc.heap == 200_000

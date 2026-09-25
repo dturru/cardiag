@@ -7,16 +7,21 @@
 #include "looptime.h"
 #include "candrops.h"
 #include "filestore.h"
-#include "retrybackoff.h"
+#include "scansched.h"
 #include "config.h"
 #include "secrets.h"
 
 static HubLinkState g_state    = HUBLINK_OFF;
-static uint32_t     g_lastTry  = 0;
-static uint32_t     g_retryMs  = WIFI_STA_RETRY_MS;
-// The wait between attempts to find the hub. Reset on every STA disconnect,
-// advanced after every failed join (retrybackoff.h).
-static RetryBackoff g_backoff;
+// SCAN, THEN JOIN (scansched.h). While on the fallback AP the board scans
+// for the hub's SSID and joins only once a scan has seen it. The channel and
+// BSSID of that sighting are handed to WiFi.begin(), so the join does not
+// scan again. The channel is kept across drops: while known, scans cover only
+// that channel (a full sweep every WIFI_SCAN_FULL_EVERY scans).
+static ScanSched g_scan;
+static bool      g_scanRunning = false;
+static uint8_t   g_hubChannel = 0;          // 0 = not known yet
+static uint8_t   g_hubBssid[6];
+static bool      g_hintValid = false;       // use channel+BSSID on this join
 static uint32_t     g_linkUpMs = 0;
 static IPAddress    g_hubIp;
 static HubLinkStats g_stats;
@@ -33,12 +38,18 @@ static volatile uint32_t g_dropMs     = 0;
 // make the board fall back to AP from inside the code that is already doing it.
 static volatile bool g_teardown = false;
 
-// NEVER WIFI_AP_STA.
+// NEVER *ASSOCIATE* IN WIFI_AP_STA.
 //
 // The ESP32 has ONE radio. In AP+STA the two interfaces must share a channel,
-// so joining a hub AP on channel 6 silently drags this board's own AP off
+// so JOINING a hub AP on channel 6 silently drags this board's own AP off
 // WIFI_AP_CHANNEL. Clients that were told to expect channel 1 then fail in a
-// way that looks like a range problem. Run one mode at a time.
+// way that looks like a range problem.
+//
+// The fallback AP now runs in AP+STA, but the STA half only ever SCANS: a
+// scan visits other channels for a few hundred ms and comes back; it never
+// moves the AP's home channel. Joining still goes through PH_JOIN_RADIO,
+// which switches to pure STA first -- the AP is torn down only once a scan
+// has shown the hub is actually there.
 
 // ---------------------------------------------------------------------------
 // Why an EVENT and not a poll.
@@ -75,6 +86,10 @@ void hublinkPrintStats(const char *what) {
   const char *bootStage = cardiagLoopStats()->maxStage;
   Serial.printf("[hublink] %s state=%s joins=%lu drops=%lu(evt=%lu poll=%lu) "
                 "joinfail=%lu apstarts=%lu reason=%u fallback=%lums "
+                // Scan-then-join: scans run, hub sightings, failed scans.
+                // Failed joins (joinfail=) should be rare: a join is only
+                // attempted after a scan has seen the hub.
+                "scans=%lu seen=%lu scanfail=%lu "
                 // largest= is the fragmentation half of the story. Free heap
                 // can look fine while no single block is big enough to serve
                 // a request, and the soak logs it per cycle for exactly that
@@ -100,6 +115,8 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)s.joinFailures, (unsigned long)s.apStarts,
                 (unsigned)s.lastReason,
                 (unsigned long)s.lastFallbackMs,
+                (unsigned long)s.scans, (unsigned long)s.sightings,
+                (unsigned long)s.scanFails,
                 (unsigned long)s.worstFallbackMs,
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMinFreeHeap(),
@@ -197,7 +214,14 @@ static void stepJoin() {
       return;
 
     case PH_JOIN_BEGIN:
-      WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS);   // asynchronous
+      // Asynchronous. With a sighting, straight to that channel and BSSID:
+      // no scan inside the join, and no chance of picking a weaker AP.
+      if (g_hintValid) {
+        WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS, g_hubChannel, g_hubBssid);
+      } else {
+        WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS);
+      }
+      g_hintValid = false;
       g_dropFlag = false;
       g_joinT0 = millis();
       g_phase = PH_JOIN_WAIT;
@@ -210,6 +234,7 @@ static void stepJoin() {
         g_dropFlag = false;          // drop the join-phase noise
         g_teardown = false;
         g_stats.staJoins++;
+        g_hubChannel = (uint8_t)WiFi.channel();   // scan here first next time
         g_state = HUBLINK_STA;
         g_phase = PH_IDLE;
         Serial.printf("[hublink] STA up: ip=%s gw=%s rssi=%d\n",
@@ -235,7 +260,11 @@ static void stepJoin() {
       return;
 
     case PH_AP_RADIO:
-      WiFi.mode(WIFI_AP);
+      // AP+STA in ONE mode switch: the AP serves, the STA half only scans
+      // (see NEVER *ASSOCIATE* IN WIFI_AP_STA above). No begin() is ever
+      // issued in this mode, and the core's reconnect stays off.
+      WiFi.setAutoReconnect(false);
+      WiFi.mode(WIFI_AP_STA);
       g_phase = PH_AP_SERVE;
       return;
 
@@ -251,17 +280,18 @@ static void stepJoin() {
         g_stats.lastFallbackMs = took;
         if (took > g_stats.worstFallbackMs) g_stats.worstFallbackMs = took;
         g_fallbackNoticedMs = 0;
-        // A drop: the schedule starts again at its shortest wait.
-        backoffReset(&g_backoff);
-        g_retryMs = backoffNextMs(&g_backoff);
+        // A drop: look for the hub again at once, then every few seconds.
+        scanSchedReset(&g_scan, millis());
         hublinkPrintStats("fallback");
       } else {
-        // A join that failed: wait longer next time, up to the cap.
-        g_retryMs = backoffNextMs(&g_backoff);
-        if (g_bootJoin) hublinkPrintStats("boot-ap");
+        // A join that failed. After boot the search starts now; after a
+        // sighting the fast window already restarted when it was seen.
+        if (g_bootJoin) {
+          scanSchedReset(&g_scan, millis());
+          hublinkPrintStats("boot-ap");
+        }
       }
       g_bootJoin = false;
-      g_lastTry = millis();
       return;
     }
   }
@@ -270,9 +300,8 @@ static void stepJoin() {
 void hublinkBegin() {
   memset(&g_stats, 0, sizeof(g_stats));
   WiFi.onEvent(onWifiEvent);
-  g_lastTry = millis();
-  g_retryMs = WIFI_STA_RETRY_MS;
-  backoffInit(&g_backoff, WIFI_STA_BACKOFF_FIRST_MS, WIFI_STA_RETRY_MS);
+  scanSchedInit(&g_scan, WIFI_SCAN_FAST_MS, WIFI_SCAN_SLOW_MS,
+                WIFI_SCAN_SLOW_AFTER_MS, WIFI_SCAN_FULL_EVERY);
   // Starts the machine and RETURNS. setup() no longer waits up to 8 s here;
   // loop() drives the join, and on failure the board falls back to exactly
   // what it did before the hub existed: its own AP. The logger is a
@@ -305,11 +334,49 @@ void hublinkLoop() {
 
   if (g_state != HUBLINK_AP) return;
 
-  // Periodically look for the hub again, so the logger joins when the car gets
-  // home without needing a power cycle.
-  if (millis() - g_lastTry < g_retryMs) return;
-  g_lastTry = millis();
-  startJoin(/*atBoot=*/false);
+  // Look for the hub, and join only once it has been seen, so the logger
+  // joins when the car gets home -- and a hub that is not there yet costs a
+  // scan, not an AP teardown and an 8 s failed join.
+  if (g_scanRunning) {
+    const int16_t r = WiFi.scanComplete();
+    if (r == WIFI_SCAN_RUNNING) return;          // async: check next pass
+    g_scanRunning = false;
+    if (r < 0) {
+      g_stats.scanFails++;
+      return;
+    }
+    g_stats.scans++;
+    int best = -1;
+    for (int16_t i = 0; i < r; i++) {
+      if (WiFi.SSID(i) != WIFI_STA_SSID) continue;
+      if (best < 0 || WiFi.RSSI(i) > WiFi.RSSI(best)) best = i;
+    }
+    if (best >= 0) {
+      g_stats.sightings++;
+      g_hubChannel = (uint8_t)WiFi.channel(best);
+      const uint8_t *bssid = WiFi.BSSID(best);
+      if (bssid) memcpy(g_hubBssid, bssid, sizeof(g_hubBssid));
+      g_hintValid = bssid != nullptr;   // without a BSSID, a plain begin()
+      Serial.printf("[hublink] hub seen: ch=%u rssi=%d; joining\n",
+                    (unsigned)g_hubChannel, (int)WiFi.RSSI(best));
+      scanSchedSighted(&g_scan, millis());
+    }
+    WiFi.scanDelete();
+    if (best >= 0) startJoin(/*atBoot=*/false);
+    return;
+  }
+  const uint32_t now = millis();
+  if (!scanSchedDue(&g_scan, now)) return;
+  const uint8_t ch = scanSchedStart(&g_scan, now, g_hubChannel);
+  // async, no hidden, active, per-channel dwell, one channel or all (0),
+  // directed at the hub's SSID so a probe response is solicited.
+  const int16_t r = WiFi.scanNetworks(true, false, false, WIFI_SCAN_MS_PER_CHAN,
+                                      ch, WIFI_STA_SSID);
+  if (r == WIFI_SCAN_FAILED) {
+    g_stats.scanFails++;
+    return;
+  }
+  g_scanRunning = true;
 }
 
 HubLinkState hublinkState() { return g_state; }

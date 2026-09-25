@@ -91,6 +91,10 @@ RE_BOOT = re.compile(r"(rst:0x[0-9a-fA-F]+|ESP-ROM:esp32)")
 RE_RESET_REASON = re.compile(r"\[boot\] RESET REASON:\s*(\w+)")
 # Max loop() pass since boot, appended to the hublink stats line. Resets with
 # the board. The non-blocking join is supposed to keep it well under a second.
+# Cumulative since boot, from the hublink line: failed joins, and the
+# scan-then-join counters.
+RE_JOINFAIL = re.compile(r"joinfail=(\d+)")
+RE_SCANS = re.compile(r"scans=(\d+) seen=(\d+) scanfail=(\d+)")
 RE_LOOPMAX = re.compile(r"loopmax=(\d+)us(?: loopstage=(\S+))?")
 # Max loop() pass since the PREVIOUS stats line (the line resets it), and its
 # slowest stage. The max of these within a cycle is that cycle's own worst
@@ -141,6 +145,10 @@ class Cycle:
     # Max loop() pass since boot, microseconds, last value seen this cycle.
     # Firmware older than the non-blocking join does not print it: None.
     loop_max_us: int | None = None
+    # Highest cumulative values seen this cycle (since boot).
+    join_fail: int | None = None
+    scans: int | None = None
+    scan_seen: int | None = None
     loop_max_stage: str = ""
     # This cycle's worst loop() pass: max of the loopwin= values seen in it.
     loop_cycle_max_us: int | None = None
@@ -163,7 +171,8 @@ class Cycle:
 
 CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
               "reason", "heap", "minheap", "largest_block", "netstack_12308",
-              "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
+              "reboot", "reset_reason", "loop_max_us", "join_fail", "scans",
+              "scan_seen", "loop_max_stage",
               "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes",
               "panics", "fs_sub_max_us", "fs_sub_stage", "fs_pass_us",
               "fs_walks",
@@ -205,6 +214,8 @@ def write_cycle_row(args, c) -> None:
                     c.largest or "", c.netstack, int(c.reboot),
                     c.reset_reason,
                     c.loop_max_us if c.loop_max_us is not None else "",
+                    *("" if v is None else v
+                      for v in (c.join_fail, c.scans, c.scan_seen)),
                     c.loop_max_stage,
                     c.loop_cycle_max_us if c.loop_cycle_max_us is not None else "",
                     c.loop_cycle_stage, c.bus_idle_closes, c.panics,
@@ -366,6 +377,13 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
         m = RE_FALLBACK.search(ln.text)
         if m:
             cyc.fallback_ms = int(m.group(1))
+        m = RE_JOINFAIL.search(ln.text)
+        if m:
+            cyc.join_fail = max(cyc.join_fail or 0, int(m.group(1)))
+        m = RE_SCANS.search(ln.text)
+        if m:
+            cyc.scans = max(cyc.scans or 0, int(m.group(1)))
+            cyc.scan_seen = max(cyc.scan_seen or 0, int(m.group(2)))
         m = RE_LOOPMAX.search(ln.text)
         if m:
             cyc.loop_max_us = int(m.group(1))
@@ -545,11 +563,10 @@ def report(cycles: list[Cycle], tot: Totals, args):
     print(stat_block("rejoin", rejoins))
     print(stat_block("fallback->AP", fallbacks, unit="ms"))
     print()
-    print("READ 'detect' AS THE RESULT. 'rejoin' is dominated by the firmware's")
-    print("retry backoff (5, 10, 20, 40, 60 s from each drop), not by anything")
-    print("the radio did: the board is in AP mode and only looks for the hub on")
-    print("that schedule, so rejoin tracks where in it the hotspot came back.")
-    print("A rejoin near 60 s on every cycle is the old fixed cadence. The number that")
+    print("READ 'detect' AS THE RESULT. 'rejoin' is the hotspot's own AP start-up")
+    print("(8-18 s after it 'returns') plus at most one 4 s scan interval: the")
+    print("board scans while on its AP and joins once it has seen the hub.")
+    print("Failed joins (joinfail=) should be near zero. The number that")
     print("matters is how long the board spends with NO interface, which is")
     print("detect + fallback.")
     print()
@@ -669,10 +686,10 @@ def main(argv=None) -> int:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--cycles", type=int, default=50)
     ap.add_argument("--dwell", type=float, default=20.0,
-                    help="seconds to sit in each state. Should exceed the "
-                         "first two backoff steps (5 s + 10 s after a drop) so "
-                         "a rejoin is attributable to the hotspot coming back "
-                         "rather than to the retry timer.")
+                    help="seconds to sit in each state. Should comfortably "
+                         "exceed the 4 s scan interval so a rejoin is "
+                         "attributable to the hotspot coming back rather than "
+                         "to the scan timer.")
     ap.add_argument("--drop-timeout", type=float, default=180.0,
                     help="how long to wait for a drop before calling it missed."
                          " Generous on purpose: the OLD firmware took ~150s.")
@@ -685,8 +702,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if args.dwell < 12:
-        print("WARNING: dwell below the first backoff steps (5 s, 10 s); "
-              "rejoin timings will be confounded by the retry timer.")
+        print("WARNING: dwell below 12 s; rejoin timings will be confounded "
+              "by the 4 s scan interval.")
     try:
         return run(args)
     except KeyboardInterrupt:
