@@ -37,7 +37,7 @@ FIELDS = sw.CSV_FIELDS
 def row(cycle: int, *, loop_cycle=38_000, stage="webui", loop_boot=42_000,
         boot_stage="webui", idle=0, panics=0, reboot=False, heap=200_000,
         missed=0, overrun=0, chg=0, idovf=0, rawbusy=0, fs_us=9_000,
-        fs_stage="snapshot", fs_pass=12_000, fs_walks=0):
+        fs_stage="snapshot", fs_pass=12_000, fs_walks=0, logdrop=0):
     return {"cycle": cycle, "detect_ms": "-1500.0", "rejoin_ms": "9000.0",
             "fallback_ms": 120, "drop_path": "event", "reason": 201,
             "heap": heap, "minheap": heap - 20_000, "largest_block": heap // 2,
@@ -51,7 +51,8 @@ def row(cycle: int, *, loop_cycle=38_000, stage="webui", loop_boot=42_000,
             "fs_pass_us": fs_pass, "fs_walks": fs_walks,
             "can_rx_missed": missed,
             "can_rx_overrun": overrun, "can_chg_dropped": chg,
-            "can_id_overflow": idovf, "can_raw_busy": rawbusy}
+            "can_id_overflow": idovf, "can_raw_busy": rawbusy,
+            "log_dropped": logdrop}
 
 
 def write(tmp_path: Path, rows: list[dict], fields=FIELDS) -> Path:
@@ -291,7 +292,8 @@ def _garbled(r: dict) -> dict:
     """A cycle whose [stats] line was split: counters and sub-stage unread."""
     r = dict(r)
     for c in ("fs_sub_max_us", "fs_sub_stage", "fs_pass_us", "can_rx_missed",
-              "can_rx_overrun", "can_chg_dropped", "can_id_overflow"):
+              "can_rx_overrun", "can_chg_dropped", "can_id_overflow",
+              "log_dropped"):
         r[c] = ""
     return r
 
@@ -303,7 +305,7 @@ def test_the_baseline_soak_shape_is_inconclusive(tmp_path):
     j = verdict_of(tmp_path, rows)
     assert j["coverage"]["can_drops"]["readable"] == 24
     assert j["verdict"] == "INCONCLUSIVE"
-    assert set(j["coverage_short"]) == {"can_drops", "fs_sub"}
+    assert set(j["coverage_short"]) == {"can_drops", "fs_sub", "log_drops"}
 
 
 @pytest.mark.parametrize("unreadable,verdict", [(4, "PASS"), (5, "INCONCLUSIVE")])
@@ -360,3 +362,34 @@ def test_counters_parse_from_their_own_stats_line():
     assert (cyc.heap, cyc.loop_cycle_max_us) == (200_000, 80_000)
     assert (cyc.fs_sub_max_us, cyc.can_rx_missed, cyc.can_id_overflow) == (
         40_000, 0, 0)
+    assert cyc.log_dropped == 12
+
+
+# --- logdrop -----------------------------------------------------------------
+
+def test_logdrop_is_reported_not_failed(tmp_path):
+    # Since-boot counter: rises in cycles 5 and 12 only.
+    rows = [row(i, logdrop=0 if i < 5 else 3 if i < 12 else 9)
+            for i in range(1, 21)]
+    j = verdict_of(tmp_path, rows)
+    assert j["verdict"] == "PASS"
+    assert j["logdrop"] == {"total": 9, "cycles": ["5", "12"]}
+
+
+def test_coverage_accounts_for_logdrop_cycles(tmp_path):
+    # Cycle 7 dropped lines and its counters were unread; cycle 3 was unread
+    # with no drop. Both still count against coverage.
+    rows = [row(i, logdrop=0 if i < 7 else 4) for i in range(1, 21)]
+    rows[2] = _garbled(rows[2])
+    rows[6] = dict(_garbled(rows[6]), log_dropped=4)
+    j = verdict_of(tmp_path, rows)
+    c = j["coverage"]["can_drops"]
+    assert (c["readable"], c["in_logdrop_cycles"]) == (18, 1)
+
+
+def test_summary_md_shows_logdrop(tmp_path):
+    rows = [row(i, logdrop=0 if i < 5 else 2) for i in range(1, 21)]
+    out = tmp_path / "SUMMARY.md"
+    ss.main(["--csv", str(write(tmp_path, rows)), "--out", str(out)])
+    text = out.read_text("utf-8")
+    assert "serial lines dropped (log queue, not a failure):** 2 in 1 cycle(s)" in text

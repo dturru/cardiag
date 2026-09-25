@@ -30,7 +30,8 @@ FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
           "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
           "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes", "panics",
           "fs_sub_max_us", "fs_sub_stage", "fs_pass_us", "can_rx_missed",
-          "can_rx_overrun", "can_chg_dropped", "can_id_overflow", "can_raw_busy"]
+          "can_rx_overrun", "can_chg_dropped", "can_id_overflow", "can_raw_busy",
+          "log_dropped"]
 
 
 def row(cycle: int, heap: int, *, minheap: int | None = None,
@@ -50,7 +51,8 @@ def row(cycle: int, heap: int, *, minheap: int | None = None,
             "bus_idle_closes": "0", "panics": "0",
             "fs_sub_max_us": "9000", "fs_sub_stage": "snapshot",
             "fs_pass_us": "12000", "can_rx_missed": "0", "can_rx_overrun": "0",
-            "can_chg_dropped": "0", "can_id_overflow": "0", "can_raw_busy": "0"}
+            "can_chg_dropped": "0", "can_id_overflow": "0", "can_raw_busy": "0",
+            "log_dropped": "0"}
 
 
 def write_csv(path: Path, rows: list[dict]) -> Path:
@@ -105,6 +107,58 @@ def test_fragmentation_fails_even_with_flat_free_heap(tmp_path):
     rows = [row(i, 200_000, largest=100_000 - i * 1000) for i in range(1, 21)]
     j = ss.judge_heap(read_back(tmp_path, rows))
     assert any("largest free block" in f for f in j["fails"])
+
+
+# --- largest block: judged by shape, not slope ------------------------------
+
+HI, LO = 110_592, 102_400          # two levels 8 KB apart
+
+
+def _levels(seq: str) -> list[int]:
+    return [HI if c == "H" else LO for c in seq]
+
+
+def test_final_bench_soak_two_level_flip_passes(tmp_path):
+    # The final bench soak's own sequence. Its least-squares slope is steeply
+    # negative (it ends on the low level); the old check failed it.
+    seq = "HHHHHHHHHHHLLLLLLLHHHHHHLLLLLLLLLLLLLLLL"
+    vals = _levels(seq)
+    assert ss.slope(vals) < ss.HEAP_SLOPE_FAIL
+    lg = ss.judge_largest(vals)
+    assert lg["fails"] == [] and lg["new_low_at"] == [11]
+    rows = [row(i, 200_000, largest=v) for i, v in enumerate(vals, 1)]
+    assert ss.judge(read_back(tmp_path, rows))["verdict"] == "PASS"
+
+
+def test_staircase_fails(tmp_path):
+    vals = [110_592 - (i // 8) * 8192 for i in range(40)]
+    lg = ss.judge_largest(vals)
+    assert lg["late_new_lows"] == [32]
+    rows = [row(i, 200_000, largest=v) for i, v in enumerate(vals, 1)]
+    j = ss.judge(read_back(tmp_path, rows))
+    assert j["verdict"] == "FAIL"
+    assert any("new all-time low in the last third" in f for f in j["fails"])
+
+
+def test_one_late_byte_below_the_low_fails():
+    # Strict: the floor moving by any amount late in the run is a finding.
+    vals = _levels("HHHHLLLLHHHHLLLLHHHHLLLLHHHHLLLLHHHHLLLL")
+    vals[-2] = LO - 4
+    assert ss.judge_largest(vals)["late_new_lows"] == [38]
+
+
+def test_low_share_growing_every_quarter_fails():
+    # Never a new low after the first, but the low level keeps taking over.
+    seq = "HHHHHHHHHL" "HHHHHHHLLL" "HHHHHLLLLL" "HHLLLLLLLL"
+    lg = ss.judge_largest(_levels(seq))
+    assert lg["late_new_lows"] == []
+    assert lg["low_share"] == [0.1, 0.3, 0.5, 0.8]
+    assert any("share growing every quarter" in f for f in lg["fails"])
+
+
+def test_early_settling_new_low_passes():
+    vals = [120_000, 115_000] + [LO] * 28
+    assert ss.judge_largest(vals)["fails"] == []
 
 
 # --- one reboot --------------------------------------------------------------
