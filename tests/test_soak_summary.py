@@ -28,7 +28,9 @@ import soak_summary as ss  # noqa: E402
 FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
           "reason", "heap", "minheap", "largest_block", "netstack_12308",
           "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
-          "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes", "panics"]
+          "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes", "panics",
+          "fs_sub_max_us", "fs_sub_stage", "fs_pass_us", "can_rx_missed",
+          "can_rx_overrun", "can_chg_dropped", "can_id_overflow"]
 
 
 def row(cycle: int, heap: int, *, minheap: int | None = None,
@@ -45,7 +47,10 @@ def row(cycle: int, heap: int, *, minheap: int | None = None,
             # judge heap and resets only; test_soak_verdict.py covers the rest.
             "loop_max_us": "42000", "loop_max_stage": "webui",
             "loop_cycle_max_us": "38000", "loop_cycle_stage": "webui",
-            "bus_idle_closes": "0", "panics": "0"}
+            "bus_idle_closes": "0", "panics": "0",
+            "fs_sub_max_us": "9000", "fs_sub_stage": "snapshot",
+            "fs_pass_us": "12000", "can_rx_missed": "0", "can_rx_overrun": "0",
+            "can_chg_dropped": "0", "can_id_overflow": "0"}
 
 
 def write_csv(path: Path, rows: list[dict]) -> Path:

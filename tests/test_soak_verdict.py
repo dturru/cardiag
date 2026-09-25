@@ -35,7 +35,9 @@ FIELDS = sw.CSV_FIELDS
 
 
 def row(cycle: int, *, loop_cycle=38_000, stage="webui", loop_boot=42_000,
-        boot_stage="webui", idle=0, panics=0, reboot=False, heap=200_000):
+        boot_stage="webui", idle=0, panics=0, reboot=False, heap=200_000,
+        missed=0, overrun=0, chg=0, idovf=0, fs_us=9_000, fs_stage="snapshot",
+        fs_pass=12_000):
     return {"cycle": cycle, "detect_ms": "-1500.0", "rejoin_ms": "9000.0",
             "fallback_ms": 120, "drop_path": "event", "reason": 201,
             "heap": heap, "minheap": heap - 20_000, "largest_block": heap // 2,
@@ -45,7 +47,10 @@ def row(cycle: int, *, loop_cycle=38_000, stage="webui", loop_boot=42_000,
             "loop_max_stage": boot_stage,
             "loop_cycle_max_us": "" if loop_cycle is None else loop_cycle,
             "loop_cycle_stage": stage, "bus_idle_closes": idle,
-            "panics": panics}
+            "panics": panics, "fs_sub_max_us": fs_us, "fs_sub_stage": fs_stage,
+            "fs_pass_us": fs_pass, "can_rx_missed": missed,
+            "can_rx_overrun": overrun, "can_chg_dropped": chg,
+            "can_id_overflow": idovf}
 
 
 def write(tmp_path: Path, rows: list[dict], fields=FIELDS) -> Path:
@@ -193,3 +198,59 @@ def test_run_soak_takes_done_from_the_verdict_file_only():
     # The old path decided DONE from soak_wifi's exit code.
     assert 'if ($soakRc -eq 0) { Finish 0 "complete-pass" }' not in ps1
     assert "FINAL VERDICT (soak_summary.py" in ps1
+
+
+# --- CAN drops and the filestore sub-stage ------------------------------------
+
+@pytest.mark.parametrize("kw,what", [
+    ({"missed": 3}, "rx_missed"),
+    ({"overrun": 1}, "FIFO overrun"),
+    ({"chg": 12}, "change-log ring full"),
+    ({"idovf": 2}, "sniffer id table full"),
+])
+def test_any_can_drop_fails(tmp_path, kw, what):
+    rows = healthy()
+    # Counters are cumulative: once non-zero they stay so.
+    rows = rows[:5] + [row(i, **kw) for i in range(6, 21)]
+    j = verdict_of(tmp_path, rows)
+    assert j["verdict"] == "FAIL"
+    assert any(what in f and "first at cycle 6" in f for f in j["fails"])
+
+
+def test_drop_counters_missing_fails(tmp_path):
+    fields = [f for f in FIELDS if not f.startswith("can_")]
+    j = verdict_of(tmp_path, healthy(), fields=fields)
+    assert j["verdict"] == "FAIL"
+    assert any("CAN drop counters not reported" in f for f in j["fails"])
+
+
+def test_fs_sub_stage_is_reported_not_failed(tmp_path):
+    rows = [row(i, fs_us=600_000 if i % 4 == 0 else 20_000,
+                fs_stage="fs_size" if i % 4 == 0 else "snapshot",
+                fs_pass=800_000) for i in range(1, 21)]
+    j = verdict_of(tmp_path, rows)
+    assert j["verdict"] == "PASS"          # the loop check is the verdict
+    us, cyc, st, _ = j["fs_sub"]["worst"]
+    assert (us, st) == (600_000, "fs_size")
+    assert j["fs_sub"]["stage_counts"] == {"fs_size": 5, "snapshot": 15}
+    out = tmp_path / "S.md"
+    ss.main(["--csv", str(tmp_path / "soak.csv"), "--out", str(out),
+             "--requested", "20"])
+    assert "worst filestore sub-stage:** `fs_size` 600.0 ms" in out.read_text()
+
+
+def test_stats_line_parses_into_the_cycle():
+    line = ("[hublink] rejoin state=sta joins=3 drops=2(evt=2 poll=0) "
+            "joinfail=0 apstarts=3 reason=201 fallback=120ms worst=150ms "
+            "heap=200000 minheap=180000 largest=100000 loopmax=2400000us "
+            "loopstage=filestore loopwin=1200000us loopwinstage=filestore "
+            "fswin=1100000us fswinstage=fs_size fswinpass=1180000us "
+            "canmiss=0 canovr=0 chgdrop=4 idovf=0")
+    tap = types.SimpleNamespace(snapshot=lambda: [sw.Line(0.0, line)])
+    cyc, tot = sw.Cycle(n=1), sw.Totals()
+    sw.scan_window(tap, 0, 1, cyc, tot)
+    assert (cyc.fs_sub_max_us, cyc.fs_sub_stage, cyc.fs_pass_us) == (
+        1_100_000, "fs_size", 1_180_000)
+    assert (cyc.can_rx_missed, cyc.can_chg_dropped) == (0, 4)
+    assert (cyc.loop_cycle_max_us, cyc.loop_cycle_stage) == (1_200_000,
+                                                             "filestore")

@@ -35,6 +35,7 @@
 #include "hublink.h"
 #include "hubstream.h"
 #include "looptime.h"
+#include "candrops.h"
 #include "selftest_profile.h"
 #include "filestore.h"
 #include "transceiver.h"
@@ -316,6 +317,18 @@ static uint32_t statusField(bool wantMissed) {
 }
 
 uint32_t    cardiagMissed()   { return statusField(true); }
+
+CanDrops cardiagCanDrops() {
+  CanDrops d = {g_twaiUp, 0, 0, recorderChangeDropped(), snifferOverflow()};
+  if (g_twaiUp) {
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) == ESP_OK) {
+      d.rxMissed = st.rx_missed_count;
+      d.rxOverrun = st.rx_overrun_count;
+    }
+  }
+  return d;
+}
 uint32_t    cardiagBusErr()   { return statusField(false); }
 const char *cardiagModeName() { return modeName(g_mode); }
 
