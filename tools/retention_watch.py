@@ -217,53 +217,92 @@ class Watcher:
         for i in gone:
             f = self.seen_indices.pop(i)
             t = self.rows[-1]["t"] if self.rows else 0
-            # Whether THIS file was acked, judged against the watermark in
-            # force. `acked_through` is a watermark, so anything at or below it
-            # was collected -- that is what makes the order checkable.
             wm = self.rows[-1].get("acked_through") if self.rows else None
-            was_acked = wm is not None and i <= wm
-            # 🔑 How many ACKED files were still on disk AT THIS MOMENT.
+            self.record_eviction(t, i, f, wm, self.seen_indices)
+
+    def record_eviction(self, t: float, i: int, f: dict, wm: int | None,
+                        on_disk: dict[int, dict]) -> dict:
+        """Judge one eviction and append it to the record.
+
+        Split out so the regression tests drive the REAL scoping rule instead
+        of a second copy of it that could drift from this one. `on_disk` is
+        every file still present at this moment, not including `i`.
+        """
+        # Whether THIS file was acked, judged against the watermark in force.
+        # `acked_through` is a watermark, so anything at or below it was
+        # collected -- that is what makes the order checkable.
+        was_acked = wm is not None and i <= wm
+
+        # 🔑 How many ACKED files were still on disk AT THIS MOMENT.
             #
-            # Claim 2 is "unacked goes only when nothing acked is left", and
-            # that has to be judged against the watermark IN FORCE WHEN THE
-            # DELETION HAPPENED. Ack status is not a property of a file, it is
-            # a property of a file at a time: a mid-run ack turns dozens of
-            # files from unacked to acked at once. Comparing a later acked
-            # eviction against an earlier unacked one without this produces a
-            # false FAIL -- those files were not acked yet when the earlier
-            # one went.
-            # ⚠️ SCOPED TO THE SAME TIER, and this is a correctness fix, not a
-            # relaxation to make a red run go green.
-            #
-            # enforceTierACap() only ever considers TIER A candidates -- that
-            # is what the cap is: Tier A's share of the partition. An acked
-            # Tier B file sitting on the disk is not a candidate it declined to
-            # take, so it is not evidence of anything.
-            #
-            # Counting every tier produced a FALSE FAIL on 2026-09-24 19:01:
-            # #436 and #442 are Tier B snapshots below the ack watermark, so
-            # the unacked Tier A eviction at t=1032.6 was reported as a
-            # violation while the firmware had in fact evicted all six acked
-            # Tier A files first. The all-tier count is kept alongside, because
-            # the global evictOne() path DOES order across tiers and a future
-            # claim may want it.
-            tier = f.get("tier")
-            acked_same_tier = sum(
-                1 for j, g in self.seen_indices.items()
-                if wm is not None and j <= wm and j != i
-                and g.get("tier") == tier)
-            acked_available_any = sum(
-                1 for j in self.seen_indices
-                if wm is not None and j <= wm and j != i)
-            self.evicted.append({"t": t, "index": i, "tier": tier,
-                                 "bytes": f.get("bytes"), "acked": was_acked,
-                                 "acked_available": acked_same_tier,
-                                 "acked_available_any": acked_available_any})
+        # Claim 2 is "unacked goes only when nothing acked is left", and that
+        # has to be judged against the watermark IN FORCE WHEN THE DELETION
+        # HAPPENED. Ack status is not a property of a file, it is a property of
+        # a file at a time: a mid-run ack turns dozens of files from unacked to
+        # acked at once. Comparing a later acked eviction against an earlier
+        # unacked one without this produces a false FAIL -- those files were
+        # not acked yet when the earlier one went.
+        #
+        # ⚠️ SCOPED TO THE SAME TIER, and this is a correctness fix, not a
+        # relaxation to make a red run go green.
+        #
+        # enforceTierACap() only ever considers TIER A candidates -- that is
+        # what the cap is: Tier A's share of the partition. An acked Tier B
+        # file sitting on the disk is not a candidate it declined to take, so
+        # it is not evidence of anything.
+        #
+        # Counting every tier produced a FALSE FAIL on 2026-09-24 19:01: #436
+        # and #442 are Tier B snapshots below the ack watermark, so the unacked
+        # Tier A eviction at t=1032.6 was reported as a violation while the
+        # firmware had in fact evicted all six acked Tier A files first. The
+        # all-tier count is kept alongside, because the global evictOne() path
+        # DOES order across tiers and a future claim may want it.
+        tier = f.get("tier")
+        acked_same_tier = sum(
+            1 for j, g in on_disk.items()
+            if wm is not None and j <= wm and j != i
+            and g.get("tier") == tier)
+        acked_available_any = sum(
+            1 for j in on_disk
+            if wm is not None and j <= wm and j != i)
+        rec = {"t": t, "index": i, "tier": tier,
+               "bytes": f.get("bytes"), "acked": was_acked,
+               "acked_available": acked_same_tier,
+               "acked_available_any": acked_available_any}
+        self.evicted.append(rec)
+        self.events.append(
+            f"[t={t:7.1f}] EVICTED "
+            f"#{i} tier={f.get('tier')} kind={f.get('kind')} "
+            f"bytes={f.get('bytes')} acked={was_acked} "
+            f"synthetic={f.get('synthetic')}")
+        return rec
+
+    def ingest_row(self, row: dict, prev: dict | None) -> None:
+        """Note the first time each threshold is crossed, from one sample.
+
+        Split out of run() so the regression tests replay recorded samples
+        through the SAME derivation the live watcher uses. A test that
+        reimplemented this would pass while the tool was broken, which is the
+        failure mode these tests exist to catch.
+        """
+        if row["warn"] and self.first_warn is None:
+            self.first_warn = dict(row)
+            self.events.append(f"[t={row['t']:7.1f}] WARN set at "
+                               f"usage {row['usage_pct']}%")
+        if prev is None:
+            return
+        if (row["deleted_acked"] or 0) > (prev["deleted_acked"] or 0) \
+                and self.first_acked_delete is None:
+            self.first_acked_delete = dict(row)
             self.events.append(
-                f"[t={t:7.1f}] EVICTED "
-                f"#{i} tier={f.get('tier')} kind={f.get('kind')} "
-                f"bytes={f.get('bytes')} acked={was_acked} "
-                f"synthetic={f.get('synthetic')}")
+                f"[t={row['t']:7.1f}] first ACKED deletion, "
+                f"usage {row['usage_pct']}%")
+        if (row["deleted_unacked"] or 0) > (prev["deleted_unacked"] or 0) \
+                and self.first_unacked_delete is None:
+            self.first_unacked_delete = dict(row)
+            self.events.append(
+                f"[t={row['t']:7.1f}] *** first UNACKED deletion, "
+                f"usage {row['usage_pct']}%, warn={row['warn']} ***")
 
     def run(self, seconds: float) -> None:
         self.t0 = time.monotonic()
@@ -273,23 +312,7 @@ class Watcher:
             if row is not None:
                 self.poll_files()
                 self.maybe_ack()
-                if row["warn"] and self.first_warn is None:
-                    self.first_warn = dict(row)
-                    self.events.append(f"[t={row['t']:7.1f}] WARN set at "
-                                       f"usage {row['usage_pct']}%")
-                if prev is not None:
-                    if (row["deleted_acked"] or 0) > (prev["deleted_acked"] or 0) \
-                            and self.first_acked_delete is None:
-                        self.first_acked_delete = dict(row)
-                        self.events.append(
-                            f"[t={row['t']:7.1f}] first ACKED deletion, "
-                            f"usage {row['usage_pct']}%")
-                    if (row["deleted_unacked"] or 0) > (prev["deleted_unacked"] or 0) \
-                            and self.first_unacked_delete is None:
-                        self.first_unacked_delete = dict(row)
-                        self.events.append(
-                            f"[t={row['t']:7.1f}] *** first UNACKED deletion, "
-                            f"usage {row['usage_pct']}%, warn={row['warn']} ***")
+                self.ingest_row(row, prev)
                 prev = row
                 print(f"[{row['t']:7.1f}] used {row['used']:>9}/{row['total']} "
                       f"({row['usage_pct']:>3}%) warn={str(row['warn']):<5} "
