@@ -267,6 +267,18 @@ const FileStoreStats *filestoreStats();
 FsSubWindow filestoreTakeSubWindow(uint8_t which);
 FsSubWindow filestoreSubBoot();
 
+// Filesystem walks and the tracked-usage resync (fsusage.h). walksTotal is
+// lifetime, boot measurement included; after boot it should only move on the
+// rare idle resync.
+struct FsUsageReport {
+  uint32_t walksTotal;
+  uint32_t resyncs;
+  int32_t  lastDriftBytes;   // actual - tracked at the last resync
+  uint32_t sinceResyncMs;    // since the last resync, or the boot measurement
+  bool     tracked;          // false until the boot measurement
+};
+FsUsageReport filestoreUsageReport();
+
 // Percent of the partition in use, 0-100.
 uint8_t filestoreUsagePct();
 

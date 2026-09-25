@@ -160,16 +160,27 @@ static void handleSession(WebServer &srv) {
   // sub-stage of any single pass, since the previous session read (this read
   // resets it) and since boot. `pass_us` is the whole tick in that pass.
   {
+    //
+    // `walks` counts filesystem walks (usedBytes()/totalBytes()) in the tick;
+    // usage is tracked in RAM (fsusage.h), so only the rare idle resync may
+    // walk. `usage` says when that last happened and how far off the tracked
+    // figure had drifted.
     const FsSubWindow iv = filestoreTakeSubWindow(0);
     const FsSubWindow bt = filestoreSubBoot();
+    const FsUsageReport ur = filestoreUsageReport();
     n = jsonAppend(buf, sizeof(buf), n,
         "\"fs_tick\":{\"interval\":{\"worst_stage\":\"%s\",\"worst_us\":%lu,"
-        "\"pass_us\":%lu},\"boot\":{\"worst_stage\":\"%s\",\"worst_us\":%lu,"
-        "\"pass_us\":%lu}},",
+        "\"pass_us\":%lu,\"walks\":%lu},\"boot\":{\"worst_stage\":\"%s\","
+        "\"worst_us\":%lu,\"pass_us\":%lu,\"walks\":%lu},"
+        "\"walks_total\":%lu,\"usage\":{\"tracked\":%s,\"resyncs\":%lu,"
+        "\"last_drift_bytes\":%ld,\"since_resync_ms\":%lu}},",
         iv.worstUs ? fsSubName(iv.worstSub) : "", (unsigned long)iv.worstUs,
-        (unsigned long)iv.passUs,
+        (unsigned long)iv.passUs, (unsigned long)iv.walks,
         bt.worstUs ? fsSubName(bt.worstSub) : "", (unsigned long)bt.worstUs,
-        (unsigned long)bt.passUs);
+        (unsigned long)bt.passUs, (unsigned long)bt.walks,
+        (unsigned long)ur.walksTotal, ur.tracked ? "true" : "false",
+        (unsigned long)ur.resyncs, (long)ur.lastDriftBytes,
+        (unsigned long)ur.sinceResyncMs);
   }
 
   // Every place a received frame can be lost before the file (candrops.h).

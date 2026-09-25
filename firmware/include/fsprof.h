@@ -26,7 +26,9 @@ enum FsSub : uint8_t {
   FS_SUB_FLUSH,          // fh.flush() on the time bound
   FS_SUB_ROTATE,         // open / close / .meta / rename / index add
   FS_SUB_RETENTION,      // eviction policy + removes
-  FS_SUB_FSSIZE,         // LittleFS.usedBytes()/totalBytes(): walks the FS
+  FS_SUB_FSSIZE,         // a filesystem walk (usedBytes()/totalBytes() ->
+                         // lfs_fs_size). Only the idle resync may walk in a
+                         // tick now (fsusage.h); see `walks` below.
   FS_SUB_HYDRATE,        // stat / .meta reads for the index (scan tail)
   FS_SUB_COUNT
 };
@@ -47,11 +49,20 @@ struct FsProf {
   uint32_t child[FS_PROF_DEPTH];    // time spent in nested stages
   uint8_t  depth;
   bool     active;                  // inside a tick; outside, no-ops
+  uint16_t walks;                   // filesystem walks this pass
 };
+
+// Count one filesystem walk (a usedBytes()/totalBytes() call). The number
+// that says whether the fix holds: it should be 0 in every tick except the
+// rare idle resync.
+static inline void fsProfWalk(FsProf *p) {
+  if (p->active) p->walks++;
+}
 
 static inline void fsProfBeginPass(FsProf *p) {
   for (uint8_t i = 0; i < FS_SUB_COUNT; i++) p->acc[i] = 0;
   p->depth = 0;
+  p->walks = 0;
   p->active = true;
 }
 
@@ -95,7 +106,12 @@ struct FsSubWindow {
   uint32_t worstUs;       // worst single sub-stage in any one pass
   uint8_t  worstSub;
   uint32_t passUs;        // the whole tick in that same pass
+  uint32_t walks;         // filesystem walks across ALL passes in the window
 };
+
+static inline void fsSubWindowAddWalks(FsSubWindow *w, uint16_t walks) {
+  w->walks += walks;
+}
 
 static inline void fsSubWindowNote(FsSubWindow *w, uint8_t sub, uint32_t us,
                                    uint32_t passUs) {

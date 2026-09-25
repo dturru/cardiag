@@ -323,6 +323,19 @@
 // explicitly so the two cannot drift.
 #define FS_VFS_ROOT "/littlefs"
 
+// LittleFS geometry for the in-RAM usage accounting (fsusage.h). The ESP32
+// port formats with 4 KB blocks; files at or under the inline limit live in
+// their directory's metadata and take no data block (esp_littlefs's cache
+// size, 512 B, bounds lfs inline_max).
+#define FS_BLOCK_BYTES 4096u
+#define FS_INLINE_MAX  512u
+
+// Background resync of the tracked usage against a real walk: at most this
+// often, and only while the board is idle (every file closed after a bus-idle
+// key-off), because the walk measured 1.05-1.74 s per call on the soak board.
+// It logs the drift between the two figures and adopts the real one.
+#define FS_USAGE_RESYNC_MS (60UL * 60UL * 1000UL)
+
 // Index entries whose size/digest/mode are read per filestoreLoop() pass. The
 // boot scan reads names only; this fills in the rest in the background. Each
 // read is one path lookup.

@@ -72,13 +72,31 @@ void test_too_deep_stays_balanced(void) {
 }
 
 void test_window_keeps_the_worst_pass(void) {
-  FsSubWindow w = {0, 0, 0};
+  FsSubWindow w = {0, 0, 0, 0};
   fsSubWindowNote(&w, FS_SUB_FLUSH, 30000, 40000);
   fsSubWindowNote(&w, FS_SUB_FSSIZE, 900000, 1400000);
   fsSubWindowNote(&w, FS_SUB_SNAPSHOT, 50000, 60000);
   TEST_ASSERT_EQUAL_UINT8(FS_SUB_FSSIZE, w.worstSub);
   TEST_ASSERT_EQUAL_UINT32(900000, w.worstUs);
   TEST_ASSERT_EQUAL_UINT32(1400000, w.passUs);
+}
+
+void test_walks_are_counted_per_pass_and_summed_per_window(void) {
+  FsSubWindow w = {0, 0, 0, 0};
+  fsProfBeginPass(&p);
+  fsProfWalk(&p);
+  fsProfWalk(&p);
+  uint32_t us;
+  fsProfEndPass(&p, &us);
+  TEST_ASSERT_EQUAL_UINT16(2, p.walks);
+  fsSubWindowAddWalks(&w, p.walks);
+  fsProfBeginPass(&p);                 // a clean pass: no walks
+  fsProfEndPass(&p, &us);
+  TEST_ASSERT_EQUAL_UINT16(0, p.walks);
+  fsSubWindowAddWalks(&w, p.walks);
+  TEST_ASSERT_EQUAL_UINT32(2, w.walks);
+  fsProfWalk(&p);                      // outside a pass (boot): not a tick walk
+  TEST_ASSERT_EQUAL_UINT16(0, p.walks);
 }
 
 int main(int, char **) {
@@ -89,5 +107,6 @@ int main(int, char **) {
   RUN_TEST(test_micros_wrap_inside_a_stage);
   RUN_TEST(test_too_deep_stays_balanced);
   RUN_TEST(test_window_keeps_the_worst_pass);
+  RUN_TEST(test_walks_are_counted_per_pass_and_summed_per_window);
   return UNITY_END();
 }
