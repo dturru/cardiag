@@ -5,6 +5,7 @@
 
 #include "hubapi.h"
 #include "hubproto.h"
+#include "looptime.h"
 #include "hublink.h"
 #include "hubstream.h"
 #include "filestore.h"
@@ -12,7 +13,6 @@
 #include "sniffer.h"
 #include "config.h"
 #include "secrets.h"
-#include "looptime.h"
 
 // Constant-time compare. A length-dependent early return on a shared token is
 // a timing oracle; cheap to avoid, so avoid it.

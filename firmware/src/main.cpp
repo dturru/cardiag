@@ -33,12 +33,12 @@
 #include "session.h"
 #include "hublink.h"
 #include "hubstream.h"
+#include "looptime.h"
 #include "selftest_profile.h"
 #include "filestore.h"
 #include "transceiver.h"
 #include "bootguard.h"
 #include "bootguard_rt.h"
-#include "looptime.h"
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason() -- why this boot was a boot
 #include <esp_core_dump.h>  // and, on a crash, WHERE it died
