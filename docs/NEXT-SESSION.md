@@ -80,7 +80,7 @@ the three below.
 | Claim | Status | Implemented at |
 |---|---|---|
 | Boot line prints the **reset reason** | ❌ **WAS FALSE** → ✅ true from `27a490d` | `firmware/src/main.cpp` §setup, `[boot] RESET REASON:` |
-| Boot line prints a **coredump summary** on PANIC/WDT, then erases it | ✅ new, `esp_core_dump_get_summary()` | `firmware/src/main.cpp` §setup, `[boot] COREDUMP:` |
+| Boot line prints a **coredump summary** ~~on PANIC/WDT, then erases it~~ → **kept until the hub fetches and acks it** (the erase is what lost the cycle-135 dump) | ✅ `esp_core_dump_get_summary()`; `GET /api/v1/coredump`, `POST /api/v1/coredump/ack` | `firmware/src/coredump.cpp` (`coredumpBegin`, called from `main.cpp` §setup), `[boot] COREDUMP PRESENT:` |
 | Board prints its **effective caps** at mount | ✅ added `c0c2645` | `firmware/src/filestore.cpp` (`EFFECTIVE CAPS`) |
 | Boot line prints the **lifetime loss record** | ✅ verified | `firmware/src/filestore.cpp:740` |
 | `*** EVICTED UNACKED TIER x ... DATA LOST ***` on unacked eviction | ✅ verified | `firmware/src/filestore.cpp:346` |

@@ -8,6 +8,7 @@
 #include "config.h"
 #include "hubapi.h"
 #include "filestore.h"
+#include "coredump.h"
 
 static WebServer g_server(80);
 static bool g_apMode = false;
@@ -253,6 +254,9 @@ static void registerRoutes() {
   // the whole server -- that call REPLACES the list rather than adding to it,
   // so it has to happen in exactly one place or "Range" quietly stops arriving.
   filestoreRegister(g_server);
+  // GET /api/v1/coredump and /ack. Token-checked; collectHeaders() above
+  // already covers X-Hub-Token.
+  coredumpRegister(g_server);
 }
 
 void webuiStart() {

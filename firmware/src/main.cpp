@@ -27,6 +27,7 @@
 
 #include "config.h"
 #include "obd.h"
+#include "coredump.h"
 #include "sniffer.h"
 #include "recorder.h"
 #include "webui.h"
@@ -544,50 +545,14 @@ void setup() {
     Serial.printf("[boot] RESET REASON: %s (%d)\n", name, (int)rr);
 
     // ⭐ A FAIL MUST ARRIVE WITH ITS EVIDENCE. The reason alone says a crash
-    // happened; the coredump says WHERE. Without this an overnight soak
-    // reports "1 TASK_WDT at cycle 137" and the next session still has to
-    // reproduce it to learn anything.
+    // happened; the coredump says WHERE.
     //
-    // Only on the four reasons that leave a dump. A BROWNOUT does not crash
-    // the firmware -- the supply went away -- so there is nothing to read, and
-    // reading it anyway would print a stale dump from an older crash and
-    // attribute it to the wrong boot.
-    if (rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT ||
-        rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT) {
-#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
-      // Heap, not stack: the struct carries a 16-entry backtrace plus a
-      // sha256 string, and setup() runs on the Arduino task's stack.
-      esp_core_dump_summary_t *s =
-          (esp_core_dump_summary_t *)malloc(sizeof(esp_core_dump_summary_t));
-      if (s && esp_core_dump_get_summary(s) == ESP_OK) {
-        Serial.printf("[boot] COREDUMP: task='%s' pc=0x%08lx depth=%u%s\n",
-                      s->exc_task, (unsigned long)s->exc_pc,
-                      (unsigned)s->exc_bt_info.depth,
-                      s->exc_bt_info.corrupted ? " (BACKTRACE CORRUPT)" : "");
-        // Six frames is enough to name the call path and still fit one line.
-        const uint32_t n = s->exc_bt_info.depth < 6 ? s->exc_bt_info.depth : 6;
-        Serial.print("[boot] COREDUMP BT:");
-        for (uint32_t i = 0; i < n; i++) {
-          Serial.printf(" 0x%08lx", (unsigned long)s->exc_bt_info.bt[i]);
-        }
-        Serial.println();
-      } else {
-        Serial.println("[boot] COREDUMP: none readable (crash may predate "
-                       "coredump support, or the dump was already erased)");
-      }
-      free(s);
-#else
-      Serial.println("[boot] COREDUMP: not built in "
-                     "(ESP_COREDUMP_ENABLE_TO_FLASH / DATA_FORMAT_ELF off)");
-#endif
-      // 🔑 ERASE IT. The partition holds ONE dump: with a stale dump in place
-      // the NEXT crash has nowhere to go, and every later boot would reprint
-      // this same summary as though it were fresh. A soak that crashes twice
-      // must be able to show both.
-      const esp_err_t er = esp_core_dump_image_erase();
-      Serial.printf("[boot] COREDUMP erased: %s\n",
-                    er == ESP_OK ? "ok" : esp_err_to_name(er));
-    }
+    // 🐛 IT USED TO BE ERASED RIGHT HERE, after a six-frame summary. That is
+    // how the soak's cycle-135 TASK_WDT lost its dump. It is now KEPT until
+    // the hub fetches it (GET /api/v1/coredump) and acks that exact dump by
+    // sha256 -- see coredump.h. The summary still prints on every boot a dump
+    // is present, marked as possibly older than this boot.
+    coredumpBegin((int)rr);
   }
 
   snifferBegin();

@@ -12,3 +12,6 @@
 #include <WebServer.h>
 
 void hubapiRegister(WebServer &srv);
+
+// The shared X-Hub-Token check (constant-time), for other modules' endpoints.
+bool hubapiTokenOk(WebServer &srv);

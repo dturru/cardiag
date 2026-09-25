@@ -12,6 +12,7 @@
 #include "sniffer.h"
 #include "config.h"
 #include "secrets.h"
+#include "coredump.h"
 
 // Constant-time compare. A length-dependent early return on a shared token is
 // a timing oracle; cheap to avoid, so avoid it.
@@ -27,6 +28,8 @@ static bool tokenOk(WebServer &srv) {
   }
   return diff == 0;
 }
+
+bool hubapiTokenOk(WebServer &srv) { return tokenOk(srv); }
 
 static void denied(WebServer &srv) {
   srv.send(401, "application/json", "{\"error\":\"bad or missing X-Hub-Token\"}");
@@ -135,6 +138,17 @@ static void handleSession(WebServer &srv) {
       (unsigned long)hubstreamFastPacketsSent(),
       (unsigned long)hubstreamFastRecordsSent(),
       (unsigned)HUB_SNAPSHOT_HZ, (unsigned)HUB_FAST_HZ);
+
+  // A stored core dump the hub has not fetched and acked yet. It stays on
+  // the board until POST /api/v1/coredump/ack names this sha256 (coredump.h),
+  // so `present` is a to-do for the hub, not a history.
+  n = jsonAppend(buf, sizeof(buf), n,
+      "\"coredump\":{\"present\":%s,\"bytes\":%lu,\"format\":\"%s\","
+      "\"sha256\":%s%s%s},",
+      coredumpPresent() ? "true" : "false",
+      (unsigned long)coredumpBytes(), coredumpFormat(),
+      coredumpPresent() ? "\"" : "", coredumpPresent() ? coredumpSha256Hex() : "null",
+      coredumpPresent() ? "\"" : "");
 
   // Storage. Protocol 2.3 says the logger warns "well before" it has to delete
   // anything -- it has no MQTT client, so it reports here and the hub's sync
