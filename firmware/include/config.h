@@ -344,18 +344,20 @@
 // with the scan measured AFTER the fix, at the worst state the disk can be in.
 // Inputs, and where each came from:
 //
-//   mount, preserved soak image ........ ~2.8 s     MEASURED 2026-09-25 (local)
+//   mount, preserved soak image ........ 231 ms     MEASURED 2026-09-25, hardware
 //   scan, pre-fix, 1,376 entries ....... 174 s      MEASURED -- the bug; not an input
-//   scan, post-fix, same image ......... PENDING    the board prints it:
-//                                                   "[fs] BOOT TIMING: mount .. + scan .."
-//   scan, post-fix, at the count cap ... PENDING    same line, steady state
+//   scan, post-fix, same image ......... 3,863 ms   MEASURED 2026-09-25, hardware
+//                                                   (1,376 entries, 690 files)
+//   scan, post-fix, at the count cap ... 596 ms     MEASURED 2026-09-25, hardware
+//                                                   (191 entries, 96 files; mount 40 ms)
 //
-// ⚠️ UNTIL THE PENDING ROWS ARE FILLED IN FROM THAT LINE, THIS IS THE RULE'S
-// FLOOR (WDT_TIMEOUT_S), not a derived value. It is 10x the one measured term,
-// and the scan no longer does a path lookup per entry, but "should be fast" is
-// the reasoning that shipped the 187 s boot. Replace it from the measurement
-// and delete this paragraph. The boot line flags any start that uses more
-// than a third of the budget, so the margin is visible on every boot.
+// Worst case = the preserved image: 231 + 3,863 = 4,094 ms.
+//   ceil(3 x 4.094 s) = 13 s  <  WDT_TIMEOUT_S (30 s)  =>  FS_BOOT_WDT_S = 30
+//
+// The rule's floor binds: the worst post-fix start uses ~14% of the budget
+// (the steady state ~2%). The eviction backlog on that image (594 files,
+// ~6 min at ~1.15 files/s) runs incrementally after boot, outside this budget.
+// The boot line still flags any start over a third of it.
 #ifndef FS_BOOT_WDT_S
 #define FS_BOOT_WDT_S 30
 #endif
