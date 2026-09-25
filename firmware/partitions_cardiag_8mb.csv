@@ -1,0 +1,23 @@
+# cardiag partition table - ESP32-S3-WROOM-1-N8R8 (8 MB flash)
+#
+# Sized deliberately around TWO OTA app slots, because the hub spec calls for
+# signed A/B firmware updates with rollback. An app partition must be
+# 0x10000-aligned.
+#
+# App slots: 2 MB each. A current Arduino WiFi + WebServer + TWAI build lands
+# around 1.3-1.5 MB, so 2 MB leaves roughly 30-40% headroom for LittleFS,
+# mbedTLS sha256 and the hub modules. Arduino's default_8MB.csv gives 3.1875 MB
+# per slot, which is more than this firmware will plausibly need and costs the
+# filesystem 2.4 MB.
+#
+# NOTE the label is "spiffs", not "littlefs": Arduino-ESP32's LittleFS.begin()
+# looks for a partition labelled "spiffs" by default. Renaming it means passing
+# a partition label at every begin() call. Not worth the footgun.
+#
+# name,     type, subtype,  offset,   size
+nvs,        data, nvs,      0x9000,   0x5000
+otadata,    data, ota,      0xE000,   0x2000
+app0,       app,  ota_0,    0x10000,  0x200000
+app1,       app,  ota_1,    0x210000, 0x200000
+spiffs,     data, spiffs,   0x410000, 0x3E0000
+coredump,   data, coredump, 0x7F0000, 0x10000

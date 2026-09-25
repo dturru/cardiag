@@ -6,6 +6,7 @@ __pycache__/
 data/*
 !data/.gitkeep
 *.csv
+!firmware/partitions_cardiag_8mb.csv
 *.log
 secrets.h
 .env
