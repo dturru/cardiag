@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import statistics
 from pathlib import Path
@@ -59,6 +60,9 @@ def main() -> int:
     ap.add_argument("--log", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--requested", type=int, default=0)
+    ap.add_argument("--context", default=None,
+                    help="run-context.json -- start time and power state, so "
+                         "the morning read has context it did not witness")
     args = ap.parse_args()
 
     path = Path(args.csv)
@@ -111,6 +115,22 @@ def main() -> int:
     if done == 0:
         L.append("\n> 🔴 **No cycles completed.** Nothing to judge — check "
                  "`runner.log`, `flash.log` and `soak.log`.\n")
+
+    # ⭐ Whoever reads this at 8am did not watch it start. A BROWNOUT at cycle
+    # 140 means one thing on mains and something entirely different if the
+    # laptop dropped to battery at 3am.
+    if args.context and Path(args.context).exists():
+        try:
+            ctx = json.loads(Path(args.context).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            ctx = {}
+        if ctx:
+            L.append("\n## Run context\n")
+            L.append("| | |")
+            L.append("|---|---|")
+            for k, v in ctx.items():
+                L.append(f"| **{k.replace('_', ' ')}** | {v} |")
+            L.append("")
 
     L.append(f"- **cycles completed:** {done} of {requested}")
     if heaps:

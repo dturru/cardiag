@@ -98,6 +98,32 @@ Log "=== cardiag 200-cycle Wi-Fi soak ==="
 Log "output -> $out"
 if ($Resume) { Log "RESUMING into an existing folder; CSV rows will append" }
 
+# ⭐ CONTEXT FOR THE MORNING READ. Whoever opens SUMMARY.md at 8am did not
+# watch this start. A BROWNOUT at cycle 140 means one thing on mains and a
+# completely different thing if the laptop dropped to battery at 3am, so the
+# power state is recorded as evidence, not as a note.
+$bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+$acOnline = if ($bat) { [bool]($bat.BatteryStatus -eq 2) } else { $true }
+$ctx = [ordered]@{
+  started        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  cycles         = $Cycles
+  dwell_s        = $Dwell
+  env            = $Env
+  port           = $Port
+  on_ac_power    = $acOnline
+  battery_pct    = if ($bat) { $bat.EstimatedChargeRemaining } else { "n/a (desktop)" }
+  sleep_ac       = "Never (set by this runner)"
+  can_harness    = "DISCONNECTED (soak is USB-only; SELFTEST is internal loopback)"
+  usb            = "direct laptop port, no hub, cable taped"
+}
+$ctx.GetEnumerator() | ForEach-Object { Log ("  {0,-14} {1}" -f $_.Key, $_.Value) }
+$ctx | ConvertTo-Json | Set-Content -Path (Join-Path $out "run-context.json") -Encoding utf8
+if (-not $acOnline) {
+  Log "!! LAPTOP IS ON BATTERY. An overnight soak will die or brown out."
+  Log "   Plug it in and relaunch. ABORTING."
+  Finish 12 "preflight-battery"
+}
+
 # --- PRE-FLIGHT -------------------------------------------------------------
 Log "--- pre-flight ---"
 
@@ -156,6 +182,59 @@ if ($SkipFlash) {
   Start-Sleep -Seconds 3
 }
 
+# --- 3b. ENTER SELFTEST, AND PROVE IT ---------------------------------------
+# ⚠️ SELFTEST DOES NOT SURVIVE A BOOT, AND THAT IS CORRECT. main.cpp refuses to
+# resume a transmitting mode unattended and forces MODE_LISTEN -- the right
+# guard for a board that wakes up plugged into a car. So the keys have to be
+# sent every time: '3' selects SELFTEST, 'y' confirms within the window.
+#
+# 🔑 And then it is VERIFIED, not assumed. Without this the soak would happily
+# run 200 cycles of Wi-Fi churn in LISTEN with no CAN traffic at all, report a
+# clean PASS, and answer a question nobody asked.
+Log "--- entering SELFTEST + verifying ---"
+$boot = Join-Path $out "boot.log"
+& python (Join-Path $PSScriptRoot 'serial_capture.py') `
+    '--port' $Port '--seconds' '45' '--delay' '20' '--gap' '3' `
+    '--send' '3' '--send' 'y' '--out' $boot '--quiet' 2>&1 |
+  Out-Null
+
+if (-not (Test-Path $boot)) { Log "!! no serial captured. ABORTING."; Finish 9 "selftest-noserial" }
+$bootText = Get-Content $boot -Raw
+
+# (a) production caps, NOT the 10% bench cap. Script-checked, not eyeballed.
+Log "--- asserting PRODUCTION caps (tier A 40%) ---"
+& python (Join-Path $PSScriptRoot 'assert_effective_caps.py') `
+    '--env' $Env '--serial' $boot '--expect' 'FS_TIER_A_MAX_PCT=40' 2>&1 |
+  Tee-Object -FilePath (Join-Path $out "caps.log") -Append |
+  ForEach-Object { Log "  $_" }
+if ($LASTEXITCODE -ne 0) {
+  Log "!! caps are NOT production defaults -- this board may still carry the"
+  Log "   10% bench cap. ABORTING (see caps.log)."
+  Finish 8 "caps-mismatch"
+}
+
+# (b) did it actually enter SELFTEST?
+if ($bootText -match 'Mode:\s*SELFTEST') {
+  Log "SELFTEST confirmed ('Mode: SELFTEST' in boot.log)"
+} else {
+  $m = [regex]::Matches($bootText, 'Mode:\s*(\w+)')
+  $last = if ($m.Count) { $m[$m.Count - 1].Groups[1].Value } else { "<none seen>" }
+  Log "!! board is in '$last', NOT SELFTEST. The 'y' confirm may have missed"
+  Log "   its window. ABORTING -- 200 cycles with no CAN traffic answers"
+  Log "   nothing. See boot.log."
+  Finish 10 "selftest-not-entered"
+}
+
+# (c) is CAN traffic actually flowing? SELFTEST drives TWAI internal loopback,
+# so frames appear on serial. Mode set but no frames = nothing being exercised.
+$frames = ([regex]::Matches($bootText, 'STD 0x[0-9A-Fa-f]{3}')).Count
+if ($frames -lt 10) {
+  Log "!! only $frames CAN frame(s) seen on serial -- SELFTEST is not driving"
+  Log "   the bus. ABORTING. See boot.log."
+  Finish 11 "selftest-no-traffic"
+}
+Log "CAN traffic confirmed: $frames frame(s) in the boot window"
+
 # --- THE SOAK ---------------------------------------------------------------
 # soak_wifi.py writes and fsyncs its CSV EVERY cycle, so a kill at 3am leaves
 # every completed cycle on disk.
@@ -173,7 +252,8 @@ $soakRc = $LASTEXITCODE
 Log "--- writing SUMMARY.md ---"
 & python (Join-Path $PSScriptRoot 'soak_summary.py') `
     '--csv' $csv '--log' (Join-Path $out "soak.log") `
-    '--out' (Join-Path $out "SUMMARY.md") '--requested' $Cycles 2>&1 |
+    '--out' (Join-Path $out "SUMMARY.md") '--requested' $Cycles `
+    '--context' (Join-Path $out "run-context.json") 2>&1 |
   ForEach-Object { Log "  $_" }
 
 Log "read results from: $out"

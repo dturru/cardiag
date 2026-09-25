@@ -95,6 +95,14 @@ def main() -> int:
     ap.add_argument("--serial", required=True,
                     help="serial.log captured for this run")
     ap.add_argument("--ini", default=str(INI))
+    ap.add_argument("--expect", action="append", default=[],
+                    metavar="MACRO=VALUE",
+                    help="Assert this value regardless of what the env sets. "
+                         "Needed for PRODUCTION defaults: esp32-can-x2 passes "
+                         "no -D for them, so without this the check has "
+                         "nothing to compare and passes trivially. The "
+                         "overnight soak must prove it is NOT carrying the "
+                         "10%% test cap.")
     args = ap.parse_args()
 
     serial = Path(args.serial)
@@ -118,6 +126,24 @@ def main() -> int:
     print(f"CAPS ASSERT: board reports -> {line}")
 
     flags = env_dflags(Path(args.ini), args.env)
+    # --expect WINS over the env: it is an explicit statement of what this run
+    # requires, and the case it exists for is an env that sets nothing at all.
+    explicit: set[str] = set()
+    for item in args.expect:
+        if "=" not in item:
+            print(f"CAPS ASSERT: bad --expect '{item}', want MACRO=VALUE")
+            return 2
+        macro, value = item.split("=", 1)
+        if macro not in MACRO_TO_FIELD:
+            print(f"CAPS ASSERT: --expect {macro} is not on the caps line; "
+                  f"known: {', '.join(sorted(MACRO_TO_FIELD))}")
+            return 2
+        flags[macro] = value
+        explicit.add(macro)
+    if explicit:
+        print(f"  asserting explicitly: "
+              f"{', '.join(f'{m}={flags[m]}' for m in sorted(explicit))}")
+
     mismatches: list[str] = []
     checked = 0
     for macro, field in MACRO_TO_FIELD.items():
