@@ -248,3 +248,97 @@ def test_fixtures_record_their_provenance(name):
     fx = load(name)
     assert fx["source_run"].startswith("bench-")
     assert "regenerate" in fx["note"]
+
+
+# --------------------------------------------------------------------------
+# 6. Claim 6 -- every file visible, file count bounded.
+#
+# ⚠️ SYNTHETIC. No run has produced these rows yet: the firmware that reports
+# `max_files` is the 2026-09-25 index fix, and its first hardware run is the
+# preserved-soak-image boot. They are built here, in the open, to pin the
+# three verdicts before that run -- NOT captures, and not to be regenerated
+# into fixtures/. Replace with a make_verdict_fixture.py capture once one
+# exists.
+# --------------------------------------------------------------------------
+
+def _c6_row(t: float, files: int, listed: int | None, *, cap: int = 96,
+            scan_files: int = 0) -> dict:
+    return {"t": t, "files": files, "listed": listed, "max_files": cap,
+            "unhydrated": 0, "scan_files": scan_files,
+            "scan_evicted_for_room": 0, "synthetic": True}
+
+
+def _judge6(rows: list[dict]) -> tuple[int, list[str], str]:
+    w = Watcher(host="127.0.0.1", interval=1.0)
+    w.rows = rows
+    unexercised: list[str] = []
+
+    def ne(claim: str, msg: str) -> None:
+        unexercised.append(claim)
+        print(f"  {msg}")
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        failures = w.judge_claim6(ne)
+    return failures, unexercised, buf.getvalue()
+
+
+def test_claim6_passes_when_an_overfull_disk_drains_to_the_cap():
+    # The preserved soak image: 690 files at boot, drained to 96.
+    rows = [_c6_row(0, 690, 690, scan_files=690), _c6_row(2, 690, 690),
+            _c6_row(4, 400, 400), _c6_row(6, 96, 96), _c6_row(8, 96, 96)]
+    failures, ne, text = _judge6(rows)
+    assert failures == 0 and ne == []
+    assert "PASS" in text
+
+
+def test_claim6_fails_when_a_file_is_on_disk_but_not_listed():
+    # The old bug's signature: the session counts more than the listing shows,
+    # and the count is stable, so it is not a rotation between requests.
+    rows = [_c6_row(0, 120, 96, scan_files=120), _c6_row(2, 120, 96)]
+    failures, _, text = _judge6(rows)
+    assert failures == 1
+    assert "not visible" in text
+
+
+def test_claim6_rotation_between_requests_is_not_a_failure():
+    # files changes between the two session polls: that pair is not stable,
+    # so a listing that differs from it proves nothing either way.
+    rows = [_c6_row(0, 50, 51), _c6_row(2, 51, 51), _c6_row(4, 51, 51)]
+    failures, _, _ = _judge6(rows)
+    assert failures == 0
+
+
+def test_claim6_fails_when_the_count_is_still_over_the_cap_at_the_end():
+    rows = [_c6_row(0, 690, 690, scan_files=690), _c6_row(2, 690, 690)]
+    failures, _, text = _judge6(rows)
+    assert failures == 1
+    assert "not bounding the count" in text
+
+
+def test_claim6_never_over_the_cap_is_not_exercised_not_pass():
+    rows = [_c6_row(0, 10, 10), _c6_row(2, 10, 10)]
+    failures, ne, text = _judge6(rows)
+    assert failures == 0
+    assert ne == ["6"]
+    assert "PASS" not in text
+
+
+def test_claim6_off_by_one_at_the_cap():
+    # Exactly at the cap is bounded; one over at the end is not.
+    at = [_c6_row(0, 97, 97, scan_files=97), _c6_row(2, 96, 96),
+          _c6_row(4, 96, 96)]
+    assert _judge6(at)[0] == 0
+    over = [_c6_row(0, 98, 98, scan_files=98), _c6_row(2, 97, 97),
+            _c6_row(4, 97, 97)]
+    assert _judge6(over)[0] == 1
+
+
+def test_claim6_is_skipped_not_counted_on_firmware_without_max_files():
+    # Captures from before the fix cannot be asked. Counting that as NOT
+    # EXERCISED would turn every older run INCONCLUSIVE for a claim it could
+    # not make -- test_1901_summary_says_pass depends on this staying true.
+    rows = [{"t": 0, "files": 30, "listed": 30, "max_files": None}]
+    failures, ne, text = _judge6(rows)
+    assert failures == 0 and ne == []
+    assert "SKIPPED" in text

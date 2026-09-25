@@ -165,9 +165,18 @@ class Watcher:
             "tier_counters_present": isinstance(st.get("lost_files"), dict),
             "write_errors": st.get("write_errors"),
             "rows_dropped": st.get("rows_dropped"),
+            # Claim 6. Absent (None) on firmware older than the 2026-09-25
+            # index fix, which is how claim 6 knows it cannot be asked.
+            "max_files": st.get("max_files"),
+            "unhydrated": st.get("unhydrated"),
+            "filestore_failed": st.get("filestore_failed"),
+            "scan_files": (st.get("scan") or {}).get("files"),
+            "scan_evicted_for_room": (st.get("scan") or {}).get("evicted_for_room"),
+            # Length of /api/v1/files, taken right AFTER this session poll.
+            # Filled in by run(); the CSV row is written once it is known.
+            "listed": None,
         }
         self.rows.append(row)
-        self._csv_row(row)
         return row
 
     def maybe_ack(self) -> None:
@@ -199,11 +208,11 @@ class Watcher:
             f"[t={t:7.1f}] ACKED through #{self.acked_index} "
             f"({self.ack_after} Tier A files); everything later stays unacked")
 
-    def poll_files(self) -> None:
+    def poll_files(self) -> int | None:
         try:
             files = get(f"{self.base}/api/v1/files")
         except Exception:                             # noqa: BLE001
-            return
+            return None
         now = {f["index"]: f for f in files}
         # ⚠️ REFRESH, do not only insert. A file is first seen as an OPEN .part
         # and only later closes; caching the first sighting left every Tier A
@@ -219,6 +228,7 @@ class Watcher:
             t = self.rows[-1]["t"] if self.rows else 0
             wm = self.rows[-1].get("acked_through") if self.rows else None
             self.record_eviction(t, i, f, wm, self.seen_indices)
+        return len(files)
 
     def record_eviction(self, t: float, i: int, f: dict, wm: int | None,
                         on_disk: dict[int, dict]) -> dict:
@@ -310,7 +320,8 @@ class Watcher:
         while time.monotonic() - self.t0 < seconds:
             row = self.poll()
             if row is not None:
-                self.poll_files()
+                row["listed"] = self.poll_files()
+                self._csv_row(row)
                 self.maybe_ack()
                 self.ingest_row(row, prev)
                 prev = row
@@ -492,8 +503,85 @@ class Watcher:
                   f"did not survive, so 'never reset, including by a format' is "
                   f"not true.")
 
+        failures += self.judge_claim6(ne)
+
         self.failures = failures
         return 1 if failures else 0
+
+    def judge_claim6(self, ne) -> int:
+        """Claim 6: every file on disk is visible, and the file COUNT is bounded.
+
+        🐛 WHY (measured 2026-09-25 on the 200-cycle soak image). The index was
+        a fixed 96-slot table and the scan skipped whatever did not fit: 594 of
+        690 files were on disk and in nobody's view -- not the listing, not
+        retention -- so they were never evicted and the directory only grew.
+        Retention also only ever bounded BYTES, and 690 small files fit.
+
+        Two checks, and they fail differently:
+
+          visible   the listing length equals the session's `files`. Judged
+                    only across STABLE pairs -- two consecutive session polls
+                    with the same count, the listing taken between them --
+                    because a file rotating between the two requests would
+                    otherwise read as a missing one.
+          bounded   `files` ends at or under `max_files`. Only EXERCISED if the
+                    count was ever over the cap (at boot, `scan.files`, or in
+                    any sample): a run that never had too many files says
+                    nothing about whether the cap works.
+
+        Rows from firmware that predates `max_files` cannot be asked, and are
+        skipped WITHOUT counting as NOT EXERCISED -- that would turn every
+        capture before the fix INCONCLUSIVE for a claim it could not make.
+        Returns the number of failures.
+        """
+        print("\nCLAIM 6 -- every file visible, file count bounded:")
+        rows = [r for r in self.rows if r.get("max_files") is not None]
+        if not rows:
+            print("  SKIPPED: the firmware reports no max_files (predates the "
+                  "2026-09-25 index fix), so this cannot be asked of it.")
+            return 0
+
+        cap = int(rows[-1]["max_files"])
+        last = rows[-1]
+        stable = [(a, b) for a, b in zip(rows, rows[1:])
+                  if a.get("listed") is not None and a["files"] == b["files"]]
+        hidden = [a for a, _ in stable if a["listed"] != a["files"]]
+        peak = max(max(int(r["files"] or 0), int(r.get("scan_files") or 0))
+                   for r in rows)
+        room = max(int(r.get("scan_evicted_for_room") or 0) for r in rows)
+        if room:
+            print(f"  note: the index could not grow at boot and evicted "
+                  f"{room} file(s) oldest-first to fit -- accounted as "
+                  f"evictions, not dropped.")
+
+        if hidden:
+            a = hidden[0]
+            print(f"  ** FAIL **: at t={a['t']:.1f} the session said files="
+                  f"{a['files']} (unchanged at the next poll) but the listing "
+                  f"had {a['listed']}. A file is on disk and not visible.")
+            return 1
+        if not stable:
+            ne("6", "NOT EXERCISED: no stable pair of samples to compare the "
+                    "listing against (the file count changed between every "
+                    "poll, or the listing never answered).")
+            return 0
+        if peak <= cap:
+            ne("6", f"NOT EXERCISED as a bound: the count peaked at {peak}, "
+                    f"never over the cap of {cap}. Visibility held on "
+                    f"{len(stable)} stable pair(s). Run against a disk with "
+                    f"more than {cap} files to exercise the cap.")
+            return 0
+        if int(last["files"] or 0) > cap:
+            print(f"  ** FAIL **: {peak} files at peak, and still "
+                  f"{last['files']} at the end of the run against a cap of "
+                  f"{cap}. Retention is not bounding the count (or the run "
+                  f"ended mid-drain -- check unhydrated={last.get('unhydrated')} "
+                  f"and the serial log for eviction lines).")
+            return 1
+        print(f"  PASS: {peak} files at peak, {last['files']} at the end "
+              f"(cap {cap}), and the listing matched the session on all "
+              f"{len(stable)} stable pair(s).")
+        return 0
 
     def write_summary(self, path: str, rc: int, meta: dict) -> None:
         """PASS/FAIL plus the numbers, in a file, separate from the log.
