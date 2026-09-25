@@ -129,14 +129,20 @@
 #endif
 // How long to wait for the hub network before falling back to AP mode.
 #define WIFI_STA_TIMEOUT_MS 8000
-// Retry the hub network on a backoff, so the logger joins when the car gets
-// home: WIFI_STA_BACKOFF_FIRST_MS, doubling after each failed join, capped at
-// WIFI_STA_RETRY_MS (5, 10, 20, 40, 60 s). The schedule restarts on every STA
-// disconnect -- a fresh drop is when the hub is most likely to come back
-// quickly. See retrybackoff.h for why the old one-shot 10 s + fixed 60 s
-// cadence cost ~58 s per rejoin.
-#define WIFI_STA_BACKOFF_FIRST_MS 5000
-#define WIFI_STA_RETRY_MS   60000
+// SCAN, THEN JOIN (scansched.h). On the fallback AP the board scans for the
+// hub's SSID and joins only once a scan has seen it. Every
+// WIFI_SCAN_FAST_MS from the last drop or sighting; every WIFI_SCAN_SLOW_MS
+// once WIFI_SCAN_SLOW_AFTER_MS have passed without one. A probe-and-backoff
+// schedule (5/10/20/40/60 s) still joined blind before the hotspot's AP was
+// up: 1.7 failed joins per soak cycle, each costing the AP ~10 s.
+#define WIFI_SCAN_FAST_MS        4000
+#define WIFI_SCAN_SLOW_MS        30000
+#define WIFI_SCAN_SLOW_AFTER_MS  120000
+// Active dwell per channel. One channel (the hub's last) is ~100 ms off the
+// AP's channel; a full sweep (every WIFI_SCAN_FULL_EVERY scans, or while the
+// channel is unknown) ~1.3 s.
+#define WIFI_SCAN_MS_PER_CHAN    100
+#define WIFI_SCAN_FULL_EVERY     4
 
 // Shared token for the mutating /api/v1 endpoints. Protocol v1 2.4.
 // Override in secrets.h. A default this obvious is intentional: it should look

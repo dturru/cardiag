@@ -48,6 +48,9 @@ struct HubLinkStats {
   uint32_t lastFallbackMs;  // how long drop -> AP serving took, ms
   uint32_t worstFallbackMs; // worst of the above this boot
   uint32_t lastLinkUpMs;    // how long the last STA link stayed up, ms
+  uint32_t scans;           // scans completed while on the fallback AP
+  uint32_t sightings;       // scans in which the hub's SSID appeared
+  uint32_t scanFails;       // scans that could not start or finish
 };
 
 const HubLinkStats *hublinkStats();

@@ -224,6 +224,31 @@ def judge_fs_sub(rows: list[dict]) -> dict | None:
     return {"worst": best, "stage_counts": stages}
 
 
+def judge_joins(rows: list[dict]) -> dict | None:
+    """Failed joins over the run, from the cumulative joinfail= counter.
+    REPORTED, not failed on. With scan-then-join a join is only attempted
+    after a scan has seen the hub, so this should be near zero; the baseline
+    probe-and-backoff firmware averaged 1.7 per cycle."""
+    vals = [(num(r.get("join_fail")), num(r.get("reboot"))) for r in rows]
+    if not any(v is not None for v, _ in vals):
+        return None
+    failed, prev = 0, None
+    for v, reboot in vals:
+        if v is None:
+            continue
+        if prev is not None and v >= prev and not reboot:
+            failed += v - prev
+        elif prev is None or reboot or v < prev:
+            failed += 0 if prev is None else v   # counter restarted at boot
+        prev = v
+    seen = [num(r.get("scan_seen")) for r in rows if num(r.get("scan_seen")) is not None]
+    scans = [num(r.get("scans")) for r in rows if num(r.get("scans")) is not None]
+    return {"failed_joins": failed, "cycles": len(rows),
+            "per_cycle": failed / len(rows) if rows else 0.0,
+            "scans_last": scans[-1] if scans else None,
+            "seen_last": seen[-1] if seen else None}
+
+
 def judge(rows: list[dict], *, requested: int = 0,
           mode: str = "SELFTEST") -> dict:
     """THE soak verdict. Everything that reports one calls this."""
@@ -290,7 +315,8 @@ def judge(rows: list[dict], *, requested: int = 0,
     return {"verdict": verdict, "fails": fails, "done": done,
             "requested": requested, "partial": partial, "heap": heap,
             "loop": loop, "reboots": reboots, "bus_idle_closes": idle,
-            "panics": panics, "can_drops": drops, "fs_sub": judge_fs_sub(rows)}
+            "panics": panics, "can_drops": drops, "fs_sub": judge_fs_sub(rows),
+            "joins": judge_joins(rows)}
 
 
 def read_rows(csv_path) -> list[dict]:
@@ -392,6 +418,13 @@ def main(argv=None) -> int:
     cd = j["can_drops"]
     L.append("- **CAN drops:** " + ("not reported" if cd is None else
              ", ".join(f"{k.removeprefix('can_')}={v}" for k, v in cd.items())))
+    jn = j["joins"]
+    if jn is not None:
+        L.append(f"- **failed joins:** {jn['failed_joins']} over {jn['cycles']} "
+                 f"cycles ({jn['per_cycle']:.2f}/cycle; scan-then-join should "
+                 f"keep this near 0)" + (
+                     f"; scans {jn['scans_last']}, hub seen {jn['seen_last']} "
+                     f"(since last boot)" if jn["scans_last"] is not None else ""))
     bi = j["bus_idle_closes"]
     L.append("- **bus-idle closes:** " + ("not counted" if bi is None
                                          else str(bi)))
