@@ -259,6 +259,14 @@ uint32_t filestoreBusQuietMs();
 
 const FileStoreStats *filestoreStats();
 
+// Where the tick's time goes (fsprof.h): the worst sub-stage of any one
+// filestoreLoop() pass. which = 0 for the /api/v1/session window, 1 for the
+// hublink stats line; taking a window resets it. filestoreSubBoot() is since
+// boot and never resets.
+#include "fsprof.h"
+FsSubWindow filestoreTakeSubWindow(uint8_t which);
+FsSubWindow filestoreSubBoot();
+
 // Percent of the partition in use, 0-100.
 uint8_t filestoreUsagePct();
 

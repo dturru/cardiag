@@ -5,6 +5,8 @@
 #include "hublink.h"
 #include "webui.h"
 #include "looptime.h"
+#include "candrops.h"
+#include "filestore.h"
 #include "config.h"
 #include "secrets.h"
 
@@ -64,6 +66,8 @@ static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
 void hublinkPrintStats(const char *what) {
   const HubLinkStats &s = g_stats;
   const LoopStats win = cardiagLoopTakeWindow(LOOP_WIN_LOG);
+  const FsSubWindow fsw = filestoreTakeSubWindow(1);
+  const CanDrops drops = cardiagCanDrops();
   const char *bootStage = cardiagLoopStats()->maxStage;
   Serial.printf("[hublink] %s state=%s joins=%lu drops=%lu(evt=%lu poll=%lu) "
                 "joinfail=%lu apstarts=%lu reason=%u fallback=%lums "
@@ -79,7 +83,13 @@ void hublinkPrintStats(const char *what) {
                 // Max pass since the PREVIOUS stats line, which this line
                 // resets. The soak takes the max of these per cycle, so a
                 // cycle's loop max is that cycle's, not the whole boot's.
-                "loopwin=%luus loopwinstage=%s\n",
+                "loopwin=%luus loopwinstage=%s "
+                // Worst filestore sub-stage (fsprof.h) since the previous
+                // stats line, and the whole tick in that pass.
+                "fswin=%luus fswinstage=%s fswinpass=%luus "
+                // Frames lost before the file (candrops.h). Any non-zero
+                // fails the soak.
+                "canmiss=%lu canovr=%lu chgdrop=%lu idovf=%lu\n",
                 what, hublinkStateName(),
                 (unsigned long)s.staJoins, (unsigned long)s.staDrops,
                 (unsigned long)s.eventDrops, (unsigned long)s.pollDrops,
@@ -93,7 +103,13 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)cardiagLoopStats()->maxUs,
                 (bootStage && *bootStage) ? bootStage : "-",
                 (unsigned long)win.maxUs,
-                (win.maxStage && *win.maxStage) ? win.maxStage : "-");
+                (win.maxStage && *win.maxStage) ? win.maxStage : "-",
+                (unsigned long)fsw.worstUs,
+                fsw.worstUs ? fsSubName(fsw.worstSub) : "-",
+                (unsigned long)fsw.passUs,
+                (unsigned long)drops.rxMissed, (unsigned long)drops.rxOverrun,
+                (unsigned long)drops.changelogDropped,
+                (unsigned long)drops.idOverflow);
 }
 
 // ---------------------------------------------------------------------------

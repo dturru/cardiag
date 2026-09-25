@@ -6,6 +6,7 @@
 #include "hubapi.h"
 #include "hubproto.h"
 #include "looptime.h"
+#include "candrops.h"
 #include "hublink.h"
 #include "hubstream.h"
 #include "filestore.h"
@@ -68,7 +69,12 @@ static void handleSession(WebServer &srv) {
   // 2560 -> 3072 (2026-09-25): safe mode and the boot-scan block add ~300
   // bytes, which took the worst case to ~2.1 kB of 2.5. Same reasoning as
   // above: another half-kB on an 8 kB loop stack is not the constraint.
-  char buf[3072];
+  //
+  // 3072 -> 3584 (2026-09-25): loop.interval, fs_tick and can_drops add ~380
+  // bytes, which would leave the worst case within ~300 B of the edge. Same
+  // reasoning again: half a kB more on the loop task's stack is not the
+  // constraint, and jsonAppend() truncates rather than overflowing.
+  char buf[3584];
   int n = jsonAppend(buf, sizeof(buf), 0,
       "{\"proto\":%d,"
       "\"device_id\":%lu,"
@@ -148,6 +154,33 @@ static void handleSession(WebServer &srv) {
         (unsigned long)iv.maxUs, iv.maxStage ? iv.maxStage : "",
         (unsigned long)iv.maxStageUs, (unsigned long)iv.passes,
         (unsigned long)iv.over100ms);
+  }
+
+  // Where the filestore tick spends its time (fsprof.h): the worst EXCLUSIVE
+  // sub-stage of any single pass, since the previous session read (this read
+  // resets it) and since boot. `pass_us` is the whole tick in that pass.
+  {
+    const FsSubWindow iv = filestoreTakeSubWindow(0);
+    const FsSubWindow bt = filestoreSubBoot();
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"fs_tick\":{\"interval\":{\"worst_stage\":\"%s\",\"worst_us\":%lu,"
+        "\"pass_us\":%lu},\"boot\":{\"worst_stage\":\"%s\",\"worst_us\":%lu,"
+        "\"pass_us\":%lu}},",
+        iv.worstUs ? fsSubName(iv.worstSub) : "", (unsigned long)iv.worstUs,
+        (unsigned long)iv.passUs,
+        bt.worstUs ? fsSubName(bt.worstSub) : "", (unsigned long)bt.worstUs,
+        (unsigned long)bt.passUs);
+  }
+
+  // Every place a received frame can be lost before the file (candrops.h).
+  {
+    const CanDrops d = cardiagCanDrops();
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"can_drops\":{\"twai_up\":%s,\"rx_missed\":%lu,\"rx_overrun\":%lu,"
+        "\"changelog_dropped\":%lu,\"id_overflow\":%lu},",
+        d.twaiUp ? "true" : "false", (unsigned long)d.rxMissed,
+        (unsigned long)d.rxOverrun, (unsigned long)d.changelogDropped,
+        (unsigned long)d.idOverflow);
   }
 
   // Stream counters. The hub counts datagrams it RECEIVED; these are what the

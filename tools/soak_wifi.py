@@ -98,6 +98,10 @@ RE_LOOPMAX = re.compile(r"loopmax=(\d+)us(?: loopstage=(\S+))?")
 RE_LOOPWIN = re.compile(r"loopwin=(\d+)us loopwinstage=(\S+)")
 # The clean key-off close. In SELFTEST the bus is the board's own loopback and
 # never goes quiet, so every one of these is false (soak_summary.py fails it).
+# Worst filestore sub-stage since the previous stats line (fsprof.h).
+RE_FSWIN = re.compile(r"fswin=(\d+)us fswinstage=(\S+) fswinpass=(\d+)us")
+# Frames lost before the file (candrops.h). Counters since boot / driver start.
+RE_DROPS = re.compile(r"canmiss=(\d+) canovr=(\d+) chgdrop=(\d+) idovf=(\d+)")
 RE_BUSIDLE = re.compile(r"\[fs\] bus idle \d+ms -> closed all files")
 RE_PANIC = re.compile(r"(Guru Meditation|abort\(\) was called|StoreProhibited|"
                       r"LoadProhibited|assert failed)")
@@ -141,13 +145,24 @@ class Cycle:
     loop_cycle_stage: str = ""
     bus_idle_closes: int = 0
     panics: int = 0
+    # Worst filestore sub-stage in this cycle, and the tick it was in.
+    fs_sub_max_us: int | None = None
+    fs_sub_stage: str = ""
+    fs_pass_us: int | None = None
+    # Highest value of each drop counter seen this cycle. None = not reported.
+    can_rx_missed: int | None = None
+    can_rx_overrun: int | None = None
+    can_chg_dropped: int | None = None
+    can_id_overflow: int | None = None
 
 
 CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
               "reason", "heap", "minheap", "largest_block", "netstack_12308",
               "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
               "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes",
-              "panics"]
+              "panics", "fs_sub_max_us", "fs_sub_stage", "fs_pass_us",
+              "can_rx_missed", "can_rx_overrun", "can_chg_dropped",
+              "can_id_overflow"]
 
 
 def csv_path(args) -> str:
@@ -186,7 +201,11 @@ def write_cycle_row(args, c) -> None:
                     c.loop_max_us if c.loop_max_us is not None else "",
                     c.loop_max_stage,
                     c.loop_cycle_max_us if c.loop_cycle_max_us is not None else "",
-                    c.loop_cycle_stage, c.bus_idle_closes, c.panics])
+                    c.loop_cycle_stage, c.bus_idle_closes, c.panics,
+                    *("" if v is None else v for v in (
+                        c.fs_sub_max_us, c.fs_sub_stage or None, c.fs_pass_us,
+                        c.can_rx_missed, c.can_rx_overrun,
+                        c.can_chg_dropped, c.can_id_overflow))])
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -345,6 +364,20 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
             cyc.loop_max_us = int(m.group(1))
             if m.group(2) and m.group(2) != "-":
                 cyc.loop_max_stage = m.group(2)
+        m = RE_FSWIN.search(ln.text)
+        if m:
+            us = int(m.group(1))
+            if cyc.fs_sub_max_us is None or us > cyc.fs_sub_max_us:
+                cyc.fs_sub_max_us = us
+                cyc.fs_sub_stage = "" if m.group(2) == "-" else m.group(2)
+                cyc.fs_pass_us = int(m.group(3))
+        m = RE_DROPS.search(ln.text)
+        if m:
+            for attr, v in zip(("can_rx_missed", "can_rx_overrun",
+                                "can_chg_dropped", "can_id_overflow"),
+                               m.groups()):
+                cur = getattr(cyc, attr)
+                setattr(cyc, attr, int(v) if cur is None else max(cur, int(v)))
         m = RE_LOOPWIN.search(ln.text)
         if m:
             us = int(m.group(1))

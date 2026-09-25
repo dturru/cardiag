@@ -27,6 +27,10 @@ It judges the two things the soak exists to answer:
                 SELFTEST's bus is the board's own loopback and never goes
                 quiet, so a key-off close there is always a false one.
   PANICS        FAIL on any panic/assert line the harness counted.
+  CAN DROPS     FAIL on any frame lost before the file: TWAI RX queue full
+                (rx_missed), RX FIFO overrun, change-log ring full, sniffer
+                id table full (candrops.h). A logger that drops frames under a
+                bench load cannot be trusted with a car's.
 
 ⭐ THIS IS THE ONLY PLACE A SOAK VERDICT IS DECIDED. `judge()` below is called
 by this script (SUMMARY.md + verdict.json), by soak_wifi.py for the VERDICT
@@ -202,6 +206,24 @@ def judge_loop(rows: list[dict]) -> dict:
     return {"worst": worst, "over": over, "fails": fails}
 
 
+def judge_fs_sub(rows: list[dict]) -> dict | None:
+    """Worst filestore sub-stage over the run. REPORTED, not failed on: the
+    loop check above is the verdict; this says where the time went."""
+    best = None
+    stages: dict[str, int] = {}
+    for r in rows:
+        us = num(r.get("fs_sub_max_us"))
+        if us is None:
+            continue
+        st = (r.get("fs_sub_stage") or "").strip() or "?"
+        stages[st] = stages.get(st, 0) + 1
+        if best is None or us > best[0]:
+            best = (us, r.get("cycle", "?"), st, num(r.get("fs_pass_us")))
+    if best is None:
+        return None
+    return {"worst": best, "stage_counts": stages}
+
+
 def judge(rows: list[dict], *, requested: int = 0,
           mode: str = "SELFTEST") -> dict:
     """THE soak verdict. Everything that reports one calls this."""
@@ -234,6 +256,27 @@ def judge(rows: list[dict], *, requested: int = 0,
         fails.append("bus-idle closes not counted (no bus_idle_closes column): "
                      "cannot be judged, so it is not passed")
 
+    DROP_COLS = {"can_rx_missed": "TWAI RX queue full (rx_missed)",
+                 "can_rx_overrun": "TWAI RX FIFO overrun",
+                 "can_chg_dropped": "change-log ring full",
+                 "can_id_overflow": "sniffer id table full"}
+    drops: dict[str, int] | None = None
+    if rows and any((r.get(c) or "").strip() for r in rows for c in DROP_COLS):
+        drops = {}
+        for col, what in DROP_COLS.items():
+            vals = [num(r.get(col)) for r in rows]
+            vals = [v for v in vals if v is not None]
+            worst = max(vals) if vals else 0
+            drops[col] = worst
+            if worst:
+                first = next(r.get("cycle", "?") for r in rows
+                             if (num(r.get(col)) or 0) > 0)
+                fails.append(f"CAN drops: {worst} {what} (first at cycle "
+                             f"{first})")
+    elif rows:
+        fails.append("CAN drop counters not reported (no can_* columns): "
+                     "cannot be judged, so it is not passed")
+
     panics = sum(num(r.get("panics")) or 0 for r in rows)
     if panics:
         fails.append(f"{panics} panic/assert line(s)")
@@ -247,7 +290,7 @@ def judge(rows: list[dict], *, requested: int = 0,
     return {"verdict": verdict, "fails": fails, "done": done,
             "requested": requested, "partial": partial, "heap": heap,
             "loop": loop, "reboots": reboots, "bus_idle_closes": idle,
-            "panics": panics}
+            "panics": panics, "can_drops": drops, "fs_sub": judge_fs_sub(rows)}
 
 
 def read_rows(csv_path) -> list[dict]:
@@ -334,6 +377,21 @@ def main(argv=None) -> int:
     L.append("- **worst loop() pass:** " + (
         f"{w[0] / 1000:.1f} ms at cycle {w[1]} (stage `{w[2]}`)" if w
         else "not reported"))
+    fsub = j["fs_sub"]
+    if fsub:
+        us, cyc, st, pass_us = fsub["worst"]
+        counts = ", ".join(f"{k} x{v}" for k, v in
+                           sorted(fsub["stage_counts"].items(),
+                                  key=lambda kv: -kv[1]))
+        L.append(f"- **worst filestore sub-stage:** `{st}` {us / 1000:.1f} ms "
+                 f"at cycle {cyc}" + (f" (whole tick {pass_us / 1000:.1f} ms)"
+                                      if pass_us else "")
+                 + f"; worst stage per cycle: {counts}")
+    else:
+        L.append("- **worst filestore sub-stage:** not reported")
+    cd = j["can_drops"]
+    L.append("- **CAN drops:** " + ("not reported" if cd is None else
+             ", ".join(f"{k.removeprefix('can_')}={v}" for k, v in cd.items())))
     bi = j["bus_idle_closes"]
     L.append("- **bus-idle closes:** " + ("not counted" if bi is None
                                          else str(bi)))

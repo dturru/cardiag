@@ -32,6 +32,7 @@ static inline void wdtFeedIfArmed() {
 
 #include "filestore.h"
 #include "busidle.h"
+#include "fsprof.h"
 #include <atomic>
 #include "fsindex.h"
 #include "bootguard_rt.h"
@@ -123,6 +124,18 @@ static std::atomic<uint32_t> g_lastBusMs{0};
 static std::atomic<bool> g_idleClosed{false};
 static RecCsvCursor g_chgCursor = {0, false};
 
+// Sub-stage profile of the tick (fsprof.h). Only filestoreLoop() opens a
+// pass, so the same code reached from a web handler is not counted here.
+static FsProf g_prof = {};
+static FsSubWindow g_subWin[2] = {};    // [0] session, [1] stats line
+static FsSubWindow g_subBoot = {};      // since boot, never reset
+
+struct FsSubScope {
+  explicit FsSubScope(uint8_t s) { fsProfEnter(&g_prof, s, micros()); }
+  ~FsSubScope() { fsProfExit(&g_prof, micros()); }
+};
+#define FS_SUB(s) FsSubScope fsSubScope_(s)
+
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------
@@ -188,6 +201,7 @@ static void recomputeUsage(bool withFsTotals = true) {
     }
   }
   if (!withFsTotals) return;
+  FS_SUB(FS_SUB_FSSIZE);
   g_st.usedBytes = LittleFS.usedBytes();
   g_st.totalBytes = LittleFS.totalBytes();
 }
@@ -268,6 +282,7 @@ static bool readMeta(FileEntry *e) {
 // count). A .part costs a stat, plus one read of the header for Tier B.
 static void hydrate(FileEntry *e) {
   if (e->hydrated) return;
+  FS_SUB(FS_SUB_HYDRATE);
   e->mode = FS_MODE_UNKNOWN;
   bool haveBytes = false;
   if (e->closed) haveBytes = readMeta(e);
@@ -450,13 +465,17 @@ static void retRemove(void *, const FsEntry *e, bool acked) {
   wdtFeedIfArmed();
 }
 
-static uint32_t retUsed(void *) { return LittleFS.usedBytes(); }
+static uint32_t retUsed(void *) {
+  FS_SUB(FS_SUB_FSSIZE);
+  return LittleFS.usedBytes();
+}
 
 // Protocol 2.3, plus the file-count cap. `reserve` keeps slots free for files
 // about to be opened. Evicts at most FS_EVICT_PER_PASS files per call; a
 // backlog (the soak image: ~600 files over the cap) drains across loop()
 // passes instead of in one call that holds the web server and the UDP stream.
 static void enforceRetention(uint16_t reserve = 0) {
+  FS_SUB(FS_SUB_RETENTION);
   recomputeUsage();
   const uint32_t total = usableBytes();
   const FsRetentionCfg cfg = {
@@ -500,6 +519,7 @@ static uint32_t nextIndex() {
 // nullptr only if every other entry is active, which two writers cannot
 // produce against a cap of FS_MAX_FILES.
 static FileEntry *trackEntry(const FileEntry &in) {
+  FS_SUB(FS_SUB_ROTATE);
   FileEntry ev;
   bool did = false;
   FileEntry *e = fsTableAddOrEvict(&g_tab, &in, &ev, &did);
@@ -514,6 +534,7 @@ static FileEntry *trackEntry(const FileEntry &in) {
 
 static void closeActive(Active &a) {
   if (!a.open) return;
+  FS_SUB(FS_SUB_ROTATE);
   a.fh.flush();
   a.fh.close();
   a.open = false;
@@ -565,6 +586,7 @@ static void closeActive(Active &a) {
 }
 
 static bool openActive(Active &a, char kind) {
+  FS_SUB(FS_SUB_ROTATE);
   // Reserve one slot, so the file about to be opened cannot take the count
   // back over FS_MAX_FILES.
   enforceRetention(/*reserve=*/1);
@@ -648,6 +670,7 @@ static bool writeActive(Active &a, const uint8_t *data, size_t len) {
 static void flushDue(Active &a, uint32_t now) {
   if (!a.open) return;
   if ((uint32_t)(now - a.lastFlushMs) < FS_FLUSH_INTERVAL_MS) return;
+  FS_SUB(FS_SUB_FLUSH);
   a.fh.flush();
   a.lastFlushMs = now;
 }
@@ -683,6 +706,7 @@ void filestoreCloseActive() {
 // ---------------------------------------------------------------------------
 
 static void writeSnapshotBlock() {
+  FS_SUB(FS_SUB_SNAPSHOT);
   static SnifferRow rows[SNIFF_MAX_IDS];
   // sinceMs 0 = every known id, changed or not. A snapshot is a LATEST-VALUE
   // record: an id that stopped updating is a fact worth keeping, and omitting
@@ -727,6 +751,7 @@ static void writeSnapshotBlock() {
 }
 
 static void drainChangeLog() {
+  FS_SUB(FS_SUB_CHANGELOG);
   // recorderClear() (the 'k' key, and /api/rec) empties the log under us. The
   // cursor would then sit past the end forever and the drain would silently
   // stop, which looks exactly like "nothing is changing on the bus".
@@ -914,9 +939,30 @@ void filestoreSetMode(uint8_t mode) {
   g_mode = mode;
 }
 
+static void filestoreTick();
+
 void filestoreLoop() {
   if (!g_st.mounted || !g_enabled) return;
+  const uint32_t t0 = micros();
+  fsProfBeginPass(&g_prof);
+  filestoreTick();
+  uint32_t worstUs = 0;
+  const uint8_t worst = fsProfEndPass(&g_prof, &worstUs);
+  const uint32_t passUs = micros() - t0;
+  fsSubWindowNote(&g_subWin[0], worst, worstUs, passUs);
+  fsSubWindowNote(&g_subWin[1], worst, worstUs, passUs);
+  fsSubWindowNote(&g_subBoot, worst, worstUs, passUs);
+}
 
+FsSubWindow filestoreTakeSubWindow(uint8_t which) {
+  const FsSubWindow w = g_subWin[which & 1];
+  g_subWin[which & 1] = FsSubWindow{};
+  return w;
+}
+
+FsSubWindow filestoreSubBoot() { return g_subBoot; }
+
+static void filestoreTick() {
   const uint32_t now = millis();
   if ((int32_t)(now - g_nextSnapMs) >= 0) {
     g_nextSnapMs = now + FS_SNAPSHOT_PERIOD_MS;
