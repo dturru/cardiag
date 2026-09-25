@@ -1,5 +1,35 @@
 # Handoff — next session
 
+## §0-BRICK — 2026-09-25, board slow-boot root-caused (LOCAL NOTE, uncommitted)
+
+📂 **Preserved failing image: `analysis/brick-2026-09-25-0748/`** — `README.md`
+has provenance + SHA-256 for both 8 MB reads (they differ only in 29 NVS bytes =
+`boot_id`; **the spiffs partition is byte-identical**). Also holds `firmware.elf`
+(the binary that was running), `spiffs.bin` and `fstrace.log`. **Gitignored —
+local to this machine only.**
+
+**Not a hang: a 187 s boot.** Root cause is two defects that compound:
+1. **`scanDir()` is O(n²)** — `openNextFile()` constructs a `VFSFileImpl`, which
+   *opens* the file (`vfs_api.cpp:481`), so it is one real open per directory
+   entry. Measured `t = k·n²`, k≈0.09–0.11; 1,376 entries → **174 s** in the
+   scan loop alone.
+2. **Silent drops past `FS_MAX_FILES=96`** (`config.h:303`) — `addEntry()`
+   returns `nullptr` and `scanDir()` just `continue`s. **594 of 690 non-meta
+   files were dropped**, so they are invisible to `g_files`, therefore to
+   `evictOne()`/`enforceRetention()`, and **can never be evicted**.
+
+⇒ Ratchet: files accumulate → retention cannot see them → directory grows →
+boot time grows quadratically (2,752 entries ≈ 11.6 min). **The watchdog cannot
+catch it** — armed at 186.7 s, after this work.
+
+⚠️ Last night's retention PASS ran from a **clean** partition, so table overflow
+was never exercised. The claims stand for the state tested.
+
+🔧 **Fix is in cloud PR `cardiag#1` — AWAITING HARDWARE VERIFICATION.** Verify
+attended: `git fetch`, check out the PR branch, build, `-t upload` **only**
+(never `-t erase`/`uploadfs` — the failing partition is the test fixture), then
+confirm this same board boots normally with the data partition untouched.
+
 ## ▶ §0-START HERE — 2026-09-24 overnight soak
 
 📂 **READ `analysis/soak-2026-09-24-2251/SUMMARY.md` AND `DONE` FIRST.**
