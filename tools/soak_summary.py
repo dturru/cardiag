@@ -9,9 +9,15 @@ saying exactly how far it got and what the data so far shows.
 
 It judges the two things the soak exists to answer:
 
-  HEAP FLAT     free-heap slope across cycles, and min-free-heap, which only
-                ever falls and is NOT restored by a reboot -- so it is the
-                honest leak signal when a reboot happened.
+  HEAP FLAT     judged PER BOOT SEGMENT. The leak signal is the trend of
+                current free heap and of the largest free block within each
+                segment. min-free-heap is reported as HEADROOM only.
+
+                ❌ An earlier version claimed min free heap "only ever falls
+                and is NOT restored by a reboot". That is false: it is
+                esp_get_minimum_free_heap_size(), a PER-BOOT low-water mark
+                that starts again at every reset. Comparing it across a reboot
+                compares two different boots.
   ZERO REBOOTS  and, for each one, WHY. "3 reboots" is not a finding.
                 "3 BROWNOUTs" (the supply sagged) and "3 TASK_WDTs" (our code
                 hung) are different findings with different fixes.
@@ -57,7 +63,72 @@ def slope(ys: list[int]) -> float:
     return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
 
 
-def main() -> int:
+# Slope thresholds, bytes per cycle, applied inside a segment. -64 B/cycle is
+# the existing free-heap threshold; the largest block uses the same one, since
+# a fragmenting heap fails an allocation with free heap to spare.
+HEAP_SLOPE_FAIL = -64.0
+MIN_SEGMENT_ROWS = 10
+
+
+def segments(rows: list[dict]) -> list[list[dict]]:
+    """Split the per-cycle rows at every reboot.
+
+    🔑 THE BOUNDARY. A row with reboot=1 is the cycle IN WHICH the board reset.
+    Its heap columns are the last stats line seen in that cycle's window, which
+    may be from before the reset or from the fresh boot -- the CSV cannot say
+    which. So that row belongs to NEITHER segment, and the next segment starts
+    at the FIRST POST-BOOT ROW: the one after it. Putting it on either side
+    would splice a value from one boot into a trend of the other.
+    """
+    segs: list[list[dict]] = [[]]
+    for r in rows:
+        if num(r.get("reboot")):
+            if segs[-1]:
+                segs.append([])
+            continue
+        segs[-1].append(r)
+    return [s for s in segs if s]
+
+
+def judge_heap(rows: list[dict]) -> dict:
+    """Leak metric per segment: slope of free heap and of the largest block.
+
+    Returned as data so the tests pin it without parsing Markdown.
+    """
+    out = {"segments": [], "fails": []}
+    for i, seg in enumerate(segments(rows), 1):
+        heaps = [h for h in (num(r.get("heap")) for r in seg) if h is not None]
+        larges = [v for v in (num(r.get("largest_block")) for r in seg)
+                  if v is not None]
+        mins = [m for m in (num(r.get("minheap")) for r in seg) if m is not None]
+        d = {
+            "n": i,
+            "rows": len(seg),
+            "first_cycle": seg[0].get("cycle"),
+            "last_cycle": seg[-1].get("cycle"),
+            "heap_first": heaps[0] if heaps else None,
+            "heap_last": heaps[-1] if heaps else None,
+            "heap_slope": slope(heaps) if len(heaps) >= 2 else None,
+            "largest_slope": slope(larges) if len(larges) >= 2 else None,
+            # HEADROOM, not a leak signal: the lowest free heap this boot ever
+            # reached. Worth knowing how close it came; meaningless across boots.
+            "min_free": min(mins) if mins else None,
+        }
+        out["segments"].append(d)
+        if len(heaps) >= MIN_SEGMENT_ROWS and d["heap_slope"] < HEAP_SLOPE_FAIL:
+            out["fails"].append(
+                f"segment {i} (cycles {d['first_cycle']}-{d['last_cycle']}): "
+                f"free heap trending down {d['heap_slope']:+.0f} B/cycle")
+        if (len(larges) >= MIN_SEGMENT_ROWS
+                and d["largest_slope"] < HEAP_SLOPE_FAIL):
+            out["fails"].append(
+                f"segment {i} (cycles {d['first_cycle']}-{d['last_cycle']}): "
+                f"largest free block trending down {d['largest_slope']:+.0f} "
+                f"B/cycle -- fragmentation")
+    return out
+
+
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--log", default=None)
@@ -66,7 +137,7 @@ def main() -> int:
     ap.add_argument("--context", default=None,
                     help="run-context.json -- start time and power state, so "
                          "the morning read has context it did not witness")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     path = Path(args.csv)
     rows: list[dict] = []
@@ -78,10 +149,7 @@ def main() -> int:
     requested = args.requested or done
     partial = done < requested
 
-    heaps = [num(r.get("heap")) for r in rows]
-    heaps = [h for h in heaps if h is not None]
-    mins = [num(r.get("minheap")) for r in rows]
-    mins = [m for m in mins if m is not None]
+    heap = judge_heap(rows)
     reboots = [r for r in rows if num(r.get("reboot"))]
     netstack = sum(num(r.get("netstack_12308")) or 0 for r in rows)
 
@@ -90,13 +158,7 @@ def main() -> int:
         reasons.setdefault(r.get("reset_reason") or "UNREPORTED",
                            []).append(r.get("cycle", "?"))
 
-    fails: list[str] = []
-    heap_slope = slope(heaps) if len(heaps) >= 2 else 0.0
-    if len(heaps) >= 10 and heap_slope < -64:
-        fails.append(f"free heap trending down {heap_slope:+.0f} B/cycle")
-    min_drop = (mins[0] - mins[-1]) if len(mins) >= 2 else 0
-    if min_drop > 4096:
-        fails.append(f"min free heap fell {min_drop} B across the run")
+    fails: list[str] = list(heap["fails"])
     if reboots:
         fails.append(f"{len(reboots)} reboot(s)")
 
@@ -136,15 +198,32 @@ def main() -> int:
             L.append("")
 
     L.append(f"- **cycles completed:** {done} of {requested}")
-    if heaps:
-        L.append(f"- **free heap:** {heaps[0]} -> {heaps[-1]} B "
-                 f"(slope {heap_slope:+.1f} B/cycle)")
-    if mins:
-        L.append(f"- **min free heap:** {mins[0]} -> {mins[-1]} B "
-                 f"({-min_drop:+d}) — never restored by a reboot, so this is "
-                 f"the honest leak signal")
     L.append(f"- **reboots:** {len(reboots)}")
     L.append(f"- **netstack 12308 events:** {netstack}")
+
+    # Heap, PER BOOT SEGMENT. A reset restores free heap and restarts the
+    # min-free low-water mark, so a trend is only meaningful inside one boot.
+    if heap["segments"]:
+        L.append("\n## Heap, per boot segment\n")
+        L.append("_Leak signal: the trend of free heap and of the largest free "
+                 "block inside a segment. **min free** is headroom — the lowest "
+                 "this boot reached — and restarts at every reset, so it is "
+                 "never compared across segments. A reboot row belongs to "
+                 "neither side; each segment starts at the first post-boot "
+                 "row._\n")
+        L.append("| Segment | Cycles | Rows | Free heap | Slope | Largest-block slope | Min free (headroom) |")
+        L.append("|---|---|---|---|---|---|---|")
+        for d in heap["segments"]:
+            hs = "—" if d["heap_slope"] is None else f"{d['heap_slope']:+.1f} B/cyc"
+            ls = "—" if d["largest_slope"] is None else f"{d['largest_slope']:+.1f} B/cyc"
+            L.append(f"| {d['n']} | {d['first_cycle']}–{d['last_cycle']} | "
+                     f"{d['rows']} | {d['heap_first']} → {d['heap_last']} | "
+                     f"{hs} | {ls} | {d['min_free']} |")
+        short = [d for d in heap["segments"] if d["rows"] < MIN_SEGMENT_ROWS]
+        if short:
+            L.append(f"\n> ℹ️ {len(short)} segment(s) under "
+                     f"{MIN_SEGMENT_ROWS} rows: slope shown, not judged.")
+        L.append("")
 
     # ⭐ NEGATIVE detect_ms IS EXPECTED, AND SAYING SO HERE IS THE POINT.
     # detect_ms is measured from the RETURN of Windows' hotspot-stop call, not

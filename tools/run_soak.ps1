@@ -271,9 +271,11 @@ Log "CAN traffic confirmed: $frames frame(s) in the boot window"
 # every completed cycle on disk.
 Log "--- soak: $Cycles cycles, dwell ${Dwell}s ---"
 Log "    per-cycle CSV flushes as it goes; safe to kill"
+Log "    raw serial -> serial-raw.log, every line host-timestamped and fsynced"
 $csv = Join-Path $out "soak.csv"
 & python (Join-Path $PSScriptRoot 'soak_wifi.py') `
-    '--port' $Port '--cycles' $Cycles '--dwell' $Dwell '--csv' $csv 2>&1 |
+    '--port' $Port '--cycles' $Cycles '--dwell' $Dwell '--csv' $csv `
+    '--raw-log' (Join-Path $out "serial-raw.log") 2>&1 |
   Tee-Object -FilePath (Join-Path $out "soak.log") -Append |
   ForEach-Object { Write-Host $_ }
 $soakRc = $LASTEXITCODE
