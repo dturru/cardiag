@@ -159,7 +159,7 @@ the cap to ~406 kB, which the measured **786 B/s** Tier A rate reaches in about
 9 minutes.
 
 ```
-powershell -ExecutionPolicy Bypass -File toolsun_bench.ps1 -Minutes 15
+powershell -ExecutionPolicy Bypass -File tools\run_bench.ps1 -Minutes 15
 ```
 
 🔑 **Why claim 2 kept missing, and it was not one cause but three:**
@@ -427,8 +427,7 @@ marginal link on demand.
 ### 2a. ▶ RUN IT — one command, detached
 
 ```
-powershell -ExecutionPolicy Bypass -File tools
-un_bench.ps1
+powershell -ExecutionPolicy Bypass -File tools\run_bench.ps1
 ```
 
 Launch it in **its own PowerShell window**. It is self-contained: pre-flight
