@@ -7,12 +7,16 @@
 #include "looptime.h"
 #include "candrops.h"
 #include "filestore.h"
+#include "retrybackoff.h"
 #include "config.h"
 #include "secrets.h"
 
 static HubLinkState g_state    = HUBLINK_OFF;
 static uint32_t     g_lastTry  = 0;
 static uint32_t     g_retryMs  = WIFI_STA_RETRY_MS;
+// The wait between attempts to find the hub. Reset on every STA disconnect,
+// advanced after every failed join (retrybackoff.h).
+static RetryBackoff g_backoff;
 static uint32_t     g_linkUpMs = 0;
 static IPAddress    g_hubIp;
 static HubLinkStats g_stats;
@@ -247,13 +251,13 @@ static void stepJoin() {
         g_stats.lastFallbackMs = took;
         if (took > g_stats.worstFallbackMs) g_stats.worstFallbackMs = took;
         g_fallbackNoticedMs = 0;
-        // A link that dropped may be a blip rather than a hub that went home.
-        // Retry soon once, then settle back to the slow cadence so a
-        // genuinely absent hub does not cost an AP teardown every ten seconds.
-        g_retryMs = WIFI_STA_QUICK_RETRY_MS;
+        // A drop: the schedule starts again at its shortest wait.
+        backoffReset(&g_backoff);
+        g_retryMs = backoffNextMs(&g_backoff);
         hublinkPrintStats("fallback");
       } else {
-        g_retryMs = WIFI_STA_RETRY_MS;
+        // A join that failed: wait longer next time, up to the cap.
+        g_retryMs = backoffNextMs(&g_backoff);
         if (g_bootJoin) hublinkPrintStats("boot-ap");
       }
       g_bootJoin = false;
@@ -268,6 +272,7 @@ void hublinkBegin() {
   WiFi.onEvent(onWifiEvent);
   g_lastTry = millis();
   g_retryMs = WIFI_STA_RETRY_MS;
+  backoffInit(&g_backoff, WIFI_STA_BACKOFF_FIRST_MS, WIFI_STA_RETRY_MS);
   // Starts the machine and RETURNS. setup() no longer waits up to 8 s here;
   // loop() drives the join, and on failure the board falls back to exactly
   // what it did before the hub existed: its own AP. The logger is a
