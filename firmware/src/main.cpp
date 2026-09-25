@@ -36,6 +36,7 @@
 #include "hubstream.h"
 #include "looptime.h"
 #include "candrops.h"
+#include "logq.h"
 #include "selftest_profile.h"
 #include "filestore.h"
 #include "transceiver.h"
@@ -97,21 +98,28 @@ static void noteId(uint32_t id, bool extended) {
   }
 }
 
+// Runs on canTask. ONE line, built here and queued whole (logq.h): canTask
+// never writes Serial itself, so a frame line cannot land in the middle of
+// loop()'s stats line, and a slow port cannot stall the CAN task.
 static void printFrame(const twai_message_t &msg) {
-  Serial.printf("[%8lu] %s 0x%03lX  dlc=%u  ",
-                (unsigned long)millis(),
-                msg.extd ? "EXT" : "STD",
-                (unsigned long)msg.identifier,
-                msg.data_length_code);
-
+  // Worst case ~60 chars (29-bit id, 8 bytes); `left()` keeps every append
+  // in bounds regardless.
+  char line[96];
+  size_t n = 0;
+  auto left = [&]() { return n < sizeof(line) ? sizeof(line) - n : 0; };
+  auto adv = [&](int w) { if (w > 0) n += (size_t)w; if (n >= sizeof(line)) n = sizeof(line) - 1; };
+  adv(snprintf(line, sizeof(line), "[%8lu] %s 0x%03lX  dlc=%u  ",
+               (unsigned long)millis(), msg.extd ? "EXT" : "STD",
+               (unsigned long)msg.identifier, msg.data_length_code));
   if (msg.rtr) {
-    Serial.print("RTR");
+    adv(snprintf(line + n, left(), "RTR"));
   } else {
-    for (int i = 0; i < msg.data_length_code; i++) {
-      Serial.printf("%02X ", msg.data[i]);
+    for (int i = 0; i < msg.data_length_code && i < 8; i++) {
+      adv(snprintf(line + n, left(), "%02X ", msg.data[i]));
     }
   }
-  Serial.println();
+  adv(snprintf(line + n, left(), "\n"));
+  logqPush(line, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +569,8 @@ void setup() {
   // In the car there is no laptop attached, so an unguarded Serial.print can
   // stall the whole loop. 0 = never block; drop instead.
   Serial.setTxTimeoutMs(0);
+  // Before any other task exists: from here on only loop() writes Serial.
+  logqBegin();
   delay(2000);   // let USB CDC enumerate before the first print
 
   pinMode(PIN_USER_LED, OUTPUT);
@@ -972,6 +982,8 @@ void loop() {
   // millis() wraps at ~49.7 d; this closes the session and starts a new
   // boot_id so relative time stays monotonic within a session.
   LOOP_STAGE("session", if (sessionTick()) hubstreamRequestFullSnapshot());
+  // Lines other tasks queued (canTask frames, ESP-IDF logs), written whole.
+  LOOP_STAGE("log", logqDrain(LOGQ_DRAIN_PER_PASS));
 
   if (!g_twaiUp) {
     loopAccount(t0, slow, slowUs);

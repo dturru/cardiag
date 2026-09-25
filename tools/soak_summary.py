@@ -192,13 +192,9 @@ def judge_loop(rows: list[dict]) -> dict:
         if num(r.get("reboot")):
             boot_flagged = False          # a new boot, a new since-boot max
     fails: list[str] = []
-    if not rows:
-        pass
-    elif not reported:
-        fails.append("loop latency not reported (no loop_cycle_max_us / "
-                     "loop_max_us in the CSV): cannot be judged, so it is "
-                     "not passed")
-    elif over:
+    # A loop figure that is missing is a COVERAGE question (judge() below ->
+    # INCONCLUSIVE), not a pass and not a fail.
+    if over:
         shown = "; ".join(over[:5]) + (f" (+{len(over) - 5} more)"
                                        if len(over) > 5 else "")
         fails.append(f"{len(over)} cycle(s) with a loop() pass over "
@@ -256,6 +252,37 @@ def judge_joins(rows: list[dict]) -> dict | None:
             "seen_last": seen[-1] if seen else None}
 
 
+# ⭐ COVERAGE. A metric the serial capture could not read on a cycle is not
+# evidence of health. The baseline soak lost the counters in 16 of 40 cycles
+# to interleaved Serial output and the verdict never noticed. Each required
+# metric must be readable on at least COVERAGE_MIN_PCT of cycles; below that
+# the verdict is INCONCLUSIVE, never PASS.
+COVERAGE_MIN_PCT = 90.0
+REQUIRED = {
+    "heap": ("heap",),
+    "loop": ("loop_cycle_max_us",),
+    "fs_sub": ("fs_sub_max_us",),
+    "can_drops": ("can_rx_missed", "can_rx_overrun", "can_chg_dropped",
+                  "can_id_overflow"),
+    # SELFTEST only; the harness writes it, so it is missing only from a CSV
+    # an older harness produced.
+    "bus_idle": ("bus_idle_closes",),
+}
+
+
+def coverage(rows: list[dict], mode: str = "SELFTEST") -> dict:
+    """Per required metric: cycles where every one of its columns was read."""
+    out = {}
+    for metric, cols in REQUIRED.items():
+        if metric == "bus_idle" and mode.upper() != "SELFTEST":
+            continue
+        ok = sum(1 for r in rows
+                 if all((r.get(c) or "").strip() for c in cols))
+        out[metric] = {"readable": ok, "total": len(rows),
+                       "pct": 100.0 * ok / len(rows) if rows else 0.0}
+    return out
+
+
 def judge(rows: list[dict], *, requested: int = 0,
           mode: str = "SELFTEST") -> dict:
     """THE soak verdict. Everything that reports one calls this."""
@@ -284,9 +311,6 @@ def judge(rows: list[dict], *, requested: int = 0,
             fails.append(f"{idle} bus-idle close(s) in SELFTEST, whose bus "
                          f"never goes quiet -- every one is false (cycles "
                          f"{', '.join(at[:12])}{' ...' if len(at) > 12 else ''})")
-    elif rows and mode.upper() == "SELFTEST":
-        fails.append("bus-idle closes not counted (no bus_idle_closes column): "
-                     "cannot be judged, so it is not passed")
 
     DROP_COLS = {"can_rx_missed": "TWAI RX queue full (rx_missed)",
                  "can_rx_overrun": "TWAI RX FIFO overrun",
@@ -305,16 +329,21 @@ def judge(rows: list[dict], *, requested: int = 0,
                              if (num(r.get(col)) or 0) > 0)
                 fails.append(f"CAN drops: {worst} {what} (first at cycle "
                              f"{first})")
-    elif rows:
-        fails.append("CAN drop counters not reported (no can_* columns): "
-                     "cannot be judged, so it is not passed")
 
     panics = sum(num(r.get("panics")) or 0 for r in rows)
     if panics:
         fails.append(f"{panics} panic/assert line(s)")
 
+    cov = coverage(rows, mode)
+    short = {m: c for m, c in cov.items() if c["pct"] < COVERAGE_MIN_PCT}
+
+    # FAIL wins: a check that failed on the cycles it could read is a failure
+    # whatever the rest look like. Otherwise, a required metric that could not
+    # be read on >= 90 % of cycles means the run cannot say PASS.
     if fails:
         verdict = "FAIL"
+    elif short:
+        verdict = "INCONCLUSIVE"
     elif partial:
         verdict = "PARTIAL"
     else:
@@ -323,6 +352,7 @@ def judge(rows: list[dict], *, requested: int = 0,
             "requested": requested, "partial": partial, "heap": heap,
             "loop": loop, "reboots": reboots, "bus_idle_closes": idle,
             "panics": panics, "can_drops": drops, "fs_sub": judge_fs_sub(rows),
+            "coverage": cov, "coverage_short": sorted(short),
             "joins": judge_joins(rows)}
 
 
@@ -340,10 +370,15 @@ def verdict_lines(j: dict) -> list[str]:
     out = [f"VERDICT: {j['verdict']} ({len(j['fails'])} failed check(s), "
            f"{j['done']}/{j['requested']} cycles)"]
     out += [f"  - {f}" for f in j["fails"]]
+    for m in j.get("coverage_short", []):
+        c = j["coverage"][m]
+        out.append(f"  - coverage: {m} readable on {c['readable']}/"
+                   f"{c['total']} cycles ({c['pct']:.0f}% < "
+                   f"{COVERAGE_MIN_PCT:.0f}%)")
     return out
 
 
-EXIT = {"PASS": 0, "FAIL": 1, "PARTIAL": 3}
+EXIT = {"PASS": 0, "FAIL": 1, "PARTIAL": 3, "INCONCLUSIVE": 4}
 
 
 def main(argv=None) -> int:
@@ -404,6 +439,18 @@ def main(argv=None) -> int:
             L.append("")
 
     L.append(f"- **cycles completed:** {done} of {requested}")
+    if j["coverage"]:
+        cells = ", ".join(
+            f"{m} {c['readable']}/{c['total']} ({c['pct']:.0f}%)"
+            + (" ⚠️" if m in j["coverage_short"] else "")
+            for m, c in j["coverage"].items())
+        L.append(f"- **coverage (cycles with readable values):** {cells}")
+    if verdict == "INCONCLUSIVE":
+        L.append(f"\n> ⚠️ **INCONCLUSIVE, not PASS.** No check failed on the "
+                 f"cycles that could be read, but "
+                 f"{', '.join(j['coverage_short'])} could not be read on at "
+                 f"least {COVERAGE_MIN_PCT:.0f}% of cycles. Check "
+                 f"serial-raw.log for garbled or missing `[stats]` lines.\n")
     L.append(f"- **reboots:** {len(reboots)}")
     L.append(f"- **netstack 12308 events:** {netstack}")
     w = j["loop"]["worst"]
@@ -608,7 +655,9 @@ def main(argv=None) -> int:
     if args.verdict_file:
         Path(args.verdict_file).write_text(json.dumps({
             "verdict": verdict, "fails": fails, "cycles_done": done,
-            "cycles_requested": requested}, indent=2) + "\n", encoding="utf-8")
+            "cycles_requested": requested, "coverage": j["coverage"],
+            "coverage_short": j["coverage_short"]}, indent=2) + "\n",
+            encoding="utf-8")
     print(f"SUMMARY: {verdict} -- {done}/{requested} cycles, "
           f"{len(reboots)} reboot(s) -> {args.out}")
     # Non-zero unless PASS, so a caller cannot mistake a FAIL for success.
