@@ -388,6 +388,17 @@
 #define CAN_TASK_CORE   1
 #define CAN_TASK_PRIO   5
 #define CAN_TASK_STACK  4096
+
+// SELFTEST's transmitter, moved out of loop() so the bench traffic keeps
+// flowing while loop() is busy -- the way a real bus does. Same core as
+// loop() (Arduino runs loopTask on core 1), priority between loopTask (1) and
+// the CAN receive task (5): it must not starve the receiver it feeds.
+#define SELFTEST_TASK_CORE      1
+#define SELFTEST_TASK_PRIO      3
+#define SELFTEST_TASK_STACK     3072
+// Tick of the transmit scheduler. The fastest SELFTEST id is 20 ms, so 1 ms
+// keeps each id within a millisecond of its schedule.
+#define SELFTEST_TASK_PERIOD_MS 1
 #define CAN_RX_WAIT_MS  100
 
 // ---------------------------------------------------------------------------

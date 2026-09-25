@@ -20,6 +20,11 @@
 void webuiStart();     // brings up the AP and the server
 void webuiStartOnCurrentNetwork();  // server only; radio already in STA
 void webuiStop();      // tears both down and powers the radio off
+
+// For hublink's step-per-pass machine: the server and the radio separately,
+// so no single call does more than one Wi-Fi mode switch.
+void webuiServerStop();   // closes the listening socket only; no radio change
+bool webuiServeAp();      // radio ALREADY in WIFI_AP: softAP() config + server
 void webuiLoop();      // call from loop(); cheap no-op while stopped
 bool webuiRunning();
 

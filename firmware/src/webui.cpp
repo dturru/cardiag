@@ -304,6 +304,29 @@ void webuiStop() {
   g_running = false;
 }
 
+void webuiServerStop() {
+  if (!g_running) return;
+  g_server.stop();
+  g_running = false;
+}
+
+bool webuiServeAp() {
+  if (g_running) return true;
+  // The caller (hublink) already did WiFi.mode(WIFI_AP) on the previous
+  // loop() pass, so this is configuration, not another mode switch.
+  if (!WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS, WIFI_AP_CHANNEL)) {
+    Serial.println("AP failed to start.");
+    return false;
+  }
+  registerRoutes();
+  g_server.begin();          // the socket, not the table
+  g_running = true;
+  g_apMode  = true;
+  Serial.printf("AP up: SSID \"%s\"  ->  http://%s/\n",
+                WIFI_AP_SSID, WiFi.softAPIP().toString().c_str());
+  return true;
+}
+
 void webuiLoop() {
   if (g_running) g_server.handleClient();
 }
