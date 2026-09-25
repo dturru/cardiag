@@ -16,8 +16,48 @@ driven without a human at the keyboard.
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 import time
+
+# esptool implements the S3's actual reset sequence. A hand-rolled DTR/RTS
+# pulse did NOT work -- see hard_reset().
+_PIO_PY = os.path.expanduser(r"~\.platformio\penv\Scripts\python.exe")
+_ESPTOOL = os.path.expanduser(
+    r"~\.platformio\packages\tool-esptoolpy\esptool.py")
+
+
+def hard_reset(port: str) -> bool:
+    """Reset the board via esptool, BEFORE the capture port is opened.
+
+    🐛 WHY NOT A DTR/RTS PULSE HERE. This used to be exactly that -- pin DTR
+    low, pulse RTS high then low -- and measured on COM3 2026-09-24 it DID
+    NOTHING: board uptime kept climbing through 122 s. A flag that silently
+    does nothing is worse than no flag, because the caller believes it worked
+    and then reads a stale banner as though it were fresh. esptool already
+    implements the real sequence for the S3's native USB-Serial-JTAG, so call
+    that rather than reimplementing it badly.
+
+    Returns True on success; the caller decides whether failure is fatal.
+    """
+    if not (os.path.exists(_PIO_PY) and os.path.exists(_ESPTOOL)):
+        print(f"--reset: esptool not found at {_ESPTOOL}", file=sys.stderr)
+        return False
+    try:
+        r = subprocess.run(
+            [_PIO_PY, _ESPTOOL, "--chip", "esp32s3", "--port", port,
+             "--after", "hard_reset", "read_mac"],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"--reset: esptool failed: {exc}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"--reset: esptool exited {r.returncode}\n{r.stderr[-400:]}",
+              file=sys.stderr)
+        return False
+    return True
 
 
 def main(argv=None) -> int:
@@ -34,7 +74,9 @@ def main(argv=None) -> int:
     ap.add_argument("--gap", type=float, default=1.0,
                     help="seconds between successive --send values")
     ap.add_argument("--reset", action="store_true",
-                    help="pulse DTR/RTS to reset the board first")
+                    help="hard-reset the board via esptool BEFORE capturing, "
+                         "so the boot banner is in the log. Exits non-zero if "
+                         "the reset fails rather than capturing a stale boot.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -55,6 +97,14 @@ def main(argv=None) -> int:
     # `dsrdtr=False` + explicitly clearing both before anything else is what
     # makes an observation non-destructive. A capture tool that reboots the
     # thing it is observing is not a capture tool.
+    # 🔑 RESET BEFORE OPENING, not after. esptool needs the port to itself, and
+    # the point of --reset is to catch the boot banner, which setup() prints
+    # ~2 s in -- so the capture must already be listening when it arrives.
+    if args.reset and not hard_reset(args.port):
+        print("--reset FAILED -- refusing to capture and call it a fresh boot",
+              file=sys.stderr)
+        return 3
+
     ser = serial.Serial()
     ser.port = args.port
     ser.baudrate = args.baud
@@ -63,13 +113,6 @@ def main(argv=None) -> int:
     ser.rts = False
     ser.dsrdtr = False
     ser.open()
-    if args.reset:
-        # Espressif's USB-Serial-JTAG maps DTR/RTS to EN/BOOT.
-        ser.setDTR(False)
-        ser.setRTS(True)
-        time.sleep(0.1)
-        ser.setRTS(False)
-        time.sleep(0.1)
 
     fh = open(args.out, "w", encoding="utf-8", newline="") if args.out else None
     t0 = time.monotonic()

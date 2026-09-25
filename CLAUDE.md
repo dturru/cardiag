@@ -11,22 +11,35 @@ Full project history and design rationale live in the vault:
 
 ## 🛡 Hardware guardrails — these fire BEFORE any lookup
 
-- ⭐⭐ **TO RESET THE BOARD FROM THE HOST, USE esptool — NOT the serial port.**
-  `python <platformio>/packages/tool-esptoolpy/esptool.py --chip esp32s3 --port COM3 --after hard_reset read_mac`
-  ❌ **CORRECTED 2026-09-24 by measurement.** This entry used to read *"closing the USB serial port
-  resets this board (DTR/RTS → EN/BOOT)"*. **It does not.** Measured three ways on COM3:
+- ⭐⭐ **A SERIAL TOOL AT DEFAULT DTR/RTS CAN REBOOT THIS BOARD. ALWAYS USE `tools/serial_capture.py`.**
+  The S3's native USB-Serial-JTAG maps DTR/RTS → EN/BOOT, and **pyserial asserts DTR on open and drops
+  both on close.** This is not theoretical: it **cost a boot_id (12 → 13) mid-bring-up** and orphaned a
+  SELFTEST `.part` whose provenance could not be recovered — which is how the `"synthetic":false` bug
+  was found. → `tools/serial_capture.py:48`.
+  **`serial_capture.py` is safe *because* it pins `dtr=False, rts=False, dsrdtr=False` BEFORE `open()`.**
+  A capture tool that reboots the thing it is observing is not a capture tool.
 
-  | Method | Result |
-  |---|---|
-  | `serial_capture.py --reset` (DTR/RTS pulse) | ❌ no reset — uptime kept climbing through 122 s |
-  | Closing the USB port | ❌ no reset — uptime 155 s, still climbing |
-  | `esptool --after hard_reset` | ✅ next capture opens at uptime 1.993 s with the full banner |
+  **TO RESET ON PURPOSE, USE esptool** — it implements the S3's actual reset sequence:
+  `python <platformio>/packages/tool-esptoolpy/esptool.py --chip esp32s3 --port COM3 --after hard_reset read_mac`
+
+  ⚖️ **WHAT IS MEASURED vs WHAT IS NOT** (COM3, 2026-09-24). An earlier edit today over-claimed a blanket
+  "closing the port does NOT reset the board". **That was wrong: it was measured using the one tool built
+  to suppress the effect.** Scope matters here, so the table says exactly what was covered.
+
+  | Tool / config | Reset? | Note |
+  |---|---|---|
+  | `serial_capture.py`, open + close (`dsrdtr=False`, DTR/RTS pinned low) | ❌ no — uptime 155 s, still climbing | **Suppression BY DESIGN.** Confirms the tool is non-destructive; says nothing about other tools |
+  | `serial_capture.py --reset` (pins DTR low, pulses RTS) | ❌ no — uptime climbed through 122 s | The flag did not work; see below |
+  | `esptool --after hard_reset` | ✅ yes | Next capture opens at uptime 1.993 s with the full banner |
+  | **raw pyserial at DEFAULTS** (DTR asserted on open, dropped on close) | ⚪ **UNTESTED** | This is the documented incident path — assume it DOES reset |
+  | **`pio device monitor`** | ⚪ **UNTESTED** | Assume it resets |
+  | PuTTY / Arduino IDE / anything leaving `dsrdtr` default | ⚪ **UNTESTED** | Assume it resets |
 
   ⇒ **Anything that must see the boot banner** (`[boot] RESET REASON`, `[fs] EFFECTIVE CAPS`,
   `[fs] mounted`) **must hard-reset via esptool FIRST, then capture.** `setup()` prints it ~2 s after
   boot (`delay(2000)` for USB CDC enumeration), so opening a port "shortly after" a flash is a race —
   `run_soak.ps1` lost it and correctly aborted. → `tools/run_soak.ps1` §3b, which retries 3×.
-  ⇒ Still true: **use `tools/serial_capture.py`**; `pio device monitor` is interactive and cannot be scripted.
+  ⇒ `pio device monitor` is interactive and cannot be scripted — another reason it is not the tool here.
 - **A capture is ONE action, repeated ~5×.** The diff tool ranks on MARGIN, and **no quiet baseline
   exists with the engine running** — a capture mixing actions is unrankable.
 - **SD is on the critical path.** Both stores are volatile PSRAM and the log fills in ~9 min.
