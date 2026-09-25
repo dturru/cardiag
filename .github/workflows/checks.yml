@@ -87,27 +87,21 @@ jobs:
       - name: Placeholder secrets.h
         run: cp include/secrets.h.example include/secrets.h
 
-      # ⚠️ STAND-IN PARTITION TABLE. platformio.ini points at
-      # partitions_cardiag_8mb.csv, but .gitignore's `*.csv` has kept that file
-      # out of the repo, so a clean checkout cannot build. This writes the
-      # table documented in docs/hub-integration-plan.md §Partition table,
-      # ONLY when the real file is absent, and only on the runner. Once the
-      # real file is committed (needs a `!firmware/partitions_cardiag_8mb.csv`
-      # exception in .gitignore) this step does nothing.
-      - name: Partition table (stand-in if not committed)
+      # The partition table is part of the build, so it must be COMMITTED.
+      # It was kept out of the repo by .gitignore's `*.csv` until 3d6745c, and
+      # CI used to paper over that with a stand-in copy. No longer: if the file
+      # is missing, or present but untracked, the build is not reproducible and
+      # this job fails here rather than building against something else.
+      - name: Partition table is committed
         run: |
           if [ ! -f partitions_cardiag_8mb.csv ]; then
-            echo "::warning::partitions_cardiag_8mb.csv is not in the repo; using the table from docs/hub-integration-plan.md"
-            cat > partitions_cardiag_8mb.csv <<'CSV'
-          # Name,   Type, SubType,  Offset,   Size
-          nvs,      data, nvs,      0x9000,   0x5000
-          otadata,  data, ota,      0xe000,   0x2000
-          app0,     app,  ota_0,    0x10000,  0x200000
-          app1,     app,  ota_1,    0x210000, 0x200000
-          spiffs,   data, spiffs,   0x410000, 0x3E0000
-          coredump, data, coredump, 0x7F0000, 0x10000
-          CSV
+            echo "::error file=firmware/platformio.ini::firmware/partitions_cardiag_8mb.csv is missing; platformio.ini's board_build.partitions needs it"
+            exit 1
           fi
+          git ls-files --error-unmatch partitions_cardiag_8mb.csv > /dev/null || {
+            echo "::error::firmware/partitions_cardiag_8mb.csv exists but is not tracked by git"
+            exit 1
+          }
 
       # The shipping env, plus captest: the one that overrides a #ifndef-guarded
       # macro with -D, which is the class of build bug this repo has been bitten
