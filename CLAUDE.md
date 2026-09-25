@@ -11,8 +11,22 @@ Full project history and design rationale live in the vault:
 
 ## 🛡 Hardware guardrails — these fire BEFORE any lookup
 
-- ⭐⭐ **CLOSING THE USB SERIAL PORT RESETS THIS BOARD.** The S3's native USB maps DTR/RTS → EN/BOOT.
-  ⇒ **use `tools/serial_capture.py`**; `pio device monitor` is interactive and cannot be scripted.
+- ⭐⭐ **TO RESET THE BOARD FROM THE HOST, USE esptool — NOT the serial port.**
+  `python <platformio>/packages/tool-esptoolpy/esptool.py --chip esp32s3 --port COM3 --after hard_reset read_mac`
+  ❌ **CORRECTED 2026-09-24 by measurement.** This entry used to read *"closing the USB serial port
+  resets this board (DTR/RTS → EN/BOOT)"*. **It does not.** Measured three ways on COM3:
+
+  | Method | Result |
+  |---|---|
+  | `serial_capture.py --reset` (DTR/RTS pulse) | ❌ no reset — uptime kept climbing through 122 s |
+  | Closing the USB port | ❌ no reset — uptime 155 s, still climbing |
+  | `esptool --after hard_reset` | ✅ next capture opens at uptime 1.993 s with the full banner |
+
+  ⇒ **Anything that must see the boot banner** (`[boot] RESET REASON`, `[fs] EFFECTIVE CAPS`,
+  `[fs] mounted`) **must hard-reset via esptool FIRST, then capture.** `setup()` prints it ~2 s after
+  boot (`delay(2000)` for USB CDC enumeration), so opening a port "shortly after" a flash is a race —
+  `run_soak.ps1` lost it and correctly aborted. → `tools/run_soak.ps1` §3b, which retries 3×.
+  ⇒ Still true: **use `tools/serial_capture.py`**; `pio device monitor` is interactive and cannot be scripted.
 - **A capture is ONE action, repeated ~5×.** The diff tool ranks on MARGIN, and **no quiet baseline
   exists with the engine running** — a capture mixing actions is unrankable.
 - **SD is on the critical path.** Both stores are volatile PSRAM and the log fills in ~9 min.
