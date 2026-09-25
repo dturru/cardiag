@@ -27,7 +27,8 @@ import soak_summary as ss  # noqa: E402
 
 FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
           "reason", "heap", "minheap", "largest_block", "netstack_12308",
-          "reboot", "reset_reason"]
+          "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
+          "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes", "panics"]
 
 
 def row(cycle: int, heap: int, *, minheap: int | None = None,
@@ -39,7 +40,12 @@ def row(cycle: int, heap: int, *, minheap: int | None = None,
             "minheap": str(minheap if minheap is not None else heap - 20000),
             "largest_block": str(largest if largest is not None else heap // 2),
             "netstack_12308": "0", "reboot": "1" if reboot else "0",
-            "reset_reason": reason}
+            "reset_reason": reason,
+            # A healthy loop and no false key-off closes, so these fixtures
+            # judge heap and resets only; test_soak_verdict.py covers the rest.
+            "loop_max_us": "42000", "loop_max_stage": "webui",
+            "loop_cycle_max_us": "38000", "loop_cycle_stage": "webui",
+            "bus_idle_closes": "0", "panics": "0"}
 
 
 def write_csv(path: Path, rows: list[dict]) -> Path:

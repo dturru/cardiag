@@ -86,9 +86,10 @@ function Log($m) {
 # without reading the logs. Removed at start, written at every exit path.
 $doneFile = Join-Path $out "DONE"
 Remove-Item $doneFile -ErrorAction SilentlyContinue
-function Finish($code, $state) {
+function Finish($code, $state, $verdict = "") {
   Set-Content -Path $doneFile -Encoding utf8 -Value @(
     "state: $state",
+    "verdict: $verdict",
     "exit_code: $code",
     "cycles_requested: $Cycles",
     "finished: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
@@ -283,11 +284,31 @@ $soakRc = $LASTEXITCODE
 # --- SUMMARY ----------------------------------------------------------------
 # Written from the CSV, so a PARTIAL run still gets a real summary.
 Log "--- writing SUMMARY.md ---"
+# ⭐ ONE VERDICT. soak_summary.py decides it (judge()), writes it to
+# verdict.json, and DONE and the end of soak.log are copied from that file.
+# $soakRc is NOT consulted for pass/fail: soak_wifi.py's exit code comes from
+# the same judge(), and reading two sources is how the soak once reported PASS
+# on runs that had failed. A missing verdict.json is a failure, not a pass.
+$verdictFile = Join-Path $out "verdict.json"
+Remove-Item $verdictFile -ErrorAction SilentlyContinue
 & python (Join-Path $PSScriptRoot 'soak_summary.py') `
     '--csv' $csv '--log' (Join-Path $out "soak.log") `
     '--out' (Join-Path $out "SUMMARY.md") '--requested' $Cycles `
-    '--context' (Join-Path $out "run-context.json") 2>&1 |
+    '--context' (Join-Path $out "run-context.json") `
+    '--verdict-file' $verdictFile 2>&1 |
   ForEach-Object { Log "  $_" }
 
+$verdict = "UNKNOWN"
+if (Test-Path $verdictFile) {
+  try { $verdict = (Get-Content $verdictFile -Raw | ConvertFrom-Json).verdict } catch { }
+}
+Add-Content -Path (Join-Path $out "soak.log") -Encoding utf8 `
+  -Value "FINAL VERDICT (soak_summary.py, same as SUMMARY.md and DONE): $verdict"
+
 Log "read results from: $out"
-if ($soakRc -eq 0) { Finish 0 "complete-pass" } else { Finish $soakRc "complete-fail" }
+switch ($verdict) {
+  "PASS"    { Finish 0 "complete-pass" $verdict }
+  "PARTIAL" { Finish 3 "partial" $verdict }
+  "FAIL"    { Finish 1 "complete-fail" $verdict }
+  default   { Finish 8 "summary-missing" $verdict }
+}

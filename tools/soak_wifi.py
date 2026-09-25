@@ -64,6 +64,8 @@ except ImportError:
     raise
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import soak_summary  # noqa: E402  -- the one place a verdict is decided
 HOTSPOT_PS1 = os.path.join(HERE, "hotspot.ps1")
 
 # Serial patterns. Kept as literals rather than shared constants with the
@@ -89,7 +91,14 @@ RE_BOOT = re.compile(r"(rst:0x[0-9a-fA-F]+|ESP-ROM:esp32)")
 RE_RESET_REASON = re.compile(r"\[boot\] RESET REASON:\s*(\w+)")
 # Max loop() pass since boot, appended to the hublink stats line. Resets with
 # the board. The non-blocking join is supposed to keep it well under a second.
-RE_LOOPMAX = re.compile(r"loopmax=(\d+)us")
+RE_LOOPMAX = re.compile(r"loopmax=(\d+)us(?: loopstage=(\S+))?")
+# Max loop() pass since the PREVIOUS stats line (the line resets it), and its
+# slowest stage. The max of these within a cycle is that cycle's own worst
+# pass -- which a since-boot max cannot give once one bad pass has happened.
+RE_LOOPWIN = re.compile(r"loopwin=(\d+)us loopwinstage=(\S+)")
+# The clean key-off close. In SELFTEST the bus is the board's own loopback and
+# never goes quiet, so every one of these is false (soak_summary.py fails it).
+RE_BUSIDLE = re.compile(r"\[fs\] bus idle \d+ms -> closed all files")
 RE_PANIC = re.compile(r"(Guru Meditation|abort\(\) was called|StoreProhibited|"
                       r"LoadProhibited|assert failed)")
 
@@ -126,11 +135,19 @@ class Cycle:
     # Max loop() pass since boot, microseconds, last value seen this cycle.
     # Firmware older than the non-blocking join does not print it: None.
     loop_max_us: int | None = None
+    loop_max_stage: str = ""
+    # This cycle's worst loop() pass: max of the loopwin= values seen in it.
+    loop_cycle_max_us: int | None = None
+    loop_cycle_stage: str = ""
+    bus_idle_closes: int = 0
+    panics: int = 0
 
 
 CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
               "reason", "heap", "minheap", "largest_block", "netstack_12308",
-              "reboot", "reset_reason", "loop_max_us"]
+              "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
+              "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes",
+              "panics"]
 
 
 def csv_path(args) -> str:
@@ -166,7 +183,10 @@ def write_cycle_row(args, c) -> None:
                     c.heap or "", c.minheap or "",
                     c.largest or "", c.netstack, int(c.reboot),
                     c.reset_reason,
-                    c.loop_max_us if c.loop_max_us is not None else ""])
+                    c.loop_max_us if c.loop_max_us is not None else "",
+                    c.loop_max_stage,
+                    c.loop_cycle_max_us if c.loop_cycle_max_us is not None else "",
+                    c.loop_cycle_stage, c.bus_idle_closes, c.panics])
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -308,6 +328,9 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
             tot.netstack += 1
         if RE_PANIC.search(ln.text):
             tot.panics += 1
+            cyc.panics += 1
+        if RE_BUSIDLE.search(ln.text):
+            cyc.bus_idle_closes += 1
         m = RE_HEAP.search(ln.text)
         if m:
             cyc.heap = int(m.group(1))
@@ -320,6 +343,14 @@ def scan_window(tap: SerialTap, lo: int, hi: int, cyc: Cycle, tot: Totals):
         m = RE_LOOPMAX.search(ln.text)
         if m:
             cyc.loop_max_us = int(m.group(1))
+            if m.group(2) and m.group(2) != "-":
+                cyc.loop_max_stage = m.group(2)
+        m = RE_LOOPWIN.search(ln.text)
+        if m:
+            us = int(m.group(1))
+            if cyc.loop_cycle_max_us is None or us > cyc.loop_cycle_max_us:
+                cyc.loop_cycle_max_us = us
+                cyc.loop_cycle_stage = "" if m.group(2) == "-" else m.group(2)
 
 
 def run(args) -> int:
@@ -436,6 +467,9 @@ def run(args) -> int:
         print(f"  [{n:>3}/{args.cycles}] detect={d} rejoin={j} "
               f"path={cyc.drop_path or '-':5} reason={cyc.reason if cyc.reason is not None else '-':>3} "
               f"heap={cyc.heap or 0:>6} 12308={cyc.netstack}"
+              + (f" loop={cyc.loop_cycle_max_us // 1000}ms/{cyc.loop_cycle_stage or '-'}"
+                 if cyc.loop_cycle_max_us is not None else "")
+              + (f" BUSIDLE={cyc.bus_idle_closes}" if cyc.bus_idle_closes else "")
               + ("  REBOOT" if cyc.reboot else ""))
 
     tap.close()
@@ -536,66 +570,19 @@ def report(cycles: list[Cycle], tot: Totals, args):
     else:
         print("heap                not enough samples")
 
-    # --- explicit verdict -------------------------------------------------
+    # --- verdict ------------------------------------------------------------
     #
-    # A run that only prints numbers gets read optimistically. These are the
-    # agreed pass criteria for "the leak is fixed", checked rather than eyeballed.
-    # --- loop latency ---------------------------------------------------
-    # Since-boot max, so the last cycle's value covers the whole run (per
-    # boot). One second is far past the ~100 ms-per-call design and past any
-    # plausible single HTTP request; crossing it means something in loop()
-    # still blocks the way the old 8 s join did.
-    loops = [c.loop_max_us for c in cycles if c.loop_max_us is not None]
+    # ⭐ NOT DECIDED HERE. soak_summary.judge() is the single source of truth,
+    # run on the per-cycle CSV this run just wrote, so the VERDICT in soak.log,
+    # SUMMARY.md and DONE cannot disagree. This file used to carry its own
+    # checks; they drifted from the summary's and the soak reported PASS on
+    # runs that had failed.
     mins = [(c.n, c.minheap) for c in cycles if c.minheap]
-    larges = [(c.n, c.largest) for c in cycles if c.largest]
-    fails: list[str] = []
-    if loops:
-        worst = max(loops)
-        print(f"loop max            {worst / 1000:.1f} ms (since boot, worst "
-              f"cycle)")
-        if worst > 1_000_000:
-            fails.append(f"a loop() pass took {worst / 1000:.0f} ms -- "
-                         f"something still blocks")
-    else:
-        print("loop max            not reported -- firmware predates "
-              "`loopmax=` in the stats line")
-
-    if len(heaps) >= 2:
-        d = [h - ph for (_, ph), (_, h) in zip(heaps, heaps[1:])
-             if h - ph < 50_000]
-        if d:
-            med = sorted(d)[len(d) // 2]
-            if med < -256:
-                fails.append(f"median per-cycle heap delta {med:+.0f} B "
-                             f"(want approximately 0)")
     if len(mins) >= 2:
-        # HEADROOM, not a verdict. minheap= is a per-boot low-water mark and
-        # restarts at every reset, so a "fall across the run" can be two
-        # different boots. The leak verdict is per boot segment, in
-        # soak_summary.py.
+        # HEADROOM, not a verdict: minheap= is a per-boot low-water mark.
         lo = min(v for _, v in mins)
         print(f"min free heap       lowest {lo} B (headroom; per-boot, "
               f"restarts at each reset -- not a leak signal)")
-    else:
-        print("min free heap       not reported -- firmware predates "
-              "`minheap=` in the stats line")
-
-    if len(larges) >= 2:
-        lo = min(v for _, v in larges)
-        drop = larges[0][1] - larges[-1][1]
-        print(f"largest free block  {larges[0][1]} -> {larges[-1][1]} B "
-              f"(min seen {lo})")
-        # Fragmentation kills with free heap to spare: a flat total and a
-        # falling largest block still ends in a failed allocation.
-        if drop > 8192:
-            fails.append(f"largest free block fell {drop} B -- fragmentation, "
-                         f"even if total free heap looks flat")
-    else:
-        print("largest free block  not reported -- firmware predates "
-              "`largest=` in the stats line")
-
-    if tot.reboots:
-        fails.append(f"{tot.reboots} reboot(s)")
 
     # ⭐ CLASSIFY EVERY RESET. "3 reboots" is not a finding; "3 BROWNOUTs" and
     # "3 TASK_WDTs" are completely different findings, and on the bench only
@@ -612,38 +599,22 @@ def report(cycles: list[Cycle], tot: Totals, args):
             where = ", ".join(str(n) for n in at[:12])
             more = f" (+{len(at) - 12} more)" if len(at) > 12 else ""
             print(f"  {name:<11} {len(at):>3}  at cycle(s) {where}{more}")
-        supply = sum(len(v) for k, v in reasons.items() if k == "BROWNOUT")
-        ours = sum(len(v) for k, v in reasons.items()
-                   if k in ("PANIC", "TASK_WDT", "INT_WDT", "WDT"))
-        if supply:
-            print(f"  -> {supply} BROWNOUT: the SUPPLY sagged, not the "
-                  f"firmware. On the bench that is the harness or the USB "
-                  f"cable. Re-run on USB power from a direct port before "
-                  f"reading anything else into it.")
-        if ours:
-            print(f"  -> {ours} PANIC/WDT: these ARE ours and are the real "
-                  f"finding of this run.")
-        if "UNREPORTED" in reasons:
-            print(f"  -> UNREPORTED means the board booted without printing "
-                  f"[boot] RESET REASON -- firmware older than that line. "
-                  f"Reflash before trusting the classification.")
-    if tot.panics:
-        fails.append(f"{tot.panics} panic/assert(s)")
 
+    j = soak_summary.judge(soak_summary.read_rows(csv_path(args)),
+                           requested=args.cycles)
+    w = j["loop"]["worst"]
+    if w:
+        print(f"loop max            {w[0] / 1000:.1f} ms at cycle {w[1]} "
+              f"(stage {w[2]})")
     print()
-    if fails:
-        print("VERDICT: ** FAIL **")
-        for f in fails:
-            print(f"  - {f}")
-    else:
-        print(f"VERDICT: PASS over {len(cycles)} cycles -- heap flat, no "
-              f"fragmentation trend, no reboots or panics.")
+    for line in soak_summary.verdict_lines(j):
+        print(line)
 
     out = csv_path(args)
     print()
     print(f"per-cycle CSV -> {out}   (written and flushed EVERY cycle)")
-    # Non-zero on FAIL so this is usable from a script, not just by eye.
-    return 1 if fails else 0
+    # Non-zero unless PASS so this is usable from a script, not just by eye.
+    return soak_summary.EXIT[j["verdict"]]
 
 
 def main(argv=None) -> int:

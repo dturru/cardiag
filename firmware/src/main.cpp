@@ -885,11 +885,29 @@ static void selfTestTask(void *) {
 // passes went over 100 ms. On /api/v1/session ("loop") and in the hublink
 // stats line the soak parses.
 // ---------------------------------------------------------------------------
+#define LOOP_SLOW_US 100000u
+
 static LoopStats g_loopStats = {0, 0, "", 0, 0};
+static LoopStats g_loopWin[2] = {{0, 0, "", 0, 0}, {0, 0, "", 0, 0}};
 
 const LoopStats *cardiagLoopStats() { return &g_loopStats; }
 
-#define LOOP_SLOW_US 100000u
+LoopStats cardiagLoopTakeWindow(LoopWindowId w) {
+  const LoopStats out = g_loopWin[w];
+  g_loopWin[w] = {0, 0, "", 0, 0};
+  return out;
+}
+
+static void loopNote(LoopStats &s, uint32_t pass, const char *slow,
+                     uint32_t slowUs) {
+  s.passes++;
+  if (pass > LOOP_SLOW_US) s.over100ms++;
+  if (pass > s.maxUs) {
+    s.maxUs = pass;
+    s.maxStage = slow;
+    s.maxStageUs = slowUs;
+  }
+}
 
 // Times one stage and remembers the slowest stage of this pass.
 #define LOOP_STAGE(name, stmt)                                  \
@@ -902,12 +920,11 @@ const LoopStats *cardiagLoopStats() { return &g_loopStats; }
 
 static void loopAccount(uint32_t t0, const char *slow, uint32_t slowUs) {
   const uint32_t pass = micros() - t0;
-  g_loopStats.passes++;
-  if (pass > LOOP_SLOW_US) g_loopStats.over100ms++;
-  if (pass > g_loopStats.maxUs) {
-    g_loopStats.maxUs = pass;
-    g_loopStats.maxStage = slow;
-    g_loopStats.maxStageUs = slowUs;
+  loopNote(g_loopWin[LOOP_WIN_API], pass, slow, slowUs);
+  loopNote(g_loopWin[LOOP_WIN_LOG], pass, slow, slowUs);
+  const uint32_t prevMax = g_loopStats.maxUs;
+  loopNote(g_loopStats, pass, slow, slowUs);
+  if (pass > prevMax) {
     // Loud only past the budget, and only when the record moves, so a
     // healthy board says nothing and a regression says what and where.
     if (pass > LOOP_SLOW_US) {

@@ -21,6 +21,23 @@ It judges the two things the soak exists to answer:
   ZERO REBOOTS  and, for each one, WHY. "3 reboots" is not a finding.
                 "3 BROWNOUTs" (the supply sagged) and "3 TASK_WDTs" (our code
                 hung) are different findings with different fixes.
+  LOOP LATENCY  FAIL if any cycle's loop() max exceeds LOOP_FAIL_US (1 s),
+                naming the cycle and the stage.
+  BUS-IDLE      FAIL on ANY "[fs] bus idle ... closed all files" in SELFTEST.
+                SELFTEST's bus is the board's own loopback and never goes
+                quiet, so a key-off close there is always a false one.
+  PANICS        FAIL on any panic/assert line the harness counted.
+
+⭐ THIS IS THE ONLY PLACE A SOAK VERDICT IS DECIDED. `judge()` below is called
+by this script (SUMMARY.md + verdict.json), by soak_wifi.py for the VERDICT
+line in soak.log, and run_soak.ps1 writes DONE from verdict.json. Three
+independent verdicts is how the soak reported PASS three times on runs that
+had failed (a 3.74 s loop pass and 1,012 false bus-idle closes on #6 among
+them): each copy checked a different subset and none of them agreed.
+
+A check whose input is MISSING fails rather than passes. "Not reported" is
+not evidence of health, and a CSV from an older harness should not be able to
+earn a PASS the current one would refuse.
 """
 
 from __future__ import annotations
@@ -68,6 +85,11 @@ def slope(ys: list[int]) -> float:
 # a fragmenting heap fails an allocation with free heap to spare.
 HEAP_SLOPE_FAIL = -64.0
 MIN_SEGMENT_ROWS = 10
+
+# One loop() pass over this fails the run. The design budget is ~100 ms per
+# call; a second is past any plausible single HTTP request and means something
+# in loop() still blocks.
+LOOP_FAIL_US = 1_000_000
 
 
 def segments(rows: list[dict]) -> list[list[dict]]:
@@ -128,6 +150,126 @@ def judge_heap(rows: list[dict]) -> dict:
     return out
 
 
+def judge_loop(rows: list[dict]) -> dict:
+    """Worst loop() pass per cycle; FAIL on any cycle over LOOP_FAIL_US.
+
+    Two columns feed it. `loop_cycle_max_us` is the max of the firmware's
+    per-window `loopwin=` values seen in that cycle: the cycle's own worst
+    pass. `loop_max_us` is since boot; over the limit it proves SOME pass this
+    boot was, so it fails too, attributed to the first cycle it was seen in.
+    """
+    worst = None          # (us, cycle, stage)
+    over: list[str] = []
+    boot_flagged = False  # this boot already has a cycle over the limit
+    reported = False
+    for r in rows:
+        cyc = r.get("cycle", "?")
+        cm = num(r.get("loop_cycle_max_us"))
+        bm = num(r.get("loop_max_us"))
+        if cm is not None or bm is not None:
+            reported = True
+        if cm is not None:
+            st = (r.get("loop_cycle_stage") or "").strip() or "?"
+            if worst is None or cm > worst[0]:
+                worst = (cm, cyc, st)
+            if cm > LOOP_FAIL_US:
+                over.append(f"cycle {cyc}: {cm / 1000:.0f} ms in {st}")
+                boot_flagged = True
+        if bm is not None and bm > LOOP_FAIL_US and not boot_flagged:
+            # The since-boot max says a pass this boot went over, and no
+            # per-cycle value has accounted for it (older firmware without
+            # loopwin=, or a pass before the first stats line was read).
+            st = (r.get("loop_max_stage") or "").strip() or "?"
+            if worst is None or bm > worst[0]:
+                worst = (bm, cyc, st)
+            over.append(f"cycle {cyc}: since-boot max {bm / 1000:.0f} ms "
+                        f"in {st}")
+            boot_flagged = True
+        if num(r.get("reboot")):
+            boot_flagged = False          # a new boot, a new since-boot max
+    fails: list[str] = []
+    if not rows:
+        pass
+    elif not reported:
+        fails.append("loop latency not reported (no loop_cycle_max_us / "
+                     "loop_max_us in the CSV): cannot be judged, so it is "
+                     "not passed")
+    elif over:
+        shown = "; ".join(over[:5]) + (f" (+{len(over) - 5} more)"
+                                       if len(over) > 5 else "")
+        fails.append(f"{len(over)} cycle(s) with a loop() pass over "
+                     f"{LOOP_FAIL_US // 1000} ms: {shown}")
+    return {"worst": worst, "over": over, "fails": fails}
+
+
+def judge(rows: list[dict], *, requested: int = 0,
+          mode: str = "SELFTEST") -> dict:
+    """THE soak verdict. Everything that reports one calls this."""
+    done = len(rows)
+    requested = requested or done
+    partial = done < requested
+
+    heap = judge_heap(rows)
+    loop = judge_loop(rows)
+    reboots = [r for r in rows if num(r.get("reboot"))]
+
+    fails: list[str] = []
+    if done == 0:
+        fails.append("no cycles completed")
+    fails += heap["fails"]
+    if reboots:
+        fails.append(f"{len(reboots)} reboot(s)")
+    fails += loop["fails"]
+
+    idle = None
+    if rows and all("bus_idle_closes" in r for r in rows):
+        idle = sum(num(r.get("bus_idle_closes")) or 0 for r in rows)
+        if idle and mode.upper() == "SELFTEST":
+            at = [r.get("cycle", "?") for r in rows
+                  if num(r.get("bus_idle_closes"))]
+            fails.append(f"{idle} bus-idle close(s) in SELFTEST, whose bus "
+                         f"never goes quiet -- every one is false (cycles "
+                         f"{', '.join(at[:12])}{' ...' if len(at) > 12 else ''})")
+    elif rows and mode.upper() == "SELFTEST":
+        fails.append("bus-idle closes not counted (no bus_idle_closes column): "
+                     "cannot be judged, so it is not passed")
+
+    panics = sum(num(r.get("panics")) or 0 for r in rows)
+    if panics:
+        fails.append(f"{panics} panic/assert line(s)")
+
+    if fails:
+        verdict = "FAIL"
+    elif partial:
+        verdict = "PARTIAL"
+    else:
+        verdict = "PASS"
+    return {"verdict": verdict, "fails": fails, "done": done,
+            "requested": requested, "partial": partial, "heap": heap,
+            "loop": loop, "reboots": reboots, "bus_idle_closes": idle,
+            "panics": panics}
+
+
+def read_rows(csv_path) -> list[dict]:
+    path = Path(csv_path)
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def verdict_lines(j: dict) -> list[str]:
+    """The VERDICT block soak_wifi.py prints into soak.log. Same words as
+    SUMMARY.md, from the same judge() result."""
+    out = [f"VERDICT: {j['verdict']} ({len(j['fails'])} failed check(s), "
+           f"{j['done']}/{j['requested']} cycles)"]
+    out += [f"  - {f}" for f in j["fails"]]
+    return out
+
+
+EXIT = {"PASS": 0, "FAIL": 1, "PARTIAL": 3}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
@@ -137,37 +279,25 @@ def main(argv=None) -> int:
     ap.add_argument("--context", default=None,
                     help="run-context.json -- start time and power state, so "
                          "the morning read has context it did not witness")
+    ap.add_argument("--verdict-file", default=None,
+                    help="write the verdict as JSON here; run_soak.ps1 takes "
+                         "DONE's state from it")
+    ap.add_argument("--mode", default="SELFTEST",
+                    help="board mode the soak ran in (run_soak.ps1 verifies "
+                         "SELFTEST before starting)")
     args = ap.parse_args(argv)
 
     path = Path(args.csv)
-    rows: list[dict] = []
-    if path.exists():
-        with path.open(encoding="utf-8", newline="") as fh:
-            rows = list(csv.DictReader(fh))
-
-    done = len(rows)
-    requested = args.requested or done
-    partial = done < requested
-
-    heap = judge_heap(rows)
-    reboots = [r for r in rows if num(r.get("reboot"))]
+    rows = read_rows(path)
+    j = judge(rows, requested=args.requested, mode=args.mode)
+    done, requested, partial = j["done"], j["requested"], j["partial"]
+    heap, reboots, fails, verdict = j["heap"], j["reboots"], j["fails"], j["verdict"]
     netstack = sum(num(r.get("netstack_12308")) or 0 for r in rows)
 
     reasons: dict[str, list[str]] = {}
     for r in reboots:
         reasons.setdefault(r.get("reset_reason") or "UNREPORTED",
                            []).append(r.get("cycle", "?"))
-
-    fails: list[str] = list(heap["fails"])
-    if reboots:
-        fails.append(f"{len(reboots)} reboot(s)")
-
-    if fails:
-        verdict = "FAIL"
-    elif partial:
-        verdict = "PARTIAL"
-    else:
-        verdict = "PASS"
 
     L: list[str] = []
     L.append("# Soak run summary\n")
@@ -200,6 +330,13 @@ def main(argv=None) -> int:
     L.append(f"- **cycles completed:** {done} of {requested}")
     L.append(f"- **reboots:** {len(reboots)}")
     L.append(f"- **netstack 12308 events:** {netstack}")
+    w = j["loop"]["worst"]
+    L.append("- **worst loop() pass:** " + (
+        f"{w[0] / 1000:.1f} ms at cycle {w[1]} (stage `{w[2]}`)" if w
+        else "not reported"))
+    bi = j["bus_idle_closes"]
+    L.append("- **bus-idle closes:** " + ("not counted" if bi is None
+                                         else str(bi)))
 
     # Heap, PER BOOT SEGMENT. A reset restores free heap and restarts the
     # min-free low-water mark, so a trend is only meaningful inside one boot.
@@ -271,7 +408,7 @@ def main(argv=None) -> int:
     # ⚠️ COUNTED, NEVER FAILED ON. Nothing acks overnight, so retention WILL
     # destroy unacked data and the board WILL say so -- loudly and correctly.
     # That is the "never silent" guarantee working, not a soak failure.
-    # THE SOAK VERDICT IS RESETS AND HEAP ONLY.
+    # Retention losses are not in the verdict (judge() above).
     losses = 0
     if args.log and Path(args.log).exists():
         losses = len(re.findall(r"EVICTED UNACKED TIER",
@@ -279,7 +416,7 @@ def main(argv=None) -> int:
                                                          errors="replace")))
     L.append(f"- **unacked-eviction warnings:** {losses} "
              f"_(expected with nothing acking — counted, NOT a failure. "
-             f"The verdict above is resets and heap only.)_")
+             f"Not part of the verdict.)_")
 
     L.append("\n## Reset classification\n")
     if not reboots:
@@ -365,9 +502,14 @@ def main(argv=None) -> int:
              f"summary is trustworthy even for a killed run)")
 
     Path(args.out).write_text("\n".join(L) + "\n", encoding="utf-8")
+    if args.verdict_file:
+        Path(args.verdict_file).write_text(json.dumps({
+            "verdict": verdict, "fails": fails, "cycles_done": done,
+            "cycles_requested": requested}, indent=2) + "\n", encoding="utf-8")
     print(f"SUMMARY: {verdict} -- {done}/{requested} cycles, "
           f"{len(reboots)} reboot(s) -> {args.out}")
-    return 0
+    # Non-zero unless PASS, so a caller cannot mistake a FAIL for success.
+    return EXIT[verdict]
 
 
 if __name__ == "__main__":

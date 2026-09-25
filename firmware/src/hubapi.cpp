@@ -130,14 +130,24 @@ static void handleSession(WebServer &srv) {
   // loop() latency since boot. The Wi-Fi join is a step-per-pass state
   // machine on the promise that no call blocks more than ~100 ms; this is the
   // measurement. `over_100ms` should stay 0; `max_stage` names the culprit.
+  //
+  // `interval` is the same since the PREVIOUS session read, and this read
+  // resets it: the since-boot max says a slow pass happened once, the
+  // interval says whether it is still happening.
   {
     const LoopStats *ls = cardiagLoopStats();
+    const LoopStats iv = cardiagLoopTakeWindow(LOOP_WIN_API);
     n = jsonAppend(buf, sizeof(buf), n,
         "\"loop\":{\"max_us\":%lu,\"max_stage\":\"%s\",\"max_stage_us\":%lu,"
-        "\"passes\":%lu,\"over_100ms\":%lu},",
+        "\"passes\":%lu,\"over_100ms\":%lu,"
+        "\"interval\":{\"max_us\":%lu,\"max_stage\":\"%s\",\"max_stage_us\":%lu,"
+        "\"passes\":%lu,\"over_100ms\":%lu}},",
         (unsigned long)ls->maxUs, ls->maxStage ? ls->maxStage : "",
         (unsigned long)ls->maxStageUs, (unsigned long)ls->passes,
-        (unsigned long)ls->over100ms);
+        (unsigned long)ls->over100ms,
+        (unsigned long)iv.maxUs, iv.maxStage ? iv.maxStage : "",
+        (unsigned long)iv.maxStageUs, (unsigned long)iv.passes,
+        (unsigned long)iv.over100ms);
   }
 
   // Stream counters. The hub counts datagrams it RECEIVED; these are what the
