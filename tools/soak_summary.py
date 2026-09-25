@@ -146,6 +146,49 @@ def main() -> int:
     L.append(f"- **reboots:** {len(reboots)}")
     L.append(f"- **netstack 12308 events:** {netstack}")
 
+    # ⭐ NEGATIVE detect_ms IS EXPECTED, AND SAYING SO HERE IS THE POINT.
+    # detect_ms is measured from the RETURN of Windows' hotspot-stop call, not
+    # from the moment the radio actually goes off. The board's STA-lost event
+    # fires a median ~1.5 s BEFORE that call returns -- the 50-cycle soak
+    # measured the same thing -- so the column is routinely negative and that
+    # is a property of the yardstick, not a fault.
+    #
+    # What WOULD be a finding is the sign flipping or the value drifting across
+    # the run, so that is what gets checked instead of the raw sign.
+    dets = [float(r["detect_ms"]) for r in rows
+            if (r.get("detect_ms") or "").strip()]
+    if dets:
+        med = statistics.median(dets)
+        L.append(f"- **detect_ms:** median {med:+.0f} ms "
+                 f"(min {min(dets):+.0f}, max {max(dets):+.0f})")
+        L.append("")
+        L.append("> ℹ️ **`detect_ms` is measured against the RETURN of the "
+                 "hotspot-stop call, not the radio-off instant.** The board's "
+                 "STA-lost event fires ~1.5 s before that call returns, so "
+                 "**negative values are expected and are not a fault** — the "
+                 "50-cycle soak measured the same offset. This is a floor on "
+                 "detection latency, not the worst case; a fading AP in a car "
+                 "is a different test.")
+        if len(dets) >= 10:
+            half = len(dets) // 2
+            first_med = statistics.median(dets[:half])
+            last_med = statistics.median(dets[half:])
+            signs = {d < 0 for d in dets}
+            if len(signs) > 1:
+                L.append(f"> ⚠️ **detect_ms CHANGES SIGN across the run** "
+                         f"(first half median {first_med:+.0f} ms, second half "
+                         f"{last_med:+.0f} ms). That is the case worth looking "
+                         f"at — the offset above is supposed to be stable.")
+            elif abs(last_med - first_med) > 1000:
+                L.append(f"> ⚠️ **detect_ms DRIFTS**: first half median "
+                         f"{first_med:+.0f} ms vs second half {last_med:+.0f} "
+                         f"ms. A stable offset should not move like this.")
+            else:
+                L.append(f"> ✅ Stable across the run (first half median "
+                         f"{first_med:+.0f} ms, second half {last_med:+.0f} "
+                         f"ms) — no sign change, no drift.")
+        L.append("")
+
     # ⚠️ COUNTED, NEVER FAILED ON. Nothing acks overnight, so retention WILL
     # destroy unacked data and the board WILL say so -- loudly and correctly.
     # That is the "never silent" guarantee working, not a soak failure.
