@@ -79,6 +79,10 @@ RE_NETSTACK = re.compile(r"netstack cb reg failed with (\d+)")
 # The ROM prints these on every reset. Seeing one MID-RUN means the board
 # restarted, which is the failure mode a recovering fault would otherwise hide.
 RE_BOOT = re.compile(r"(rst:0x[0-9a-fA-F]+|ESP-ROM:esp32)")
+# The firmware's own classification, printed once per boot in setup().
+# Strictly better than decoding rst:0x.. by hand, and it is the line that
+# separates "the bench supply sagged" from "our code hung".
+RE_RESET_REASON = re.compile(r"\[boot\] RESET REASON:\s*(\w+)")
 RE_PANIC = re.compile(r"(Guru Meditation|abort\(\) was called|StoreProhibited|"
                       r"LoadProhibited|assert failed)")
 
@@ -106,6 +110,47 @@ class Cycle:
     largest: int | None = None
     netstack: int = 0
     reboot: bool = False
+    # ⭐ WHY the board rebooted, from the firmware's own [boot] RESET REASON
+    # line. A soak that counts reboots but cannot say why is a reboot counter,
+    # not a diagnosis. BROWNOUT on the bench means the supply sagged -- the
+    # harness or the USB cable -- and is a DIFFERENT finding from TASK_WDT or
+    # PANIC, which are ours. Empty when no reset was observed this cycle.
+    reset_reason: str = ""
+
+
+CSV_FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
+              "reason", "heap", "minheap", "largest_block", "netstack_12308",
+              "reboot", "reset_reason"]
+
+
+def csv_path(args) -> str:
+    return args.csv or os.path.join(HERE, "soak_wifi_result.csv")
+
+
+def write_cycle_row(args, c) -> None:
+    """Append ONE cycle and flush.
+
+    🛑 The uninterruptible-work rule: an overnight run can be cut at any time,
+    and a killed run must leave usable partial data. This used to be a single
+    write at the end of report(), so a soak killed at cycle 199 of 200 left
+    nothing at all.
+    """
+    out = csv_path(args)
+    new = not os.path.exists(out) or os.path.getsize(out) == 0
+    with open(out, "a", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(CSV_FIELDS)
+        w.writerow([c.n,
+                    f"{c.detect_ms:.1f}" if c.detect_ms is not None else "",
+                    f"{c.rejoin_ms:.1f}" if c.rejoin_ms is not None else "",
+                    c.fallback_ms if c.fallback_ms is not None else "",
+                    c.drop_path, c.reason if c.reason is not None else "",
+                    c.heap or "", c.minheap or "",
+                    c.largest or "", c.netstack, int(c.reboot),
+                    c.reset_reason])
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 @dataclass
@@ -305,8 +350,21 @@ def run(args) -> int:
             if RE_BOOT.search(ln.text):
                 cyc.reboot = True
                 tot.reboots += 1
+            m = RE_RESET_REASON.search(ln.text)
+            if m:
+                cyc.reset_reason = m.group(1)
+                # A reset reason line IS a boot, even if the ROM banner was
+                # missed -- USB CDC re-enumeration can swallow the first lines.
+                if not cyc.reboot:
+                    cyc.reboot = True
+                    tot.reboots += 1
 
         cycles.append(cyc)
+        # 🛑 UNINTERRUPTIBLE-WORK RULE: flush this cycle to disk NOW. A
+        # 200-cycle overnight soak that is killed at cycle 180 must leave 180
+        # usable rows, not an empty file. The CSV used to be written once in
+        # report(), so any interruption lost the entire run.
+        write_cycle_row(args, cyc)
         d = f"{cyc.detect_ms/1000:6.2f}s" if cyc.detect_ms is not None else "  MISS "
         j = f"{cyc.rejoin_ms/1000:6.2f}s" if cyc.rejoin_ms is not None else "  MISS "
         print(f"  [{n:>3}/{args.cycles}] detect={d} rejoin={j} "
@@ -456,6 +514,37 @@ def report(cycles: list[Cycle], tot: Totals, args):
 
     if tot.reboots:
         fails.append(f"{tot.reboots} reboot(s)")
+
+    # ⭐ CLASSIFY EVERY RESET. "3 reboots" is not a finding; "3 BROWNOUTs" and
+    # "3 TASK_WDTs" are completely different findings, and on the bench only
+    # one of them is about our code. The firmware prints its own reason at
+    # boot, so this is read, not inferred.
+    reasons: dict[str, list[int]] = {}
+    for c in cycles:
+        if c.reboot:
+            reasons.setdefault(c.reset_reason or "UNREPORTED", []).append(c.n)
+    if reasons:
+        print()
+        print("reset reasons")
+        for name, at in sorted(reasons.items()):
+            where = ", ".join(str(n) for n in at[:12])
+            more = f" (+{len(at) - 12} more)" if len(at) > 12 else ""
+            print(f"  {name:<11} {len(at):>3}  at cycle(s) {where}{more}")
+        supply = sum(len(v) for k, v in reasons.items() if k == "BROWNOUT")
+        ours = sum(len(v) for k, v in reasons.items()
+                   if k in ("PANIC", "TASK_WDT", "INT_WDT", "WDT"))
+        if supply:
+            print(f"  -> {supply} BROWNOUT: the SUPPLY sagged, not the "
+                  f"firmware. On the bench that is the harness or the USB "
+                  f"cable. Re-run on USB power from a direct port before "
+                  f"reading anything else into it.")
+        if ours:
+            print(f"  -> {ours} PANIC/WDT: these ARE ours and are the real "
+                  f"finding of this run.")
+        if "UNREPORTED" in reasons:
+            print(f"  -> UNREPORTED means the board booted without printing "
+                  f"[boot] RESET REASON -- firmware older than that line. "
+                  f"Reflash before trusting the classification.")
     if tot.panics:
         fails.append(f"{tot.panics} panic/assert(s)")
 
@@ -468,22 +557,9 @@ def report(cycles: list[Cycle], tot: Totals, args):
         print(f"VERDICT: PASS over {len(cycles)} cycles -- heap flat, min free "
               f"heap stable, no fragmentation trend, no reboots or panics.")
 
-    out = args.csv or os.path.join(HERE, "soak_wifi_result.csv")
-    with open(out, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["cycle", "detect_ms", "rejoin_ms", "fallback_ms",
-                    "drop_path", "reason", "heap", "minheap",
-                    "largest_block", "netstack_12308", "reboot"])
-        for c in cycles:
-            w.writerow([c.n,
-                        f"{c.detect_ms:.1f}" if c.detect_ms is not None else "",
-                        f"{c.rejoin_ms:.1f}" if c.rejoin_ms is not None else "",
-                        c.fallback_ms if c.fallback_ms is not None else "",
-                        c.drop_path, c.reason if c.reason is not None else "",
-                        c.heap or "", c.minheap or "",
-                        c.largest or "", c.netstack, int(c.reboot)])
+    out = csv_path(args)
     print()
-    print(f"per-cycle CSV -> {out}")
+    print(f"per-cycle CSV -> {out}   (written and flushed EVERY cycle)")
     # Non-zero on FAIL so this is usable from a script, not just by eye.
     return 1 if fails else 0
 

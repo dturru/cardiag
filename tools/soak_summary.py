@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Write SUMMARY.md for a soak run FROM ITS CSV, so a killed run still gets one.
+
+🛑 This is the half of the uninterruptible-work rule that the old soak was
+missing. soak_wifi.py's own report() only runs if the soak reaches the end; an
+overnight run cut at 3am produced no verdict at all. This reads the per-cycle
+CSV -- which is flushed every cycle -- so a partial run gets a real summary
+saying exactly how far it got and what the data so far shows.
+
+It judges the two things the soak exists to answer:
+
+  HEAP FLAT     free-heap slope across cycles, and min-free-heap, which only
+                ever falls and is NOT restored by a reboot -- so it is the
+                honest leak signal when a reboot happened.
+  ZERO REBOOTS  and, for each one, WHY. "3 reboots" is not a finding.
+                "3 BROWNOUTs" (the supply sagged) and "3 TASK_WDTs" (our code
+                hung) are different findings with different fixes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+import statistics
+from pathlib import Path
+
+# Resets that are about the power supply, not our firmware. On the bench with
+# the CAN harness disconnected and the cable taped to a direct USB port, a
+# BROWNOUT is a real finding about the board or the cable.
+SUPPLY = {"BROWNOUT"}
+# Resets that are ours, and the actual point of a stability soak.
+OURS = {"PANIC", "TASK_WDT", "INT_WDT", "WDT"}
+
+
+def num(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def slope(ys: list[int]) -> float:
+    """Least-squares slope in bytes/cycle. Two points is enough to be honest."""
+    n = len(ys)
+    if n < 2:
+        return 0.0
+    xs = list(range(n))
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    if den == 0:
+        return 0.0
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--log", default=None)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--requested", type=int, default=0)
+    args = ap.parse_args()
+
+    path = Path(args.csv)
+    rows: list[dict] = []
+    if path.exists():
+        with path.open(encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+
+    done = len(rows)
+    requested = args.requested or done
+    partial = done < requested
+
+    heaps = [num(r.get("heap")) for r in rows]
+    heaps = [h for h in heaps if h is not None]
+    mins = [num(r.get("minheap")) for r in rows]
+    mins = [m for m in mins if m is not None]
+    reboots = [r for r in rows if num(r.get("reboot"))]
+    netstack = sum(num(r.get("netstack_12308")) or 0 for r in rows)
+
+    reasons: dict[str, list[str]] = {}
+    for r in reboots:
+        reasons.setdefault(r.get("reset_reason") or "UNREPORTED",
+                           []).append(r.get("cycle", "?"))
+
+    fails: list[str] = []
+    heap_slope = slope(heaps) if len(heaps) >= 2 else 0.0
+    if len(heaps) >= 10 and heap_slope < -64:
+        fails.append(f"free heap trending down {heap_slope:+.0f} B/cycle")
+    min_drop = (mins[0] - mins[-1]) if len(mins) >= 2 else 0
+    if min_drop > 4096:
+        fails.append(f"min free heap fell {min_drop} B across the run")
+    if reboots:
+        fails.append(f"{len(reboots)} reboot(s)")
+
+    if fails:
+        verdict = "FAIL"
+    elif partial:
+        verdict = "PARTIAL"
+    else:
+        verdict = "PASS"
+
+    L: list[str] = []
+    L.append("# Soak run summary\n")
+    L.append(f"**VERDICT: {verdict}** ({len(fails)} failed check(s))\n")
+    if partial:
+        L.append(f"> ⚠️ **PARTIAL — {done} of {requested} cycles.** The run did "
+                 f"not finish, so this is what the completed cycles show, not "
+                 f"a verdict on {requested}. Top it up with "
+                 f"`run_soak.ps1 -Resume`.\n")
+    if done == 0:
+        L.append("\n> 🔴 **No cycles completed.** Nothing to judge — check "
+                 "`runner.log`, `flash.log` and `soak.log`.\n")
+
+    L.append(f"- **cycles completed:** {done} of {requested}")
+    if heaps:
+        L.append(f"- **free heap:** {heaps[0]} -> {heaps[-1]} B "
+                 f"(slope {heap_slope:+.1f} B/cycle)")
+    if mins:
+        L.append(f"- **min free heap:** {mins[0]} -> {mins[-1]} B "
+                 f"({-min_drop:+d}) — never restored by a reboot, so this is "
+                 f"the honest leak signal")
+    L.append(f"- **reboots:** {len(reboots)}")
+    L.append(f"- **netstack 12308 events:** {netstack}")
+
+    L.append("\n## Reset classification\n")
+    if not reboots:
+        L.append("No resets observed. ✅ That is the stability claim.")
+    else:
+        L.append("| Reason | Count | At cycle(s) |")
+        L.append("|---|---|---|")
+        for name, at in sorted(reasons.items()):
+            shown = ", ".join(at[:12]) + (f" (+{len(at)-12})" if len(at) > 12 else "")
+            L.append(f"| `{name}` | {len(at)} | {shown} |")
+        supply = sum(len(v) for k, v in reasons.items() if k in SUPPLY)
+        ours = sum(len(v) for k, v in reasons.items() if k in OURS)
+        unrep = len(reasons.get("UNREPORTED", []))
+        L.append("")
+        if supply:
+            L.append(f"- 🔌 **{supply} BROWNOUT — the SUPPLY sagged, not the "
+                     f"firmware.** With the CAN harness disconnected and the "
+                     f"cable taped to a direct USB port, this is about the "
+                     f"board or the cable. Not a firmware finding.")
+        if ours:
+            L.append(f"- 🔴 **{ours} PANIC/WDT — these ARE ours** and are the "
+                     f"real finding of this run.")
+        if unrep:
+            L.append(f"- ⚪ **{unrep} UNREPORTED** — the board booted without "
+                     f"printing `[boot] RESET REASON`, so it is running "
+                     f"firmware older than that line. Reflash before trusting "
+                     f"any classification here.")
+
+    if fails:
+        L.append("\n## Failed checks\n")
+        for f in fails:
+            L.append(f"- {f}")
+
+    if args.log and Path(args.log).exists():
+        text = Path(args.log).read_text(encoding="utf-8", errors="replace")
+        hits = re.findall(r"^.*(Guru Meditation|abort\(\) was called|"
+                          r"StoreProhibited|LoadProhibited|RESET REASON).*$",
+                          text, re.MULTILINE)
+        if hits:
+            L.append(f"\n## Notable serial lines\n\n_{len(hits)} match(es); "
+                     f"full text in `soak.log`._")
+
+    L.append("\n---\n")
+    L.append(f"per-cycle CSV -> `{path.name}` (flushed every cycle, so this "
+             f"summary is trustworthy even for a killed run)")
+
+    Path(args.out).write_text("\n".join(L) + "\n", encoding="utf-8")
+    print(f"SUMMARY: {verdict} -- {done}/{requested} cycles, "
+          f"{len(reboots)} reboot(s) -> {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

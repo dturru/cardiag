@@ -37,6 +37,7 @@
 #include "filestore.h"
 #include "transceiver.h"
 #include <esp_task_wdt.h>
+#include <esp_system.h>   // esp_reset_reason() -- why this boot was a boot
 
 static void selfTestReset();
 
@@ -499,6 +500,34 @@ void setup() {
 
   Serial.println();
   Serial.println("cardiag");
+
+  // ⭐ WHY THIS BOOT WAS A BOOT. Nothing printed it before, although the
+  // handoff notes twice claimed "the firmware prints the reset reason on boot
+  // and settles it in one line" -- it did not, which is why the 2026-09-24
+  // mid-run reboot went three sessions without an answer. A soak that counts
+  // reboots but cannot say WHY is a reboot counter, not a diagnosis.
+  //
+  // BROWNOUT here means the supply sagged: on the bench that is the dupont
+  // harness or the USB cable, not a firmware fault. TASK_WDT, INT_WDT and
+  // PANIC are ours. Keeping the two classes separable is the whole point.
+  {
+    const esp_reset_reason_t rr = esp_reset_reason();
+    const char *name;
+    switch (rr) {
+      case ESP_RST_POWERON:   name = "POWERON";   break;
+      case ESP_RST_EXT:       name = "EXT";       break;
+      case ESP_RST_SW:        name = "SW";        break;
+      case ESP_RST_PANIC:     name = "PANIC";     break;
+      case ESP_RST_INT_WDT:   name = "INT_WDT";   break;
+      case ESP_RST_TASK_WDT:  name = "TASK_WDT";  break;
+      case ESP_RST_WDT:       name = "WDT";       break;
+      case ESP_RST_DEEPSLEEP: name = "DEEPSLEEP"; break;
+      case ESP_RST_BROWNOUT:  name = "BROWNOUT";  break;
+      case ESP_RST_SDIO:      name = "SDIO";      break;
+      default:                name = "UNKNOWN";   break;
+    }
+    Serial.printf("[boot] RESET REASON: %s (%d)\n", name, (int)rr);
+  }
 
   snifferBegin();
   recorderBegin();
