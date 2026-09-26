@@ -40,6 +40,29 @@ KNOWN_PLACEHOLDERS = {
     "REPLACE_ME", "xxxxxxxx", "password", "secret",
 }
 
+# Keys whose value is an address, not a secret (tools/secret_scan_allow.txt).
+# Exact names only. A name that looks like a credential is refused even if
+# listed, so the allowlist cannot be used to silence a real secret.
+ALLOW_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "secret_scan_allow.txt")
+NEVER_ALLOW = re.compile(r"TOKEN|PASS|SECRET|KEY", re.I)
+
+
+def load_allowlist(path: str = ALLOW_FILE) -> set[str]:
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        print(f"  allowlist absent ({path}): every key is scanned")
+        return set()
+    names = {ln.strip() for ln in lines
+             if ln.strip() and not ln.lstrip().startswith("#")}
+    bad = sorted(n for n in names if NEVER_ALLOW.search(n))
+    if bad:
+        raise SystemExit(f"secret_scan_allow.txt lists credential-like keys "
+                         f"{bad}: refusing to skip them")
+    return names
+
+
 # C #define "VALUE"  |  KEY=VALUE
 #
 # 🐛 `[^\S\n]` (horizontal whitespace), NOT `\s`. `\s` MATCHES NEWLINES, so on
@@ -64,8 +87,13 @@ def fp(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:12]
 
 
-def extract(path: str) -> dict[str, str]:
-    """Pull name -> value pairs out of a secrets file."""
+def extract(path: str, allow: set[str] | None = None) -> dict[str, str]:
+    """Pull name -> value pairs out of a secrets file.
+
+    Keys in `allow` are skipped (and reported as skipped): their values are
+    addresses that legitimately appear in the repo.
+    """
+    allow = allow or set()
     try:
         text = open(path, encoding="utf-8", errors="replace").read()
     except OSError as exc:
@@ -76,7 +104,9 @@ def extract(path: str) -> dict[str, str]:
     for pat in PATTERNS:
         for m in pat.finditer(text):
             name, value = m.group(1), m.group(2).strip().strip('"').strip("'")
-            if not value:
+            if name in allow:
+                skipped.append(f"{name} (allowlisted: not a secret)")
+            elif not value:
                 skipped.append(f"{name} (no value set)")
             elif value in KNOWN_PLACEHOLDERS:
                 skipped.append(f"{name} (placeholder)")
@@ -156,12 +186,13 @@ def main(argv=None) -> int:
     repo = os.path.abspath(args.repo)
     print(f"repo: {repo}")
 
+    allow = load_allowlist()
     secrets: dict[str, str] = {}
     for spec in args.secrets:
         if not os.path.exists(spec):
             print(f"  secrets file absent, skipped: {spec}")
             continue
-        found = extract(spec)
+        found = extract(spec, allow)
         print(f"  {spec}: {len(found)} value(s)")
         for name, value in found.items():
             print(f"      {name:<20} len={len(value):<3} sha256={fp(value)}")
