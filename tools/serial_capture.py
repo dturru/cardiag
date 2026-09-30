@@ -11,11 +11,19 @@ produces EVIDENCE rather than a recollection.
 `--send` writes a key to the device's serial console after `--delay` seconds,
 which is how the firmware's single-key commands (mode changes, status) are
 driven without a human at the keyboard.
+
+`--send-file` writes a file line by line after the `--send` keys. It is for
+credential provisioning (`:cred ...`, docs/provisioning.md): the file's
+contents are NEVER printed or logged -- only its line count and a sha256
+fingerprint. `--send` echoes what it sends, so never put a secret in it.
+
+    python tools/serial_capture.py --port COM3 --seconds 20 --send-file provision.txt
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -73,6 +81,12 @@ def main(argv=None) -> int:
                     help="seconds to wait before the first --send")
     ap.add_argument("--gap", type=float, default=1.0,
                     help="seconds between successive --send values")
+    ap.add_argument("--send-file", metavar="PATH",
+                    help="send this file line by line after the --send keys; "
+                         "contents are never echoed (credential provisioning)")
+    ap.add_argument("--line-gap", type=float, default=0.05,
+                    help="seconds between --send-file lines (the board's RX "
+                         "buffer is small)")
     ap.add_argument("--reset", action="store_true",
                     help="hard-reset the board via esptool BEFORE capturing, "
                          "so the boot banner is in the log. Exits non-zero if "
@@ -105,6 +119,16 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 3
 
+    file_lines = None
+    if args.send_file:
+        with open(args.send_file, "rb") as f:
+            data = f.read()
+        file_lines = [ln.rstrip(b"\r") for ln in data.split(b"\n")]
+        while file_lines and not file_lines[-1]:
+            file_lines.pop()
+        file_fp = "sha256:" + hashlib.sha256(data).hexdigest()[:8]
+        del data
+
     ser = serial.Serial()
     ser.port = args.port
     ser.baudrate = args.baud
@@ -133,6 +157,22 @@ def main(argv=None) -> int:
                     fh.write(line + "\n")
                     fh.flush()
                 next_send = now + args.gap
+            elif file_lines is not None and not pending and now >= next_send:
+                for ln in file_lines:
+                    ser.write(ln + b"\n")
+                    ser.flush()
+                    time.sleep(args.line_gap)
+                # Never the contents: a count and a fingerprint only.
+                line = (f"[{time.monotonic() - t0:8.3f}] >>> SENT FILE "
+                        f"{os.path.basename(args.send_file)} "
+                        f"({len(file_lines)} lines, {file_fp})")
+                file_lines = None
+                if not args.quiet:
+                    print(line, flush=True)
+                if fh:
+                    fh.write(line + "\n")
+                    fh.flush()
+                next_send = time.monotonic() + args.gap
 
             chunk = ser.read(4096)
             if not chunk:

@@ -276,8 +276,8 @@ void webuiStart() {
   g_apMode  = true;
   // The password is NOT printed. That was harmless while it was the repo
   // default and is not now that it is a real rotated secret: serial output is
-  // captured to files by the soak harness and pasted into notes. It lives in
-  // firmware/include/secrets.h.
+  // captured to files by the soak harness and pasted into notes. It is
+  // WIFI_AP_PASS from the gitignored firmware/include/secrets.h.
   Serial.printf("AP up: SSID \"%s\"  ->  http://%s/\n",
                 WIFI_AP_SSID, WiFi.softAPIP().toString().c_str());
 }

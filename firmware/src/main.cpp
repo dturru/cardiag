@@ -42,6 +42,7 @@
 #include "transceiver.h"
 #include "bootguard.h"
 #include "bootguard_rt.h"
+#include "creds.h"
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason() -- why this boot was a boot
 #include <esp_core_dump.h>  // and, on a crash, WHERE it died
@@ -414,6 +415,7 @@ static void printHelp() {
   Serial.println("keys:  1 listen   2 sniff   3 selftest*   4 poll*   (* transmits, asks to confirm)");
   Serial.println("       c clear marks   p pause   r reset table   w wifi ap   h help");
   Serial.println("       l start/stop change log   k clear change log");
+  Serial.println("       :cred help   hub-link credentials (NVS)");
   Serial.println("button: short press cycles LISTEN <-> SNIFF (passive modes only)");
   Serial.println();
 }
@@ -453,8 +455,13 @@ static void __attribute__((noinline)) debugPanicNow() {
 #endif
 
 static void handleKeys() {
+  credsConsoleTick();
   while (Serial.available()) {
     const int ch = Serial.read();
+
+    // A ':' line (and a `:cred ca` PEM) belongs to creds and is never seen
+    // as single keys -- a '3' inside a password must not start SELFTEST.
+    if (credsConsoleFeed(ch)) continue;
 
 #if defined(CARDIAG_DEBUG_PANIC) && CARDIAG_DEBUG_PANIC
     // '!' arms, 'y' within the confirm window fires. Anything else disarms.
@@ -633,6 +640,9 @@ void setup() {
 
   snifferBegin();
   recorderBegin();
+  // Hub-link credentials from NVS, before anything that uses them. Prints
+  // PROVISIONED (fingerprints only) or STANDALONE.
+  credsBegin();
   g_prefs.begin("cardiag", false);
   uint8_t stored = g_prefs.getUChar("mode", CARDIAG_MODE);
   if (modeTransmits(stored)) {

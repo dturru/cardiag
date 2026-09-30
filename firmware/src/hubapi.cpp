@@ -13,22 +13,15 @@
 #include "session.h"
 #include "sniffer.h"
 #include "config.h"
-#include "secrets.h"
+#include "creds.h"
 #include "coredump.h"
 
-// Constant-time compare. A length-dependent early return on a shared token is
-// a timing oracle; cheap to avoid, so avoid it.
+// The token lives in NVS (creds.h); the compare is constant-time
+// (credTokenEqual) and fails closed when no token is provisioned.
 static bool tokenOk(WebServer &srv) {
   if (!srv.hasHeader("X-Hub-Token")) return false;
   const String got = srv.header("X-Hub-Token");
-  const char  *want = HUB_API_TOKEN;
-  const size_t wlen = strlen(want);
-  uint8_t diff = (uint8_t)(got.length() ^ wlen);
-  for (size_t i = 0; i < wlen; i++) {
-    const char c = (i < got.length()) ? got[i] : 0;
-    diff |= (uint8_t)(c ^ want[i]);
-  }
-  return diff == 0;
+  return credsTokenOk(got.c_str(), got.length());
 }
 
 bool hubapiTokenOk(WebServer &srv) { return tokenOk(srv); }
