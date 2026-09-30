@@ -30,7 +30,11 @@ enum CredField : uint8_t {
 #define CRED_MQTT_PASS_MAX  128
 #define CRED_TOKEN_MIN      8
 #define CRED_TOKEN_MAX      128
-#define CRED_CA_MAX         4096
+// PEM bytes. The hub CA is EC P-256 (~0.7 kB PEM); 2 kB also fits RSA-2048/3072.
+// Kept well under the NVS budget: the whole nvs partition is 20 kB (0x5000),
+// shared with bootguard and the mode prefs, and a commit that replaces the CA
+// briefly holds old and new copies.
+#define CRED_CA_MAX         2048
 // One console line. A PEM body line is 64; `cred set mqtt_pass <128>` is the
 // longest command.
 #define CRED_LINE_MAX       160
@@ -49,6 +53,7 @@ enum CredErr : uint8_t {
   CRED_E_CHARSET,
   CRED_E_PLACEHOLDER,   // a value from secrets.h.example / the old defaults
   CRED_E_PEM,
+  CRED_E_PAIR,          // ssid without pass, mqtt_user without mqtt_pass...
 };
 const char *credErrName(CredErr e);
 
@@ -57,18 +62,30 @@ const char *credErrName(CredErr e);
 bool    credIsPlaceholder(const char *v, size_t n);
 CredErr credValidate(CredField f, const char *v, size_t n);
 
+// Fields whose value is a secret: pass, mqtt_pass, token.
+bool credIsSecret(CredField f);
+
+// The WHOLE set a commit would leave behind, by presence. ssid/pass and
+// mqtt_user/mqtt_pass go together or not at all. On failure *bad names the
+// field whose partner is missing.
+CredErr credCheckSet(const bool present[CRED_FIELD_COUNT], CredField *bad);
+
 // ---------------------------------------------------------------------------
 // Console line (without the leading ':' that puts the console in line mode):
 //
 //   cred show
-//   cred set <ssid|pass|mqtt_user|mqtt_pass|token> <value...>
+//   cred set <ssid|pass|mqtt_user|mqtt_pass|token> <value...>   (staged)
 //   cred ca                     then the PEM, ending at -----END CERTIFICATE-----
-//   cred clear <field|all>
+//   cred clear <field|all>                                       (staged)
+//   cred commit                 validate the whole set, then write it
+//   cred abort                  drop everything staged
 //   cred import                 one-time, from a legacy secrets.h
 //   cred help
 //
-// A value is everything after the single space that follows the field name,
-// so an SSID may contain spaces. Trailing CR/LF is not part of it.
+// A value is LITERAL: every byte after the single space that follows the field
+// name, up to the line end. Spaces (leading, inner, trailing) and quotes are
+// part of it; there is no quoting or escaping. Trailing CR/LF is not part of
+// it.
 // ---------------------------------------------------------------------------
 enum CredCmd : uint8_t {
   CRED_CMD_NONE = 0,   // not a `cred` line
@@ -79,6 +96,8 @@ enum CredCmd : uint8_t {
   CRED_CMD_CA,
   CRED_CMD_CLEAR,
   CRED_CMD_IMPORT,
+  CRED_CMD_COMMIT,
+  CRED_CMD_ABORT,
 };
 
 struct CredParsed {
@@ -92,14 +111,23 @@ struct CredParsed {
 CredParsed credParseLine(const char *line, size_t n);
 
 // ---------------------------------------------------------------------------
-// Fingerprints.
+// What is printed in place of a value (credDescribe).
 //
-// "sha256:" + the first 8 hex of SHA-256(value): enough to tell "same value as
-// on my laptop" from "not", and all that is ever printed. Check one locally:
-//     printf %s 'value' | sha256sum | cut -c1-8
-// For the CA the hash is over the DER, so it matches the first 8 hex of
-//     openssl x509 -in ca.pem -noout -fingerprint -sha256
+//   secrets (pass, mqtt_pass, token)  "set, N chars" -- NO hash. A plain hash
+//       of a low-entropy passphrase is an offline guess-checker for anyone
+//       holding a serial log; a keyed hash could not be checked on a laptop,
+//       which was its only use. The length is enough to catch a truncated
+//       or whitespace-padded paste.
+//   ssid, mqtt_user                   "sha256:" + first 8 hex of SHA-256.
+//       Not secrets (the SSID is broadcast), just kept out of pasted logs.
+//       Check locally:  printf %s 'value' | sha256sum | cut -c1-8
+//   ca                                SHA-256 of the DER: the first 8 hex of
+//       openssl x509 -in ca.pem -noout -fingerprint -sha256
+//       A CA is public; this is the standard way to name one.
 // ---------------------------------------------------------------------------
+#define CRED_DESC_LEN 24
+void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN]);
+
 #define CRED_FP_LEN 15   // "sha256:" + 8 hex
 void credSha256(const uint8_t *d, size_t n, uint8_t out[32]);
 void credFingerprint(const uint8_t *d, size_t n, char out[CRED_FP_LEN + 1]);

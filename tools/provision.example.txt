@@ -7,4 +7,5 @@
 -----BEGIN CERTIFICATE-----
 <paste the hub CA PEM body here>
 -----END CERTIFICATE-----
+:cred commit
 :cred show

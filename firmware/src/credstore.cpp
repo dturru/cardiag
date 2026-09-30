@@ -1,5 +1,6 @@
 #include "credstore.h"
 
+#include <stdio.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ const char *credErrName(CredErr e) {
     case CRED_E_CHARSET:     return "bad character";
     case CRED_E_PLACEHOLDER: return "placeholder value";
     case CRED_E_PEM:         return "not a single PEM certificate";
+    case CRED_E_PAIR:        return "set without its pair";
   }
   return "?";
 }
@@ -120,6 +122,21 @@ CredErr credValidate(CredField f, const char *v, size_t n) {
   }
 }
 
+bool credIsSecret(CredField f) {
+  return f == CRED_PASS || f == CRED_MQTT_PASS || f == CRED_TOKEN;
+}
+
+CredErr credCheckSet(const bool present[CRED_FIELD_COUNT], CredField *bad) {
+  static const CredField pairs[][2] = {{CRED_SSID, CRED_PASS},
+                                       {CRED_MQTT_USER, CRED_MQTT_PASS}};
+  for (const auto &pr : pairs) {
+    if (present[pr[0]] == present[pr[1]]) continue;
+    if (bad) *bad = present[pr[0]] ? pr[1] : pr[0];
+    return CRED_E_PAIR;
+  }
+  return CRED_OK;
+}
+
 // ---------------------------------------------------------------------------
 // Console line parser
 // ---------------------------------------------------------------------------
@@ -160,6 +177,8 @@ CredParsed credParseLine(const char *line, size_t n) {
   if (wordIs(w, wn, "show") && !hasArg)   { r.cmd = CRED_CMD_SHOW;   return r; }
   if (wordIs(w, wn, "ca") && !hasArg)     { r.cmd = CRED_CMD_CA;     return r; }
   if (wordIs(w, wn, "import") && !hasArg) { r.cmd = CRED_CMD_IMPORT; return r; }
+  if (wordIs(w, wn, "commit") && !hasArg) { r.cmd = CRED_CMD_COMMIT; return r; }
+  if (wordIs(w, wn, "abort") && !hasArg)  { r.cmd = CRED_CMD_ABORT;  return r; }
 
   if (wordIs(w, wn, "clear") && hasArg) {
     const char *w3;
@@ -341,6 +360,16 @@ void credCaFingerprint(const char *pem, size_t n, char out[CRED_FP_LEN + 1]) {
     return;
   }
   credFingerprint(s_der, dl, out);
+}
+
+void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN]) {
+  if (credIsSecret(f)) {
+    snprintf(out, CRED_DESC_LEN, "set, %u chars", (unsigned)n);
+  } else if (f == CRED_CA) {
+    credCaFingerprint(v, n, out);
+  } else {
+    credFingerprint((const uint8_t *)v, n, out);
+  }
 }
 
 // ---------------------------------------------------------------------------

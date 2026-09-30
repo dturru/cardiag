@@ -8,14 +8,17 @@
 // provisioned the logger runs STANDALONE -- its own AP, no hub join -- and
 // says so at boot.
 //
-// Values never leave this module except as a fingerprint (credstore.h).
+// Values never leave this module: a secret shows as "set, N chars", other
+// fields as a fingerprint (credDescribe, credstore.h).
 
 #include <stddef.h>
 #include <stdint.h>
 
 // Load the active set from NVS and print the boot banner. Call once, early in
-// setup(), before hublinkBegin(). The active set is fixed until the next boot:
-// `cred set` / `clear` write NVS and ask for a reset.
+// setup(), before hublinkBegin(). The ONLY NVS read outside a console command;
+// the active set is fixed until the next boot. `cred set` / `clear` only
+// stage; `cred commit` validates the whole set and writes it under a
+// `complete` flag, so an interrupted commit boots as NOT provisioned.
 void credsBegin();
 
 // Hub Wi-Fi (the hub's AP) provisioned: SSID and passphrase both present.

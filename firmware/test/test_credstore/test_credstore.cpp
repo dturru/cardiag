@@ -239,6 +239,77 @@ void test_token_prefix_plus_256_bytes_rejected(void) {
   TEST_ASSERT_FALSE(credTokenEqual(want, wl, got, wl + 256));
 }
 
+// --- Display / set checks ---------------------------------------------------
+
+void test_describe_secrets_show_length_never_a_hash(void) {
+  char d[CRED_DESC_LEN];
+  const CredField secrets[] = {CRED_PASS, CRED_MQTT_PASS, CRED_TOKEN};
+  for (CredField f : secrets) {
+    TEST_ASSERT_TRUE(credIsSecret(f));
+    credDescribe(f, "hunter2-hunter2", 15, d);
+    TEST_ASSERT_EQUAL_STRING("set, 15 chars", d);
+    TEST_ASSERT_NULL(strstr(d, "sha256"));
+  }
+}
+
+void test_describe_public_fields_use_sha256(void) {
+  char d[CRED_DESC_LEN];
+  TEST_ASSERT_FALSE(credIsSecret(CRED_SSID));
+  credDescribe(CRED_SSID, "abc", 3, d);
+  TEST_ASSERT_EQUAL_STRING("sha256:ba7816bf", d);
+  credDescribe(CRED_MQTT_USER, "abc", 3, d);
+  TEST_ASSERT_EQUAL_STRING("sha256:ba7816bf", d);
+  credDescribe(CRED_CA, kPem, strlen(kPem), d);
+  TEST_ASSERT_EQUAL_STRING("sha256:4c0166be", d);
+}
+
+void test_check_set_pairs(void) {
+  bool p[CRED_FIELD_COUNT] = {false};
+  CredField bad = CRED_NONE;
+  TEST_ASSERT_EQUAL(CRED_OK, credCheckSet(p, &bad));          // empty is valid
+  p[CRED_TOKEN] = true;
+  p[CRED_CA] = true;
+  TEST_ASSERT_EQUAL(CRED_OK, credCheckSet(p, &bad));          // singles ok
+  p[CRED_SSID] = true;
+  TEST_ASSERT_EQUAL(CRED_E_PAIR, credCheckSet(p, &bad));
+  TEST_ASSERT_EQUAL(CRED_PASS, bad);
+  p[CRED_PASS] = true;
+  TEST_ASSERT_EQUAL(CRED_OK, credCheckSet(p, &bad));
+  p[CRED_MQTT_PASS] = true;
+  TEST_ASSERT_EQUAL(CRED_E_PAIR, credCheckSet(p, &bad));
+  TEST_ASSERT_EQUAL(CRED_MQTT_USER, bad);
+}
+
+void test_parse_values_are_literal(void) {
+  // Leading/trailing spaces and quotes are part of the value.
+  CredParsed p = parse("cred set pass  \"quoted pass\" \r\n");
+  TEST_ASSERT_EQUAL(CRED_CMD_SET, p.cmd);
+  TEST_ASSERT_EQUAL(15, p.valueLen);
+  TEST_ASSERT_EQUAL_MEMORY(" \"quoted pass\" ", p.value, 15);
+  TEST_ASSERT_EQUAL(CRED_OK, credValidate(CRED_PASS, p.value, p.valueLen));
+  p = parse("cred set ssid it's here");
+  TEST_ASSERT_EQUAL_MEMORY("it's here", p.value, 9);
+}
+
+void test_parse_commit_abort(void) {
+  TEST_ASSERT_EQUAL(CRED_CMD_COMMIT, parse("cred commit").cmd);
+  TEST_ASSERT_EQUAL(CRED_CMD_ABORT, parse("cred abort\r").cmd);
+  TEST_ASSERT_EQUAL(CRED_CMD_BAD, parse("cred commit now").cmd);
+}
+
+void test_longest_set_line_fits_the_console_line(void) {
+  // "cred set mqtt_pass " + a max-length value must not overflow CRED_LINE_MAX.
+  TEST_ASSERT_TRUE(strlen("cred set mqtt_pass ") + CRED_MQTT_PASS_MAX <= CRED_LINE_MAX);
+  TEST_ASSERT_TRUE(strlen("cred set token ") + CRED_TOKEN_MAX <= CRED_LINE_MAX);
+}
+
+void test_ca_over_cap_rejected(void) {
+  static char big[CRED_CA_MAX + 64];
+  memset(big, 'A', sizeof(big) - 1);
+  big[sizeof(big) - 1] = 0;
+  TEST_ASSERT_EQUAL(CRED_E_LONG, v(CRED_CA, big));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_sha256_known_vectors);
@@ -260,5 +331,12 @@ int main(int, char **) {
   RUN_TEST(test_token_equal);
   RUN_TEST(test_unprovisioned_token_never_matches);
   RUN_TEST(test_token_prefix_plus_256_bytes_rejected);
+  RUN_TEST(test_describe_secrets_show_length_never_a_hash);
+  RUN_TEST(test_describe_public_fields_use_sha256);
+  RUN_TEST(test_check_set_pairs);
+  RUN_TEST(test_parse_values_are_literal);
+  RUN_TEST(test_parse_commit_abort);
+  RUN_TEST(test_longest_set_line_fits_the_console_line);
+  RUN_TEST(test_ca_over_cap_rejected);
   return UNITY_END();
 }
