@@ -119,6 +119,7 @@ CredErr credValidate(CredField f, const char *v, size_t n) {
       if (!der) return CRED_E_NOMEM;
       size_t dl = 0;
       const bool ok = credPemToDer(v, n, der, CRED_CA_MAX, &dl);
+      credWipe(der, CRED_CA_MAX);
       free(der);
       return ok ? CRED_OK : CRED_E_PEM;
     }
@@ -377,11 +378,13 @@ void credCaFingerprint(const char *pem, size_t n, char out[CRED_FP_LEN + 1]) {
   uint8_t *der = (uint8_t *)malloc(CRED_CA_MAX);   // see credValidate
   size_t dl = 0;
   if (!der || !credPemToDer(pem, n, der, CRED_CA_MAX, &dl)) {
+    if (der) credWipe(der, CRED_CA_MAX);
     free(der);
     memcpy(out, "sha256:????????", CRED_FP_LEN + 1);
     return;
   }
   credFingerprint(der, dl, out);
+  credWipe(der, CRED_CA_MAX);
   free(der);
 }
 
@@ -393,6 +396,15 @@ void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN])
   } else {
     credFingerprint((const uint8_t *)v, n, out);
   }
+}
+
+void credWipe(void *p, size_t n) {
+  volatile uint8_t *v = (volatile uint8_t *)p;
+  while (n--) *v++ = 0;
+#if defined(__GNUC__)
+  // Belt and braces: the buffer's memory is observed, so no store above is dead.
+  __asm__ __volatile__("" : : "r"(p) : "memory");
+#endif
 }
 
 // ---------------------------------------------------------------------------

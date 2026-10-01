@@ -53,11 +53,8 @@ static char    *g_ca = nullptr;          // PEM being pasted (CA_BUF)
 static size_t   g_caLen = 0;
 static bool     g_caOverflow = false;
 
-// Plain memset can be elided on a buffer that is not read again.
-static void wipe(void *p, size_t n) {
-  volatile uint8_t *v = (volatile uint8_t *)p;
-  while (n--) *v++ = 0;
-}
+// credWipe (credstore.h): a wipe the compiler cannot elide before free().
+static void wipe(void *p, size_t n) { credWipe(p, n); }
 
 static char *caAlloc() { return (char *)calloc(1, CA_BUF); }
 static void caFree(char *&b) {

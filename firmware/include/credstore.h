@@ -154,6 +154,11 @@ bool credPemToDer(const char *pem, size_t n, uint8_t *der, size_t cap,
 // CA fingerprint as above; "sha256:????????" if the PEM does not decode.
 void credCaFingerprint(const char *pem, size_t n, char out[CRED_FP_LEN + 1]);
 
+// Zero n bytes in a way the compiler cannot drop as a dead store, even right
+// before free() or at end of scope (plain memset can be). Same guarantee as
+// mbedtls_platform_zeroize, without mbedtls, so the native tests build it.
+void credWipe(void *p, size_t n);
+
 // Constant-time in the length of `want`. An EMPTY `want` never matches: an
 // unprovisioned token must lock the endpoints, not open them.
 bool credTokenEqual(const char *want, size_t wlen, const char *got, size_t glen);

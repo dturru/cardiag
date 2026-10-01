@@ -336,6 +336,14 @@ void test_finished_commit_is_complete(void) {
   TEST_ASSERT_EQUAL_STRING("complete", credCommitStateName(CRED_COMMIT_COMPLETE));
 }
 
+void test_wipe_zeroes_every_byte(void) {
+  uint8_t b[37];
+  memset(b, 0xA5, sizeof(b));
+  credWipe(b, sizeof(b));
+  for (size_t i = 0; i < sizeof(b); i++) TEST_ASSERT_EQUAL_HEX8(0, b[i]);
+  credWipe(b, 0);                        // n == 0 is a no-op, not a crash
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_sha256_known_vectors);
@@ -367,5 +375,6 @@ int main(int, char **) {
   RUN_TEST(test_never_provisioned_is_not_incomplete);
   RUN_TEST(test_interrupted_commit_is_incomplete);
   RUN_TEST(test_finished_commit_is_complete);
+  RUN_TEST(test_wipe_zeroes_every_byte);
   return UNITY_END();
 }
