@@ -310,6 +310,40 @@ void test_ca_over_cap_rejected(void) {
   TEST_ASSERT_EQUAL(CRED_E_LONG, v(CRED_CA, big));
 }
 
+// --- Commit state -------------------------------------------------------------
+
+void test_never_provisioned_is_not_incomplete(void) {
+  // A fresh board: no `complete` key, no fields. Not an interrupted commit.
+  TEST_ASSERT_EQUAL(CRED_COMMIT_NONE, credCommitState(false, 0, false));
+  TEST_ASSERT_EQUAL_STRING("not provisioned",
+                           credCommitStateName(credCommitState(false, 0, false)));
+}
+
+void test_interrupted_commit_is_incomplete(void) {
+  // complete=0 is written first: cut before any field, or after some.
+  TEST_ASSERT_EQUAL(CRED_COMMIT_INCOMPLETE, credCommitState(true, 0, false));
+  TEST_ASSERT_EQUAL(CRED_COMMIT_INCOMPLETE, credCommitState(true, 0, true));
+  // Fields with no flag at all were not written by a finished commit.
+  TEST_ASSERT_EQUAL(CRED_COMMIT_INCOMPLETE, credCommitState(false, 0, true));
+  TEST_ASSERT_EQUAL_STRING("INCOMPLETE",
+                           credCommitStateName(CRED_COMMIT_INCOMPLETE));
+}
+
+void test_finished_commit_is_complete(void) {
+  TEST_ASSERT_EQUAL(CRED_COMMIT_COMPLETE, credCommitState(true, 1, true));
+  // `cred clear all` + commit: a finished commit of an empty set.
+  TEST_ASSERT_EQUAL(CRED_COMMIT_COMPLETE, credCommitState(true, 1, false));
+  TEST_ASSERT_EQUAL_STRING("complete", credCommitStateName(CRED_COMMIT_COMPLETE));
+}
+
+void test_wipe_zeroes_every_byte(void) {
+  uint8_t b[37];
+  memset(b, 0xA5, sizeof(b));
+  credWipe(b, sizeof(b));
+  for (size_t i = 0; i < sizeof(b); i++) TEST_ASSERT_EQUAL_HEX8(0, b[i]);
+  credWipe(b, 0);                        // n == 0 is a no-op, not a crash
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_sha256_known_vectors);
@@ -338,5 +372,9 @@ int main(int, char **) {
   RUN_TEST(test_parse_commit_abort);
   RUN_TEST(test_longest_set_line_fits_the_console_line);
   RUN_TEST(test_ca_over_cap_rejected);
+  RUN_TEST(test_never_provisioned_is_not_incomplete);
+  RUN_TEST(test_interrupted_commit_is_incomplete);
+  RUN_TEST(test_finished_commit_is_complete);
+  RUN_TEST(test_wipe_zeroes_every_byte);
   return UNITY_END();
 }
