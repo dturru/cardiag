@@ -108,10 +108,12 @@ MIN_SEGMENT_ROWS = 10
 #              but a small fall, or a large fall in fewer windows.
 #      ok    = otherwise. A single low sample or an alternation is ignored.
 #
-# The CSV has no timestamps, so the window is in cycles. 10 cycles is ~10 min
-# at the soak's ~1 min/cycle; pass --window-cycles if the cycle time differs.
-ENVELOPE_WINDOW_CYCLES = 10
-ENVELOPE_K = 6
+# The CSV has no timestamps, so the window is in cycles. A soak cycle is ~7 min
+# (09-25: 40 cycles over ~4.5 h), so 5 cycles is ~35 min and a 40-cycle soak
+# gets 8 windows -- enough for K=4. With 10-cycle windows it got 4, and K=6
+# could never fire. Pass --window-cycles if the cycle time differs.
+ENVELOPE_WINDOW_CYCLES = 5
+ENVELOPE_K = 4
 ENVELOPE_DROP_B = 16 * 1024
 ENVELOPE_STEP_MIN_B = 256
 LARGEST_FLOOR_B = 120 * 1024
@@ -493,7 +495,7 @@ def main(argv=None) -> int:
                          "SELFTEST before starting)")
     ap.add_argument("--window-cycles", type=int, default=ENVELOPE_WINDOW_CYCLES,
                     help="cycles per largest-block envelope window "
-                         f"(default {ENVELOPE_WINDOW_CYCLES}, ~10 min)")
+                         f"(default {ENVELOPE_WINDOW_CYCLES}, ~35 min at ~7 min/cycle)")
     args = ap.parse_args(argv)
 
     path = Path(args.csv)

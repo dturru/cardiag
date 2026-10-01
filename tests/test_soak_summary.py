@@ -105,7 +105,7 @@ def test_falling_min_free_alone_is_headroom_not_a_failure(tmp_path):
 
 
 def test_fragmentation_fails_even_with_flat_free_heap(tmp_path):
-    # 200 B/cycle for 130 cycles: 13 windows, envelope down ~25 KB, all above
+    # 200 B/cycle for 130 cycles: 26 windows, envelope down ~25 KB, all above
     # the floor. Judged on the envelope (judge_largest), not by judge_heap.
     rows = [row(i, 200_000, largest=200_000 - i * 200) for i in range(1, 131)]
     rows = read_back(tmp_path, rows)
@@ -214,7 +214,8 @@ def _flip_rows(n: int) -> list[dict]:
     return rows
 
 
-def _leak_rows(windows: int, step: int = 2048, w: int = 10) -> list[dict]:
+def _leak_rows(windows: int, step: int = 2048,
+               w: int = ss.ENVELOPE_WINDOW_CYCLES) -> list[dict]:
     """Upper envelope stepping down ~2 KB per window, flipping inside each."""
     rows, i = [], 1
     for k in range(windows):
@@ -226,7 +227,7 @@ def _leak_rows(windows: int, step: int = 2048, w: int = 10) -> list[dict]:
 
 
 def test_two_level_flip_is_ok():
-    j = ss.judge(_flip_rows(240))                    # 24 windows
+    j = ss.judge(_flip_rows(240))                    # 48 windows
     assert j["largest"]["state"] == "ok", j["largest"]
     assert j["verdict"] == "PASS"
     seg = j["largest"]["segments"][0]
@@ -251,6 +252,7 @@ def test_synthetic_leak_alerts():
 
 def test_short_decline_is_watch_not_leak():
     # 9 windows: 8 steps x 2 KB = 16 KB, not > 16 KB -> enough windows, small fall.
+    assert ss.ENVELOPE_K <= 8
     lg = ss.judge_largest(_leak_rows(9))
     assert lg["state"] == "watch"
     j = ss.judge(_leak_rows(9))
@@ -259,7 +261,7 @@ def test_short_decline_is_watch_not_leak():
 
 
 def test_big_fall_in_few_windows_is_watch():
-    lg = ss.judge_largest(_leak_rows(4, step=8000))  # 3 steps, 24 kB
+    lg = ss.judge_largest(_leak_rows(4, step=8000))  # 3 steps (< K=4), 24 kB
     assert lg["state"] == "watch"
 
 
@@ -281,7 +283,7 @@ def test_floor_is_configurable():
 def test_envelope_is_judged_per_boot():
     """A reboot restores the heap: a fall across it is not a decline."""
     rows = _leak_rows(5) + [row(51, 200_000, reboot=True)]
-    rows += [row(52 + i, 200_000, largest=UPPER - 9 * 2048) for i in range(50)]
+    rows += [row(52 + i, 200_000, largest=UPPER - 9 * 2048) for i in range(25)]
     lg = ss.judge_largest(rows)
     assert lg["state"] != "leak"
 
@@ -293,8 +295,9 @@ def test_largest_in_summary_md(tmp_path):
 
 # The real 09-25 soak, if its run folder is present locally (analysis/ is not
 # all committed). Must not alert. Skipped in CI.
-REAL = sorted((Path(__file__).resolve().parents[1] / "analysis").glob(
-    "soak*2026-09-25*/*.csv"))
+_ANALYSIS = Path(__file__).resolve().parents[1] / "analysis"
+REAL = sorted(set(_ANALYSIS.glob("soak*2026-09-25*/*.csv"))
+              | set(_ANALYSIS.glob("2026-09-25-final-bench-soak/**/soak.csv")))
 
 
 @pytest.mark.skipif(not REAL, reason="09-25 soak CSV not present (local data)")
@@ -303,3 +306,12 @@ def test_real_0925_soak_does_not_alert():
         rows = ss.read_rows(p)
         lg = ss.judge_largest(rows)
         assert lg is None or lg["state"] == "ok", (p.name, lg)
+
+
+def test_a_40_cycle_soak_has_enough_windows_for_k():
+    """09-25: 40 cycles at ~7 min. The defaults must be able to fire on it."""
+    windows = 40 // ss.ENVELOPE_WINDOW_CYCLES
+    assert windows - 1 >= ss.ENVELOPE_K
+    lg = ss.judge_largest(_leak_rows(8, step=3 * 1024))   # 7 steps, 21 KB
+    assert lg["segments"][0]["windows"] == 8
+    assert lg["state"] == "leak"
