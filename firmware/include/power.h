@@ -24,5 +24,8 @@ uint32_t powerQuietNowMs();
 // Whether the filestore may open a file now (powerMayRecord, powerpolicy.h).
 bool powerMayRecordNow();
 
-// Debounced ignition level, for status output. Always true under bus-quiet.
+// Debounced ignition level. Always true under bus-quiet.
 bool powerIgnitionOn();
+
+// Why this boot happened (powerpolicy.h). WAKE_NA under bus-quiet.
+WakeSource powerWakeSource();

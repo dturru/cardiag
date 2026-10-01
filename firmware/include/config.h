@@ -296,20 +296,38 @@
 #define POWER_POLICY 0
 #endif
 
-// ⚠️ ASSUMED PIN, NOT FROM A NETLIST. The ignition-sense input on the carrier
-// is not designed yet (docs/NEXT-SESSION.md §5). GPIO5 is free on the
-// ESP32-CAN-X2 as far as config.h knows (not CAN1, the MCP2515 SPI/INT, the
-// LED, BOOT, USB, UART0 or octal PSRAM). Confirm against the carrier netlist
-// before wiring anything to it -- CLAUDE.md: verify wiring from the NETLIST.
+// Ignition sense, FROM THE CARRIER NETLIST: IO21, ACTIVE-LOW. The ignition
+// add-on drives an NPN level shifter with a 10 k pull-up to 3V3, so LOW =
+// ignition ON. The internal pull-up is enabled too: an unwired or broken
+// input reads HIGH = OFF and the board powers down -- the fail-safe direction
+// for the battery.
 //
-// Expected circuit: switched supply -> divider/opto -> 3.3 V logic. The pin
-// is read with a PULL-DOWN, so an unwired or broken input reads OFF and the
-// board powers down: the fail-safe direction for the battery.
+// The same ignition feed also powers the X2 directly, through a diode into
+// +12V, in parallel with the carrier's INH-switched supply. So with ignition
+// ON the board is up whatever INH does; with it OFF, go-to-sleep (INH low)
+// removes the last supply.
 #ifndef IGN_SENSE_GPIO
-#define IGN_SENSE_GPIO 5
+#define IGN_SENSE_GPIO 21
 #endif
 #ifndef IGN_ACTIVE_HIGH
-#define IGN_ACTIVE_HIGH 1
+#define IGN_ACTIVE_HIGH 0
+#endif
+
+// TCAN1043 mode pins, FROM THE CARRIER NETLIST: EN = IO39, nSTB = IO38, each
+// with a 10 k pull-down on the board (power-up = standby, INH on). TXD/RXD
+// are not connected: on this carrier the TCAN1043 is a wake sensor and the
+// INH switch, never a CAN path. Mode table in powerpolicy.h.
+#ifndef XCVR_EN_GPIO
+#define XCVR_EN_GPIO 39
+#endif
+#ifndef XCVR_NSTB_GPIO
+#define XCVR_NSTB_GPIO 38
+#endif
+// Whether this build drives EN/nSTB. Defaults ON under the ignition policy
+// (the carrier is what makes it meaningful) and OFF under bus-quiet, whose
+// behaviour this PR does not change. -DTRANSCEIVER_HAS_INH=0/1 overrides.
+#ifndef TRANSCEIVER_HAS_INH
+#define TRANSCEIVER_HAS_INH (POWER_POLICY == 1)
 #endif
 
 // Debounce. Generic starting points, NOT measured on any vehicle: tune from a
@@ -321,12 +339,22 @@
 #ifndef IGN_OFF_DEBOUNCE_MS
 #define IGN_OFF_DEBOUNCE_MS 2000
 #endif
-// Ignition off this long: command power-down (close-then-sleep, sleepguard.h).
-// The ignition policy's equivalent of CAN_MAX_AWAKE_MS, and like it the only
-// thing that turns the board off -- 0 disables it, which on the TCAN1043G
-// means nothing ever will.
+// Ignition OFF (debounced) -> close files -> SAFE TO CUT POWER -> go-to-sleep.
+// Extra wait after the debounced OFF before go-to-sleep; 0 = at once, which is
+// the default: OFF is already IGN_OFF_DEBOUNCE_MS old when it is believed.
 #ifndef IGN_OFF_SLEEP_MS
-#define IGN_OFF_SLEEP_MS (60u * 1000u)
+#define IGN_OFF_SLEEP_MS 0
+#endif
+// Booted with ignition OFF (bus-wake or usb-bench): go back to sleep this long
+// after boot unless the ignition comes on. Short: an unlock or a comfort wake
+// is not a trip.
+#ifndef IGN_BUSWAKE_AWAKE_MS
+#define IGN_BUSWAKE_AWAKE_MS 10000
+#endif
+// While OFF and still awake (go-to-sleep did not take, or USB keeps the board
+// up), re-command the close + go-to-sleep sequence this often.
+#ifndef IGN_RESLEEP_MS
+#define IGN_RESLEEP_MS 5000
 #endif
 
 #if POWER_POLICY != 0 && POWER_POLICY != 1
@@ -334,6 +362,9 @@
 #endif
 #if IGN_SENSE_GPIO >= 35 && IGN_SENSE_GPIO <= 37
 #error "IGN_SENSE_GPIO: IO35/36/37 are taken by octal PSRAM"
+#endif
+#if (XCVR_EN_GPIO >= 35 && XCVR_EN_GPIO <= 37) || (XCVR_NSTB_GPIO >= 35 && XCVR_NSTB_GPIO <= 37)
+#error "XCVR_EN_GPIO / XCVR_NSTB_GPIO: IO35/36/37 are taken by octal PSRAM"
 #endif
 
 // ---------------------------------------------------------------------------
@@ -343,9 +374,7 @@
 #ifndef RTC_ENABLE
 #define RTC_ENABLE 1
 #endif
-// ⚠️ ASSUMED PINS, NOT FROM A NETLIST. GPIO8/9 are the ESP32-S3 Arduino
-// default I2C pins and are not used by anything else in config.h. Confirm
-// against the carrier netlist. With no RTC fitted the boot read NACKs and the
+// FROM THE CARRIER NETLIST: SDA = IO8, SCL = IO9. With no RTC fitted the boot read NACKs and the
 // logger says so and carries on with no anchor.
 #ifndef RTC_SDA_GPIO
 #define RTC_SDA_GPIO 8

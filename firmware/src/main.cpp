@@ -44,6 +44,7 @@
 #include "bootguard_rt.h"
 #include "creds.h"
 #include "power.h"
+#include "cantx.h"
 #include "rtc.h"
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason() -- why this boot was a boot
@@ -145,6 +146,9 @@ static bool modeTransmits(uint8_t m) {
 }
 
 static twai_mode_t twaiModeFor(uint8_t m) {
+  // TX gate (cantx.h): NORMAL ACKs and NO_ACK drives, so with the gate shut
+  // the controller is listen-only whatever the mode says.
+  if (!canTxAllowed()) return TWAI_MODE_LISTEN_ONLY;
   switch (m) {
     case MODE_SELFTEST: return TWAI_MODE_NO_ACK;      // drives the bus
     case MODE_POLL:     return TWAI_MODE_NORMAL;      // drives the bus
@@ -423,6 +427,10 @@ static void printHelp() {
 }
 
 static void requestMode(uint8_t m) {
+  if (modeTransmits(m) && !canTxAllowed()) {
+    Serial.printf("refused: %s transmits and the ignition is off\n", modeName(m));
+    return;
+  }
   if (m == g_mode) {
     Serial.printf("already in %s\n", modeName(m));
     return;
@@ -886,7 +894,7 @@ static void selfTestTick() {
     // behind the tx queue, which would slow the web server and the UDP stream
     // -- the very things this workload exists to exercise. A refused frame is
     // counted instead, and a rising count is a real finding.
-    if (twai_transmit(&tx, 0) != ESP_OK) g_stTxFails++;
+    if (canTransmit(&tx, 0) != ESP_OK) g_stTxFails++;
     else g_stFrames++;
   }
 }
@@ -976,6 +984,44 @@ static void loopAccount(uint32_t t0, const char *slow, uint32_t slowUs) {
   }
 }
 
+// IGNITION POLICY, once per loop() pass.
+//   * Ignition OFF: a transmitting mode drops to LISTEN (the TX gate already
+//     refuses every frame; this also stops NORMAL mode ACKing).
+//   * OFF long enough: close -> SAFE TO CUT POWER -> go-to-sleep, re-issued
+//     every IGN_RESLEEP_MS while the board is still awake.
+//   * Backstop: OFF for CAN_MAX_AWAKE_MS and still awake -> forced sequence.
+static void ignitionPowerTick() {
+  static uint32_t lastCmdMs = 0;
+  static bool commanded = false;
+  static uint32_t lastBackstopMs = 0;
+  if (powerIgnitionOn()) {
+    commanded = false;
+    return;
+  }
+  if (modeTransmits(g_mode)) {
+    Serial.printf("[power] ignition off: %s -> LISTEN (no TX while off)\n",
+                  modeName(g_mode));
+    applyMode(MODE_LISTEN, false);
+  }
+  const uint32_t now = millis();
+  const uint32_t off = powerQuietNowMs();
+  if (CAN_MAX_AWAKE_MS && off >= CAN_MAX_AWAKE_MS) {
+    if (!lastBackstopMs || now - lastBackstopMs >= IGN_RESLEEP_MS) {
+      lastBackstopMs = now ? now : 1;
+      char why[64];
+      snprintf(why, sizeof(why), "ignition off %lus and still awake",
+               (unsigned long)(off / 1000));
+      transceiverForceSleep(why);
+    }
+    return;
+  }
+  if (off < powerThresholdsNow().sleepMs) return;
+  if (commanded && now - lastCmdMs < IGN_RESLEEP_MS) return;
+  commanded = true;
+  lastCmdMs = now;
+  transceiverRequestSleep();
+}
+
 void loop() {
   const uint32_t t0 = micros();
   const char *slow = "";
@@ -992,7 +1038,9 @@ void loop() {
   // The clock is the power policy's (power.h): bus silence, or ignition-off
   // time -- never bus silence under the ignition policy.
   powerLoop();
-  {
+  if (powerPolicy() == POWER_IGNITION) {
+    ignitionPowerTick();
+  } else {
     const uint32_t sleepMs = powerThresholdsNow().sleepMs;
     if (sleepMs && powerQuietNowMs() >= sleepMs) transceiverRequestSleep();
   }

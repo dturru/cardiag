@@ -9,6 +9,7 @@
 #include "driver/twai.h"
 #include "config.h"
 #include "obd.h"
+#include "cantx.h"
 
 // This module used to be mode-gated so Phase 0 binaries were unchanged by its
 // existence. That guard is gone: modes are now selected at RUNTIME, so every
@@ -107,7 +108,8 @@ bool obdRequest(uint8_t mode, uint8_t pid, ObdResult *out) {
 
   const uint32_t t0 = millis();
 
-  if (twai_transmit(&tx, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS)) != ESP_OK) {
+  // The TX gate (cantx.h): refused while the ignition is off.
+  if (canTransmit(&tx, pdMS_TO_TICKS(OBD_RESPONSE_TIMEOUT_MS)) != ESP_OK) {
     // Not the same failure as a timeout: this means we never got the frame
     // onto the bus at all (no ACK from any node => nobody is listening).
     g_stats.timeouts++;

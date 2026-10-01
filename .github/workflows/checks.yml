@@ -117,5 +117,10 @@ jobs:
       - name: Build esp32-can-x2-captest
         run: pio run -e esp32-can-x2-captest
 
+      # The carrier/ignition build: the only env that compiles the TCAN1043
+      # EN/nSTB code (TRANSCEIVER_HAS_INH follows POWER_POLICY=1).
+      - name: Build esp32-can-x2-ignition
+        run: pio run -e esp32-can-x2-ignition
+
       - name: Native tests
         run: pio test -e native

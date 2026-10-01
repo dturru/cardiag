@@ -132,3 +132,104 @@ static inline bool powerMayRecord(PowerPolicy p, uint32_t quietMs,
                                   const PowerThresholds &t) {
   return p != POWER_IGNITION || quietMs < t.closeMs;
 }
+
+// ---------------------------------------------------------------------------
+// THE TX GATE. Every path that can put a bit on the vehicle bus -- an OBD
+// request, a SELFTEST frame, and the choice of a TWAI mode that ACKs (NORMAL)
+// or drives (NO_ACK) -- asks this one function first (cantx.h).
+//
+// Under POWER_IGNITION nothing transmits while the ignition is off: a parked
+// car's bus is woken by the car, never by the logger. POWER_BUS_QUIET has no
+// ignition input, so the gate is open there (behaviour unchanged).
+// ---------------------------------------------------------------------------
+static inline bool canTxGate(PowerPolicy p, bool ignitionOn) {
+  return p != POWER_IGNITION || ignitionOn;
+}
+
+// ---------------------------------------------------------------------------
+// WAKE SOURCE: why this boot happened, read once in setup().
+//
+//   ignition  the ignition input reads ON at boot.
+//   bus-wake  ignition OFF and no USB host: the carrier's TCAN1043 saw bus
+//             activity and raised INH. The board closes nothing (nothing is
+//             open yet), transmits nothing, and goes back to sleep after
+//             IGN_BUSWAKE_AWAKE_MS unless the ignition comes on.
+//   usb-bench ignition OFF with a USB host attached: powered from the bench.
+//             Treated exactly like bus-wake (no TX, no recording, go-to-sleep
+//             commanded); a USB supply simply keeps the board up anyway.
+//   n/a       bus-quiet policy: no ignition input to read.
+// ---------------------------------------------------------------------------
+enum WakeSource : uint8_t {
+  WAKE_NA = 0,
+  WAKE_IGNITION,
+  WAKE_BUS,
+  WAKE_USB_BENCH,
+};
+
+static inline WakeSource wakeSourceAtBoot(PowerPolicy p, bool ignitionOn,
+                                          bool usbHost) {
+  if (p != POWER_IGNITION) return WAKE_NA;
+  if (ignitionOn) return WAKE_IGNITION;
+  return usbHost ? WAKE_USB_BENCH : WAKE_BUS;
+}
+
+static inline const char *wakeSourceName(WakeSource w) {
+  switch (w) {
+    case WAKE_IGNITION:  return "ignition";
+    case WAKE_BUS:       return "bus-wake";
+    case WAKE_USB_BENCH: return "usb-bench";
+    default:             return "n/a";
+  }
+}
+
+// How long the ignition may read OFF before go-to-sleep is commanded.
+//   * Ignition seen ON this boot: IGN_OFF_SLEEP_MS after the (debounced) OFF.
+//   * Never seen ON (bus-wake / usb-bench boot): the short bus-wake window,
+//     timed from boot, so a door-unlock wake does not hold the board up.
+//   * A watchdog/panic reset with ignition OFF: 0, back to sleep at once --
+//     the reset re-evaluates the input instead of trusting the old state.
+static inline uint32_t ignSleepAfterMs(bool seenOnThisBoot, bool watchdogBoot,
+                                       uint32_t offSleepMs, uint32_t busWakeMs) {
+  if (seenOnThisBoot) return offSleepMs;
+  return watchdogBoot ? 0 : busWakeMs;
+}
+
+// ---------------------------------------------------------------------------
+// TCAN1043 MODE PINS on the carrier (EN = IO39, nSTB = IO38, both with 10 k
+// pull-downs). TXD/RXD are NOT connected: the TCAN1043 is a wake sensor and
+// the INH switch for the board's own supply, never a CAN path.
+//
+//   mode         EN  nSTB  INH   used for
+//   standby       0    0   on    power-up state (the pull-downs)
+//   silent        0    1   on    ignition ON: hold-up, receiver only
+//   go-to-sleep   1    0   off   power-down: INH drops after tGO_TO_SLEEP
+//   normal        1    1   on    NEVER: it is the transmit mode
+//
+// There is deliberately no XCVR_NORMAL value, so no code path can ask for it.
+// ---------------------------------------------------------------------------
+enum XcvrMode : uint8_t {
+  XCVR_STANDBY = 0,
+  XCVR_SILENT,
+  XCVR_GO_TO_SLEEP,
+};
+
+struct XcvrPins {
+  bool en;
+  bool nstb;
+};
+
+static inline XcvrPins xcvrPinsFor(XcvrMode m) {
+  switch (m) {
+    case XCVR_SILENT:      return {false, true};
+    case XCVR_GO_TO_SLEEP: return {true, false};
+    default:               return {false, false};
+  }
+}
+
+static inline const char *xcvrModeName(XcvrMode m) {
+  switch (m) {
+    case XCVR_SILENT:      return "silent";
+    case XCVR_GO_TO_SLEEP: return "go-to-sleep";
+    default:               return "standby";
+  }
+}
