@@ -61,7 +61,8 @@ reverse), if NVS is nearly full, or while the change log is recording
 (stop it with `l` first: flash writes stall the CPU). It writes
 `complete=0`, then the fields, then `complete=1`. A power cut part-way leaves
 `complete=0`, and the next boot says `INCOMPLETE` and runs standalone with the
-token locked. Commit and a reset are the only times NVS is touched.
+token locked. A board that has never had a commit says `not provisioned`
+(no generation), never `INCOMPLETE`. Commit and a reset are the only times NVS is touched.
 
 Changes apply after a reset (esptool `--after hard_reset`, see CLAUDE.md).
 

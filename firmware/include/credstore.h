@@ -54,6 +54,7 @@ enum CredErr : uint8_t {
   CRED_E_PLACEHOLDER,   // a value from secrets.h.example / the old defaults
   CRED_E_PEM,
   CRED_E_PAIR,          // ssid without pass, mqtt_user without mqtt_pass...
+  CRED_E_NOMEM,         // no heap for the CA scratch (it is not kept resident)
 };
 const char *credErrName(CredErr e);
 
@@ -69,6 +70,20 @@ bool credIsSecret(CredField f);
 // mqtt_user/mqtt_pass go together or not at all. On failure *bad names the
 // field whose partner is missing.
 CredErr credCheckSet(const bool present[CRED_FIELD_COUNT], CredField *bad);
+
+// What the store's commit flag says, from three NVS facts: does the `complete`
+// key exist, its value, and is any field key present. `cred commit` writes
+// complete=0 FIRST, so the key existing is what separates a board that was
+// never provisioned (no key, no fields) from an interrupted commit (key = 0,
+// or fields with no key at all).
+enum CredCommitState : uint8_t {
+  CRED_COMMIT_NONE = 0,     // never provisioned
+  CRED_COMMIT_INCOMPLETE,   // a commit started and did not finish
+  CRED_COMMIT_COMPLETE,
+};
+CredCommitState credCommitState(bool flagPresent, uint8_t flag, bool anyField);
+// "not provisioned" / "INCOMPLETE" / "complete" -- the boot banner's word.
+const char *credCommitStateName(CredCommitState s);
 
 // ---------------------------------------------------------------------------
 // Console line (without the leading ':' that puts the console in line mode):
