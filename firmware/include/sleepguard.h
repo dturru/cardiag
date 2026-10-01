@@ -109,3 +109,29 @@ static inline const char *sleepVerdictName(SleepVerdict v) {
     default:                       return "refused: unknown";
   }
 }
+
+// ---------------------------------------------------------------------------
+// THE ORDER, executed. Both policies' power-down goes through here, so
+// "close every file, THEN say safe, THEN command sleep" is one function with
+// a native test (test_powerpolicy) instead of a convention in each caller.
+//
+// After a close the open-file count is read AGAIN: a close that did not close
+// (a write error, a file reopened by another path) means NO sleep command.
+// ---------------------------------------------------------------------------
+struct SleepIo {
+  void *ctx;
+  uint16_t (*openFiles)(void *ctx);
+  void (*closeAll)(void *ctx);
+  void (*announceSafe)(void *ctx);   // prints SAFE TO CUT POWER
+  void (*commandSleep)(void *ctx);   // EN high + nSTB low on the carrier
+};
+
+static inline SleepVerdict sleepExecute(SleepVerdict v, const SleepIo &io) {
+  if (sleepNeedsClose(v)) io.closeAll(io.ctx);
+  if (!sleepShouldSleep(v)) return v;
+  if (io.openFiles(io.ctx) > 0) return SLEEP_REFUSED_FILES_OPEN;
+  io.announceSafe(io.ctx);
+  io.commandSleep(io.ctx);
+  return v;
+}
+

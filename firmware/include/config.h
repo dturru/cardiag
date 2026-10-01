@@ -280,6 +280,113 @@
 // on the G variant means nothing will ever turn this board off.
 #define CAN_MAX_AWAKE_MS (5u * 60u * 1000u)
 
+// ---------------------------------------------------------------------------
+// POWER-OFF POLICY (powerpolicy.h). What ends a trip.
+//
+//   0 = bus-quiet  files close after CAN_BUS_IDLE_CLOSE_MS of silence and
+//                  power-down follows at CAN_MAX_AWAKE_MS. The default.
+//   1 = ignition   files close and power-down follow IGN_SENSE_GPIO, never
+//                  bus silence alone. For vehicles whose diagnostic bus is
+//                  silent while running unless a tester polls it.
+//
+// Build-time: -DPOWER_POLICY=1. Both modes close every file before the
+// power-down command (sleepguard.h owns that; the policy only picks the clock).
+// ---------------------------------------------------------------------------
+#ifndef POWER_POLICY
+#define POWER_POLICY 0
+#endif
+
+// Ignition sense, FROM THE CARRIER NETLIST: IO21, ACTIVE-LOW. The ignition
+// add-on drives an NPN level shifter with a 10 k pull-up to 3V3, so LOW =
+// ignition ON. The internal pull-up is enabled too: an unwired or broken
+// input reads HIGH = OFF and the board powers down -- the fail-safe direction
+// for the battery.
+//
+// The same ignition feed also powers the X2 directly, through a diode into
+// +12V, in parallel with the carrier's INH-switched supply. So with ignition
+// ON the board is up whatever INH does; with it OFF, go-to-sleep (INH low)
+// removes the last supply.
+#ifndef IGN_SENSE_GPIO
+#define IGN_SENSE_GPIO 21
+#endif
+#ifndef IGN_ACTIVE_HIGH
+#define IGN_ACTIVE_HIGH 0
+#endif
+
+// TCAN1043 mode pins, FROM THE CARRIER NETLIST: EN = IO39, nSTB = IO38, each
+// with a 10 k pull-down on the board (power-up = standby, INH on). TXD/RXD
+// are not connected: on this carrier the TCAN1043 is a wake sensor and the
+// INH switch, never a CAN path. Mode table in powerpolicy.h.
+#ifndef XCVR_EN_GPIO
+#define XCVR_EN_GPIO 39
+#endif
+#ifndef XCVR_NSTB_GPIO
+#define XCVR_NSTB_GPIO 38
+#endif
+// Whether this build drives EN/nSTB. Defaults ON under the ignition policy
+// (the carrier is what makes it meaningful) and OFF under bus-quiet, whose
+// behaviour this PR does not change. -DTRANSCEIVER_HAS_INH=0/1 overrides.
+#ifndef TRANSCEIVER_HAS_INH
+#define TRANSCEIVER_HAS_INH (POWER_POLICY == 1)
+#endif
+
+// Debounce. Generic starting points, NOT measured on any vehicle: tune from a
+// trace of the real input. OFF is slow so a supply dip while cranking is not
+// a key-off; ON is quick so the first seconds of a trip are not lost.
+#ifndef IGN_ON_DEBOUNCE_MS
+#define IGN_ON_DEBOUNCE_MS 200
+#endif
+#ifndef IGN_OFF_DEBOUNCE_MS
+#define IGN_OFF_DEBOUNCE_MS 2000
+#endif
+// Ignition OFF (debounced) -> close files -> SAFE TO CUT POWER -> go-to-sleep.
+// Extra wait after the debounced OFF before go-to-sleep; 0 = at once, which is
+// the default: OFF is already IGN_OFF_DEBOUNCE_MS old when it is believed.
+#ifndef IGN_OFF_SLEEP_MS
+#define IGN_OFF_SLEEP_MS 0
+#endif
+// Booted with ignition OFF (bus-wake or usb-bench): go back to sleep this long
+// after boot unless the ignition comes on. Short: an unlock or a comfort wake
+// is not a trip.
+#ifndef IGN_BUSWAKE_AWAKE_MS
+#define IGN_BUSWAKE_AWAKE_MS 10000
+#endif
+// While OFF and still awake (go-to-sleep did not take, or USB keeps the board
+// up), re-command the close + go-to-sleep sequence this often.
+#ifndef IGN_RESLEEP_MS
+#define IGN_RESLEEP_MS 5000
+#endif
+
+#if POWER_POLICY != 0 && POWER_POLICY != 1
+#error "POWER_POLICY must be 0 (bus-quiet) or 1 (ignition)"
+#endif
+#if IGN_SENSE_GPIO >= 35 && IGN_SENSE_GPIO <= 37
+#error "IGN_SENSE_GPIO: IO35/36/37 are taken by octal PSRAM"
+#endif
+#if (XCVR_EN_GPIO >= 35 && XCVR_EN_GPIO <= 37) || (XCVR_NSTB_GPIO >= 35 && XCVR_NSTB_GPIO <= 37)
+#error "XCVR_EN_GPIO / XCVR_NSTB_GPIO: IO35/36/37 are taken by octal PSRAM"
+#endif
+
+// ---------------------------------------------------------------------------
+// RTC: PCF8563 (rtc8563.h). Read once at boot as the lowest-trust "rtc" anchor
+// when its voltage-low flag is clear; written whenever the hub pushes gps/ntp.
+// ---------------------------------------------------------------------------
+#ifndef RTC_ENABLE
+#define RTC_ENABLE 1
+#endif
+// FROM THE CARRIER NETLIST: SDA = IO8, SCL = IO9. With no RTC fitted the boot read NACKs and the
+// logger says so and carries on with no anchor.
+#ifndef RTC_SDA_GPIO
+#define RTC_SDA_GPIO 8
+#endif
+#ifndef RTC_SCL_GPIO
+#define RTC_SCL_GPIO 9
+#endif
+#define RTC_I2C_HZ 100000
+// An RTC reading before this year is an unset clock counting from its reset
+// value, not a time. Rejected like VL.
+#define RTC_MIN_YEAR 2026
+
 // Hardware task watchdog. Layer 1: the other two failsafes are code, so they
 // cannot help when the code is what stopped running.
 #ifndef WDT_TIMEOUT_S

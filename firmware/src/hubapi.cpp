@@ -11,10 +11,13 @@
 #include "hubstream.h"
 #include "filestore.h"
 #include "session.h"
+#include "rtc.h"
 #include "sniffer.h"
 #include "config.h"
 #include "creds.h"
 #include "coredump.h"
+#include "power.h"
+#include "cantx.h"
 
 // The token lives in NVS (creds.h); the compare is constant-time
 // (credTokenEqual) and fails closed when no token is provisioned.
@@ -79,6 +82,21 @@ static void handleSession(WebServer &srv) {
       (unsigned long)sessionBootId(),
       (unsigned long)millis(),
       hublinkStateName());
+
+  // Why this boot happened and what the power policy sees now. `ignition` is
+  // null under bus-quiet, which has no ignition input.
+  if (powerPolicy() == POWER_IGNITION) {
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"power\":{\"policy\":\"%s\",\"wake_source\":\"%s\","
+        "\"ignition\":%s,\"tx_blocked\":%lu},",
+        powerPolicyName(powerPolicy()), wakeSourceName(powerWakeSource()),
+        powerIgnitionOn() ? "true" : "false", (unsigned long)canTxBlocked());
+  } else {
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"power\":{\"policy\":\"%s\",\"wake_source\":\"%s\","
+        "\"ignition\":null,\"tx_blocked\":0},",
+        powerPolicyName(powerPolicy()), wakeSourceName(powerWakeSource()));
+  }
 
   if (sessionAnchorValid()) {
     n = jsonAppend(buf, sizeof(buf), n,
@@ -433,6 +451,8 @@ static void handleTime(WebServer &srv) {
   }
 
   const bool applied = sessionSetAnchor((uint64_t)epoch, src);
+  // Keep the RTC on the best time the hub has given (gps/ntp only).
+  if (applied) rtcSyncFromAnchor();
   char buf[192];
   snprintf(buf, sizeof(buf),
       "{\"ok\":true,\"applied\":%s,\"source\":\"%s\",\"uptime_ms\":%lu}",

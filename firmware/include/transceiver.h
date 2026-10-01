@@ -23,6 +23,7 @@
 #include <stdint.h>
 
 #include "sleepguard.h"
+#include "powerpolicy.h"
 
 // Evaluate the invariant and, if it holds, command the transceiver to sleep.
 //
@@ -35,3 +36,14 @@ SleepVerdict transceiverRequestSleep();
 // the ESP32-CAN-X2, so a caller can tell "sleep succeeded" from "sleep was
 // allowed but there is nothing here to switch".
 bool transceiverHasInhPath();
+
+// Carrier only (TRANSCEIVER_HAS_INH): EN/nSTB as outputs, starting in
+// standby to match the board's pull-downs. No-ops otherwise.
+void transceiverBegin();
+// Drive EN/nSTB for `m` (powerpolicy.h mode table). There is no normal mode.
+void transceiverSetMode(XcvrMode m);
+XcvrMode transceiverMode();
+
+// Close every file, print SAFE TO CUT POWER, command go-to-sleep -- forced,
+// whatever the verdict: the ignition-off backstop (CAN_MAX_AWAKE_MS).
+void transceiverForceSleep(const char *why);

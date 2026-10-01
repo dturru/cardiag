@@ -209,3 +209,72 @@ vendor wiki, not from the board in hand, and 12 V into the wrong header pin dest
 
 ⚠️ **Pin 16 is always hot**, so the board runs with the key out. The `<1 mA` sleep budget is still unsolved
 — unplug after a session, and treat ignition-switched power as the real answer.
+
+## Carrier board wiring (from the carrier netlist)
+
+These are the firmware defaults (`firmware/include/config.h`); every one can be
+overridden with `-D`.
+
+| Signal | ESP32-S3 | Notes |
+|---|---|---|
+| TCAN1043 **EN** | IO39 | 10 k pull-down on the board |
+| TCAN1043 **nSTB** | IO38 | 10 k pull-down on the board |
+| TCAN1043 TXD / RXD | — | **not connected.** On the carrier the TCAN1043 is a wake sensor and the INH switch for the board's own supply, never a CAN path |
+| PCF8563 RTC SDA / SCL | IO8 / IO9 | |
+| **Ignition sense** | IO21 | **active-LOW**: NPN level shifter, 10 k pull-up to 3V3. LOW = ignition ON |
+
+**Supplies.** The ignition add-on also powers the X2 directly, through a diode
+into +12V, **in parallel with** the carrier's INH-switched supply. Ignition ON
+keeps the board up whatever INH does; with ignition OFF, go-to-sleep (INH low)
+removes the last supply.
+
+### TCAN1043 modes used
+
+| Mode | EN | nSTB | INH | Used for |
+|---|---|---|---|---|
+| standby | 0 | 0 | on | power-up state (the pull-downs) |
+| **silent** | 0 | 1 | on | **ignition ON: hold-up.** Receiver only |
+| **go-to-sleep** | 1 | 0 | **off** after tGO_TO_SLEEP | power-down, only after every file is closed |
+| normal | 1 | 1 | on | **never** — it is the transmit mode, and there is no TXD path |
+
+The firmware has no value for normal mode. Go-to-sleep is entered from silent:
+silent first, then EN high and nSTB low back to back (the datasheet order; the
+reverse lands in standby and keeps INH on). EN=1/nSTB=1 exists only for that
+sub-microsecond gap, with TXD unconnected. ⚠️ Confirm on a scope that INH falls.
+
+### Ignition policy (`-DPOWER_POLICY=1`, env `esp32-can-x2-ignition`)
+
+`POWER_POLICY=0` (bus-quiet, the default) is unchanged and does not drive EN/nSTB.
+
+| Situation | What the firmware does |
+|---|---|
+| Boot | Reads IO21; logs `[power] … wake=ignition / bus-wake / usb-bench` and reports it in `/api/v1/session` (`power.wake_source`). usb-bench = ignition OFF with a USB host attached |
+| Ignition ON | TCAN1043 → silent (INH holds the supply); recording on; TX allowed |
+| Ignition OFF, debounced (`IGN_OFF_DEBOUNCE_MS`, 2 s) | Transmitting mode → LISTEN; close all files → `SAFE TO CUT POWER NOW` → go-to-sleep. Never go-to-sleep with a file open: a close that leaves one open means no sleep command |
+| Boot by bus-wake, ignition OFF | No TX, nothing recorded, go-to-sleep after `IGN_BUSWAKE_AWAKE_MS` (10 s) unless the ignition comes on |
+| Still awake with ignition OFF | Sequence re-issued every `IGN_RESLEEP_MS` (5 s); after `CAN_MAX_AWAKE_MS` a forced close + go-to-sleep (`[sleep] BACKSTOP`). The G variant has no sleep failsafe of its own |
+| Task-WDT / panic reset | The input is re-read at boot; ignition OFF → straight back to sleep |
+| TX | One gate (`cantx.h`): OBD requests, SELFTEST frames and any ACKing TWAI mode only while ignition is ON. `power.tx_blocked` counts refusals |
+
+**Crank dip.** OFF is believed only after `IGN_OFF_DEBOUNCE_MS` (2 s) of
+continuous OFF; ON after 200 ms. The assumption: a supply dip while cranking
+pulls the sense line OFF for **less than 2 s**. If a trace of the real input
+shows a longer dip, raise `IGN_OFF_DEBOUNCE_MS`. During the dip the board stays
+up on the INH-switched supply (silent mode holds INH).
+
+### Bench test (carrier + ignition add-on, `esp32-can-x2-ignition`)
+
+No CAN bus attached. Capture with `tools/serial_capture.py` (never a tool that
+toggles DTR/RTS).
+
+1. **12 V on the add-on's IGN input** boots the board: the log shows
+   `wake=ignition  ignition ON` and `[xcvr] TCAN1043 -> silent (EN=0 nSTB=1)`;
+   `/api/v1/session` shows `"power":{"policy":"ignition","wake_source":"ignition","ignition":true,…}`.
+2. **Remove the 12 V**: about 2 s later `[power] ignition OFF`, the close
+   (`[sleep] … close then sleep` or `[fs] ignition off … closed all files`),
+   `SAFE TO CUT POWER NOW`, `[xcvr] TCAN1043 -> go-to-sleep`, in that order, then the board powers down (INH falls; meter
+   it).
+3. **Dip**: pull IGN for under 2 s and restore — no `ignition OFF`, files stay
+   open.
+4. **Bus-wake**: with IGN off, wake the TCAN1043 from the bus side —
+   `wake=bus-wake`, no files opened, go-to-sleep after ~10 s.
