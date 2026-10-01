@@ -30,7 +30,8 @@ FIELDS = ["cycle", "detect_ms", "rejoin_ms", "fallback_ms", "drop_path",
           "reboot", "reset_reason", "loop_max_us", "loop_max_stage",
           "loop_cycle_max_us", "loop_cycle_stage", "bus_idle_closes", "panics",
           "fs_sub_max_us", "fs_sub_stage", "fs_pass_us", "can_rx_missed",
-          "can_rx_overrun", "can_chg_dropped", "can_id_overflow", "can_raw_busy"]
+          "can_rx_overrun", "can_chg_dropped", "can_id_overflow", "can_raw_busy",
+          "log_dropped"]
 
 
 def row(cycle: int, heap: int, *, minheap: int | None = None,
@@ -187,3 +188,56 @@ def test_short_segment_is_shown_not_judged(tmp_path):
     j = ss.judge_heap(read_back(tmp_path, rows))
     assert j["segments"][0]["heap_slope"] < ss.HEAP_SLOPE_FAIL
     assert not any("segment 1" in f for f in j["fails"])
+
+
+# --- serial log loss (logdrop) -------------------------------------------------
+
+def _logdrop_rows(values, reboot_at=None):
+    rows = []
+    for i, v in enumerate(values, 1):
+        r = row(i, 200_000, reboot=(i == reboot_at))
+        r["log_dropped"] = "" if v is None else str(v)
+        rows.append(r)
+    return rows
+
+
+def test_logdrop_zero_passes_without_warning():
+    j = ss.judge(_logdrop_rows([0] * 10))
+    assert j["verdict"] == "PASS" and j["warnings"] == []
+    assert j["log_drop"]["worst"] == 0
+
+
+def test_logdrop_under_threshold_warns_but_passes():
+    j = ss.judge(_logdrop_rows([0, 0, 3, 3, 5, 5, 5, 5, 5, 5]))
+    assert j["verdict"] == "PASS"
+    assert j["warnings"] and "5 line(s)" in j["warnings"][0]
+    assert any("WARNING" in ln for ln in ss.verdict_lines(j))
+
+
+def test_logdrop_over_threshold_fails_with_cycle():
+    over = ss.LOGDROP_FAIL_MAX + 45                     # 65, the 09-25 soak
+    j = ss.judge(_logdrop_rows([0, 10, over, over]))
+    assert j["verdict"] == "FAIL"
+    assert any(f"dropped {over} line(s)" in f and "cycle 3" in f
+               for f in j["fails"])
+
+
+def test_logdrop_threshold_is_per_boot():
+    """The counter restarts at a reboot: two boots of 15 are not 30."""
+    rows = _logdrop_rows([15, 15, 0, 15], reboot_at=3)
+    j = ss.judge(rows)
+    assert j["log_drop"]["worst"] == 15
+    assert not any("serial log" in f for f in j["fails"])
+
+
+def test_logdrop_column_absent_is_not_reported(tmp_path):
+    j = ss.judge([row(i, 200_000) for i in range(1, 6)])
+    assert j["log_drop"] is None and j["warnings"] == []
+    text = run_summary(tmp_path, [row(i, 200_000) for i in range(1, 6)])
+    assert "serial log dropped (logdrop):** not reported" in text
+
+
+def test_logdrop_in_summary_md(tmp_path):
+    text = run_summary(tmp_path, _logdrop_rows([0, 0, 0, 7, 7]))
+    assert "serial log dropped (logdrop):** 7 line(s)" in text
+    assert "## Warnings" in text

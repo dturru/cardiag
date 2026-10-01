@@ -16,6 +16,7 @@
 #include "config.h"
 #include "creds.h"
 #include "coredump.h"
+#include "logq.h"
 #include "power.h"
 #include "cantx.h"
 
@@ -76,12 +77,16 @@ static void handleSession(WebServer &srv) {
       "\"device_id\":%lu,"
       "\"boot_id\":%lu,"
       "\"uptime_ms\":%lu,"
-      "\"link\":\"%s\",",
+      "\"link\":\"%s\","
+      // Serial lines other tasks queued that did not fit (logq.h), since
+      // boot. Non-zero = the serial log is missing lines.
+      "\"log_dropped\":%lu,",
       HUB_PROTO_VERSION,
       (unsigned long)sessionDeviceId(),
       (unsigned long)sessionBootId(),
       (unsigned long)millis(),
-      hublinkStateName());
+      hublinkStateName(),
+      (unsigned long)logqDropped());
 
   // Why this boot happened and what the power policy sees now. `ignition` is
   // null under bus-quiet, which has no ignition input.

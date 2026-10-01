@@ -270,6 +270,40 @@ REQUIRED = {
 }
 
 
+# ⭐ SERIAL LOG LOSS. logdrop= counts lines other tasks queued that did not
+# fit (logq.h) -- since boot, so a reboot restarts it. A dropped line is
+# diagnostics lost, not data lost: any is shown as a WARNING, and more than
+# LOGDROP_FAIL_MAX in one boot fails the run, because past that the log can no
+# longer be trusted to show what happened (the 09-25 soak dropped 65 and
+# nothing said so).
+LOGDROP_FAIL_MAX = 20
+
+
+def judge_logdrop(rows: list[dict]) -> dict | None:
+    """Worst logdrop per boot segment. None when the CSV has no column."""
+    if not rows or not any((r.get("log_dropped") or "").strip() for r in rows):
+        return None
+    worst, at, cur = 0, None, 0
+    for r in rows:
+        if num(r.get("reboot")):
+            cur = 0
+        v = num(r.get("log_dropped"))
+        if v is None:
+            continue
+        cur = max(cur, v)
+        if cur > worst:
+            worst, at = cur, r.get("cycle", "?")
+    out = {"worst": worst, "cycle": at, "fails": [], "warnings": []}
+    if worst > LOGDROP_FAIL_MAX:
+        out["fails"].append(f"serial log dropped {worst} line(s) in one boot "
+                            f"(> {LOGDROP_FAIL_MAX}, at cycle {at}): the log "
+                            f"is missing lines")
+    elif worst:
+        out["warnings"].append(f"serial log dropped {worst} line(s) (at cycle "
+                               f"{at}; fails above {LOGDROP_FAIL_MAX})")
+    return out
+
+
 def coverage(rows: list[dict], mode: str = "SELFTEST") -> dict:
     """Per required metric: cycles where every one of its columns was read."""
     out = {}
@@ -331,6 +365,12 @@ def judge(rows: list[dict], *, requested: int = 0,
                 fails.append(f"CAN drops: {worst} {what} (first at cycle "
                              f"{first})")
 
+    logdrop = judge_logdrop(rows)
+    warnings: list[str] = []
+    if logdrop is not None:
+        fails += logdrop["fails"]
+        warnings += logdrop["warnings"]
+
     panics = sum(num(r.get("panics")) or 0 for r in rows)
     if panics:
         fails.append(f"{panics} panic/assert line(s)")
@@ -354,7 +394,8 @@ def judge(rows: list[dict], *, requested: int = 0,
             "loop": loop, "reboots": reboots, "bus_idle_closes": idle,
             "panics": panics, "can_drops": drops, "fs_sub": judge_fs_sub(rows),
             "coverage": cov, "coverage_short": sorted(short),
-            "joins": judge_joins(rows)}
+            "joins": judge_joins(rows), "log_drop": logdrop,
+            "warnings": warnings}
 
 
 def read_rows(csv_path) -> list[dict]:
@@ -371,6 +412,7 @@ def verdict_lines(j: dict) -> list[str]:
     out = [f"VERDICT: {j['verdict']} ({len(j['fails'])} failed check(s), "
            f"{j['done']}/{j['requested']} cycles)"]
     out += [f"  - {f}" for f in j["fails"]]
+    out += [f"  - WARNING: {w}" for w in j.get("warnings", [])]
     for m in j.get("coverage_short", []):
         c = j["coverage"][m]
         out.append(f"  - coverage: {m} readable on {c['readable']}/"
@@ -478,6 +520,12 @@ def main(argv=None) -> int:
     cd = j["can_drops"]
     L.append("- **CAN drops:** " + ("not reported" if cd is None else
              ", ".join(f"{k.removeprefix('can_')}={v}" for k, v in cd.items())))
+    ld = j["log_drop"]
+    L.append("- **serial log dropped (logdrop):** " + (
+        "not reported" if ld is None else
+        f"{ld['worst']} line(s), worst boot" + (
+            f" (cycle {ld['cycle']}) — ⚠ the log is missing lines"
+            if ld["worst"] else "")))
     jn = j["joins"]
     if jn is not None:
         L.append(f"- **failed joins:** {jn['failed_joins']} over {jn['cycles']} "
@@ -609,6 +657,10 @@ def main(argv=None) -> int:
         L.append("\n## Failed checks\n")
         for f in fails:
             L.append(f"- {f}")
+    if j["warnings"]:
+        L.append("\n## Warnings\n")
+        for w in j["warnings"]:
+            L.append(f"- {w}")
 
     # ⭐ A FAIL MUST ARRIVE WITH ITS EVIDENCE. The firmware prints a coredump
     # summary on any PANIC/WDT boot -- the task that died, its PC and the first
