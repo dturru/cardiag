@@ -40,7 +40,7 @@ def row(cycle: int, *, loop_cycle=38_000, stage="webui", loop_boot=42_000,
         fs_stage="snapshot", fs_pass=12_000, fs_walks=0):
     return {"cycle": cycle, "detect_ms": "-1500.0", "rejoin_ms": "9000.0",
             "fallback_ms": 120, "drop_path": "event", "reason": 201,
-            "heap": heap, "minheap": heap - 20_000, "largest_block": heap // 2,
+            "heap": heap, "minheap": heap - 20_000, "largest_block": 160_000,
             "netstack_12308": 0, "reboot": int(reboot),
             "reset_reason": "TASK_WDT" if reboot else "",
             "loop_max_us": "" if loop_boot is None else loop_boot,
