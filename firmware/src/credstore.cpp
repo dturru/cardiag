@@ -1,6 +1,7 @@
 #include "credstore.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,7 @@ const char *credErrName(CredErr e) {
     case CRED_E_PLACEHOLDER: return "placeholder value";
     case CRED_E_PEM:         return "not a single PEM certificate";
     case CRED_E_PAIR:        return "set without its pair";
+    case CRED_E_NOMEM:       return "out of memory";
   }
   return "?";
 }
@@ -67,9 +69,6 @@ bool credIsPlaceholder(const char *v, size_t n) {
     if (strlen(p) == n && memcmp(p, v, n) == 0) return true;
   return false;
 }
-
-// Scratch DER for validate + fingerprint. DER is smaller than its PEM.
-static uint8_t s_der[CRED_CA_MAX];
 
 static bool allPrintable(const char *v, size_t n, bool spaceOk) {
   for (size_t i = 0; i < n; i++) {
@@ -114,8 +113,15 @@ CredErr credValidate(CredField f, const char *v, size_t n) {
       if (!allPrintable(v, n, false)) return CRED_E_CHARSET;
       return credIsPlaceholder(v, n) ? CRED_E_PLACEHOLDER : CRED_OK;
     case CRED_CA: {
+      // DER scratch on the heap, per call: a CA is only decoded while
+      // provisioning or printing the banner, so a resident 2 kB bought nothing.
+      uint8_t *der = (uint8_t *)malloc(CRED_CA_MAX);
+      if (!der) return CRED_E_NOMEM;
       size_t dl = 0;
-      return credPemToDer(v, n, s_der, sizeof(s_der), &dl) ? CRED_OK : CRED_E_PEM;
+      const bool ok = credPemToDer(v, n, der, CRED_CA_MAX, &dl);
+      credWipe(der, CRED_CA_MAX);
+      free(der);
+      return ok ? CRED_OK : CRED_E_PEM;
     }
     default:
       return CRED_E_CHARSET;
@@ -135,6 +141,21 @@ CredErr credCheckSet(const bool present[CRED_FIELD_COUNT], CredField *bad) {
     return CRED_E_PAIR;
   }
   return CRED_OK;
+}
+
+CredCommitState credCommitState(bool flagPresent, uint8_t flag, bool anyField) {
+  if (flagPresent && flag == 1) return CRED_COMMIT_COMPLETE;
+  if (!flagPresent && !anyField) return CRED_COMMIT_NONE;
+  return CRED_COMMIT_INCOMPLETE;
+}
+
+const char *credCommitStateName(CredCommitState s) {
+  switch (s) {
+    case CRED_COMMIT_NONE:       return "not provisioned";
+    case CRED_COMMIT_INCOMPLETE: return "INCOMPLETE";
+    case CRED_COMMIT_COMPLETE:   return "complete";
+  }
+  return "?";
 }
 
 // ---------------------------------------------------------------------------
@@ -354,12 +375,17 @@ bool credPemToDer(const char *pem, size_t n, uint8_t *der, size_t cap,
 }
 
 void credCaFingerprint(const char *pem, size_t n, char out[CRED_FP_LEN + 1]) {
+  uint8_t *der = (uint8_t *)malloc(CRED_CA_MAX);   // see credValidate
   size_t dl = 0;
-  if (!credPemToDer(pem, n, s_der, sizeof(s_der), &dl)) {
+  if (!der || !credPemToDer(pem, n, der, CRED_CA_MAX, &dl)) {
+    if (der) credWipe(der, CRED_CA_MAX);
+    free(der);
     memcpy(out, "sha256:????????", CRED_FP_LEN + 1);
     return;
   }
-  credFingerprint(s_der, dl, out);
+  credFingerprint(der, dl, out);
+  credWipe(der, CRED_CA_MAX);
+  free(der);
 }
 
 void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN]) {
@@ -370,6 +396,15 @@ void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN])
   } else {
     credFingerprint((const uint8_t *)v, n, out);
   }
+}
+
+void credWipe(void *p, size_t n) {
+  volatile uint8_t *v = (volatile uint8_t *)p;
+  while (n--) *v++ = 0;
+#if defined(__GNUC__)
+  // Belt and braces: the buffer's memory is observed, so no store above is dead.
+  __asm__ __volatile__("" : : "r"(p) : "memory");
+#endif
 }
 
 // ---------------------------------------------------------------------------
