@@ -10,9 +10,10 @@
 #include "filestore.h"
 #include "scansched.h"
 #include "config.h"
-#include "secrets.h"
+#include "creds.h"
 
 static HubLinkState g_state    = HUBLINK_OFF;
+static bool         g_standalone = false;   // no hub credentials
 // SCAN, THEN JOIN (scansched.h). While on the fallback AP the board scans
 // for the hub's SSID and joins only once a scan has seen it. The channel and
 // BSSID of that sighting are handed to WiFi.begin(), so the join does not
@@ -182,7 +183,8 @@ static bool      g_bootJoin = false;       // for the stats label only
 static uint32_t  g_fallbackNoticedMs = 0;  // 0 = this AP start is not a fallback
 
 static void startJoin(bool atBoot) {
-  Serial.printf("[hublink] joining \"%s\" ...\n", WIFI_STA_SSID);
+  // The SSID is not printed: serial logs get pasted into notes.
+  Serial.println("[hublink] joining the hub AP ...");
   g_bootJoin = atBoot;
   g_teardown = true;                 // our own mode changes raise events
   g_phase = PH_JOIN_RADIO;
@@ -227,9 +229,9 @@ static void stepJoin() {
       // Asynchronous. With a sighting, straight to that channel and BSSID:
       // no scan inside the join, and no chance of picking a weaker AP.
       if (g_hintValid) {
-        WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS, g_hubChannel, g_hubBssid);
+        WiFi.begin(credsHubSsid(), credsHubPass(), g_hubChannel, g_hubBssid);
       } else {
-        WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS);
+        WiFi.begin(credsHubSsid(), credsHubPass());
       }
       g_hintValid = false;
       g_dropFlag = false;
@@ -317,10 +319,19 @@ void hublinkBegin() {
   // what it did before the hub existed: its own AP. The logger is a
   // standalone product; the hub is an optional client.
   g_state = HUBLINK_AP;
+  // Nothing provisioned (creds.h): the standalone product, and nothing else.
+  // No join, no scan -- there is no SSID to look for.
+  if (!credsHaveHubWifi()) {
+    g_standalone = true;
+    Serial.println("[hublink] no hub credentials -- STANDALONE, own AP only");
+    webuiStart();
+    return;
+  }
   startJoin(/*atBoot=*/true);
 }
 
 void hublinkLoop() {
+  if (g_standalone) return;
   if (g_phase != PH_IDLE) {
     stepJoin();
     return;
@@ -358,7 +369,7 @@ void hublinkLoop() {
     g_stats.scans++;
     int best = -1;
     for (int16_t i = 0; i < r; i++) {
-      if (WiFi.SSID(i) != WIFI_STA_SSID) continue;
+      if (WiFi.SSID(i) != credsHubSsid()) continue;
       if (best < 0 || WiFi.RSSI(i) > WiFi.RSSI(best)) best = i;
     }
     if (best >= 0) {
@@ -381,7 +392,7 @@ void hublinkLoop() {
   // async, no hidden, active, per-channel dwell, one channel or all (0),
   // directed at the hub's SSID so a probe response is solicited.
   const int16_t r = WiFi.scanNetworks(true, false, false, WIFI_SCAN_MS_PER_CHAN,
-                                      ch, WIFI_STA_SSID);
+                                      ch, credsHubSsid());
   if (r == WIFI_SCAN_FAILED) {
     g_stats.scanFails++;
     return;

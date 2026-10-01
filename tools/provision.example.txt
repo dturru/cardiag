@@ -1,0 +1,11 @@
+:cred set ssid <hub-ap-ssid>
+:cred set pass <hub-ap-passphrase>
+:cred set mqtt_user <mqtt-username>
+:cred set mqtt_pass <mqtt-password>
+:cred set token <HUB_API_TOKEN from the hub's secrets.env>
+:cred ca
+-----BEGIN CERTIFICATE-----
+<paste the hub CA PEM body here>
+-----END CERTIFICATE-----
+:cred commit
+:cred show

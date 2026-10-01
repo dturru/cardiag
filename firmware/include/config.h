@@ -118,15 +118,11 @@
 // Hub integration (protocol v1). See docs/hub-integration-plan.md.
 // ---------------------------------------------------------------------------
 
-// The hub network the logger joins as a station. Credentials live in the
-// gitignored secrets.h; these are only the fallbacks so a fresh checkout still
-// compiles. STA is tried first; on failure the board falls back to its own AP.
-#ifndef WIFI_STA_SSID
-#define WIFI_STA_SSID "carhub"
-#endif
-#ifndef WIFI_STA_PASS
-#define WIFI_STA_PASS "carhub-default"
-#endif
+// The hub network the logger joins as a station. Its SSID/passphrase, the API
+// token and the MQTT/CA credentials live in NVS, provisioned over serial
+// (creds.h) -- never compiled in. Nothing provisioned = standalone AP only.
+// WIFI_STA_SSID / WIFI_STA_PASS / HUB_API_TOKEN in a legacy secrets.h are
+// read ONLY by the one-time `:cred import`.
 // How long to wait for the hub network before falling back to AP mode.
 #define WIFI_STA_TIMEOUT_MS 8000
 // SCAN, THEN JOIN (scansched.h). On the fallback AP the board scans for the
@@ -143,13 +139,6 @@
 // channel is unknown) ~1.3 s.
 #define WIFI_SCAN_MS_PER_CHAN    100
 #define WIFI_SCAN_FULL_EVERY     4
-
-// Shared token for the mutating /api/v1 endpoints. Protocol v1 2.4.
-// Override in secrets.h. A default this obvious is intentional: it should look
-// wrong in a packet capture if it was never changed.
-#ifndef HUB_API_TOKEN
-#define HUB_API_TOKEN "change-me"
-#endif
 
 #define HUB_UDP_PORT        5005
 #define HUB_SNAPSHOT_HZ     5      // protocol 1.5 default; 1-10

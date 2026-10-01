@@ -9,6 +9,11 @@ data/*
 !firmware/partitions_cardiag_8mb.csv
 *.log
 secrets.h
+# Provisioning input for `:cred` (tools/serial_capture.py --send-file) and
+# the hub CA: device-specific, never committed.
+provision*.txt
+!provision.example.txt
+*.pem
 .env
 
 # Vendor design files are not redistributed: this repo is PUBLIC and the
