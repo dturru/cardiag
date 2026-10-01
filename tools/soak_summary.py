@@ -90,6 +90,97 @@ def slope(ys: list[int]) -> float:
 HEAP_SLOPE_FAIL = -64.0
 MIN_SEGMENT_ROWS = 10
 
+# ⭐ LARGEST FREE BLOCK: JUDGE THE UPPER ENVELOPE, NOT THE SAMPLES.
+#
+# The 09-25 soak showed a TWO-LEVEL FLIP: largest_block alternating between two
+# plateaus ~8 KB apart as buffers were allocated and freed, both flat for the
+# whole run. That is normal and must never alert -- and a per-sample slope
+# alerts on it whenever the flips happen to bunch up. So:
+#
+#   1. Cut each boot segment into windows of ENVELOPE_WINDOW_CYCLES rows and
+#      take the MAX of each window (the upper plateau).
+#   2. A step counts as a decline only if the window max falls by more than
+#      ENVELOPE_STEP_MIN_B (noise on a flat plateau is not a step).
+#   3. leak  = ENVELOPE_K or more consecutive declining windows whose total
+#              fall exceeds ENVELOPE_DROP_B (bigger than one flip step), OR any
+#              sample below LARGEST_FLOOR_B.
+#      watch = a declining run that has only one of the two: enough windows
+#              but a small fall, or a large fall in fewer windows.
+#      ok    = otherwise. A single low sample or an alternation is ignored.
+#
+# The CSV has no timestamps, so the window is in cycles. 10 cycles is ~10 min
+# at the soak's ~1 min/cycle; pass --window-cycles if the cycle time differs.
+ENVELOPE_WINDOW_CYCLES = 10
+ENVELOPE_K = 6
+ENVELOPE_DROP_B = 16 * 1024
+ENVELOPE_STEP_MIN_B = 256
+LARGEST_FLOOR_B = 120 * 1024
+
+
+def judge_largest(rows: list[dict], *, window: int = ENVELOPE_WINDOW_CYCLES,
+                  k: int = ENVELOPE_K, drop_b: int = ENVELOPE_DROP_B,
+                  floor_b: int = LARGEST_FLOOR_B) -> dict | None:
+    """ok / watch / leak for largest_block, with the numbers behind it.
+
+    None when no row reports largest_block.
+    """
+    worst_state = "ok"
+    rank = {"ok": 0, "watch": 1, "leak": 2}
+    segs_out, reasons = [], []
+    min_sample, min_cycle = None, None
+    for i, seg in enumerate(segments(rows), 1):
+        pts = [(r.get("cycle", "?"), num(r.get("largest_block"))) for r in seg]
+        pts = [(c, v) for c, v in pts if v is not None]
+        if not pts:
+            continue
+        for c, v in pts:
+            if min_sample is None or v < min_sample:
+                min_sample, min_cycle = v, c
+        maxima = []
+        for s in range(0, len(pts), window):
+            chunk = pts[s:s + window]
+            if len(chunk) * 2 < window and maxima:   # short tail: too few rows
+                break
+            maxima.append(max(v for _, v in chunk))
+        # Longest run of consecutive declining windows, and its total fall.
+        best_run, best_fall, run, start = 0, 0, 0, 0
+        for j in range(1, len(maxima)):
+            if maxima[j - 1] - maxima[j] > ENVELOPE_STEP_MIN_B:
+                if run == 0:
+                    start = j - 1
+                run += 1
+                fall = maxima[start] - maxima[j]
+                if (run, fall) > (best_run, best_fall):
+                    best_run, best_fall = run, fall
+            else:
+                run = 0
+        state = "ok"
+        if best_run >= k and best_fall > drop_b:
+            state = "leak"
+            reasons.append(f"segment {i}: upper envelope fell {best_fall} B over "
+                           f"{best_run} consecutive windows (>= {k} windows and "
+                           f"> {drop_b} B)")
+        elif best_run >= 2 and (best_run >= k or best_fall > drop_b):
+            state = "watch"
+            reasons.append(f"segment {i}: upper envelope fell {best_fall} B over "
+                           f"{best_run} consecutive windows (leak needs >= {k} "
+                           f"windows and > {drop_b} B)")
+        segs_out.append({"n": i, "windows": len(maxima), "window_max": maxima,
+                         "decline_run": best_run, "decline_b": best_fall,
+                         "state": state})
+        if rank[state] > rank[worst_state]:
+            worst_state = state
+    if not segs_out:
+        return None
+    if min_sample is not None and min_sample < floor_b:
+        worst_state = "leak"
+        reasons.insert(0, f"largest free block {min_sample} B at cycle "
+                          f"{min_cycle} is below the {floor_b} B floor")
+    return {"state": worst_state, "reasons": reasons, "segments": segs_out,
+            "min_sample": min_sample, "min_cycle": min_cycle,
+            "window_cycles": window, "k": k, "drop_b": drop_b,
+            "floor_b": floor_b}
+
 # One loop() pass over this fails the run. The design budget is ~100 ms per
 # call; a second is past any plausible single HTTP request and means something
 # in loop() still blocks.
@@ -145,12 +236,8 @@ def judge_heap(rows: list[dict]) -> dict:
             out["fails"].append(
                 f"segment {i} (cycles {d['first_cycle']}-{d['last_cycle']}): "
                 f"free heap trending down {d['heap_slope']:+.0f} B/cycle")
-        if (len(larges) >= MIN_SEGMENT_ROWS
-                and d["largest_slope"] < HEAP_SLOPE_FAIL):
-            out["fails"].append(
-                f"segment {i} (cycles {d['first_cycle']}-{d['last_cycle']}): "
-                f"largest free block trending down {d['largest_slope']:+.0f} "
-                f"B/cycle -- fragmentation")
+        # The largest block is judged on its upper envelope (judge_largest),
+        # never on this per-sample slope: a two-level flip skews it.
     return out
 
 
@@ -284,7 +371,8 @@ def coverage(rows: list[dict], mode: str = "SELFTEST") -> dict:
 
 
 def judge(rows: list[dict], *, requested: int = 0,
-          mode: str = "SELFTEST") -> dict:
+          mode: str = "SELFTEST",
+          window_cycles: int = ENVELOPE_WINDOW_CYCLES) -> dict:
     """THE soak verdict. Everything that reports one calls this."""
     done = len(rows)
     requested = requested or done
@@ -301,6 +389,9 @@ def judge(rows: list[dict], *, requested: int = 0,
     if reboots:
         fails.append(f"{len(reboots)} reboot(s)")
     fails += loop["fails"]
+    largest = judge_largest(rows, window=window_cycles)
+    if largest is not None and largest["state"] == "leak":
+        fails += [f"largest free block LEAK -- {r}" for r in largest["reasons"]]
 
     idle = None
     if rows and all("bus_idle_closes" in r for r in rows):
@@ -354,7 +445,7 @@ def judge(rows: list[dict], *, requested: int = 0,
             "loop": loop, "reboots": reboots, "bus_idle_closes": idle,
             "panics": panics, "can_drops": drops, "fs_sub": judge_fs_sub(rows),
             "coverage": cov, "coverage_short": sorted(short),
-            "joins": judge_joins(rows)}
+            "joins": judge_joins(rows), "largest": largest}
 
 
 def read_rows(csv_path) -> list[dict]:
@@ -376,6 +467,9 @@ def verdict_lines(j: dict) -> list[str]:
         out.append(f"  - coverage: {m} readable on {c['readable']}/"
                    f"{c['total']} cycles ({c['pct']:.0f}% < "
                    f"{COVERAGE_MIN_PCT:.0f}%)")
+    lg = j.get("largest")
+    if lg is not None and lg["state"] == "watch":
+        out += [f"  - WATCH: largest free block -- {r}" for r in lg["reasons"]]
     return out
 
 
@@ -397,11 +491,15 @@ def main(argv=None) -> int:
     ap.add_argument("--mode", default="SELFTEST",
                     help="board mode the soak ran in (run_soak.ps1 verifies "
                          "SELFTEST before starting)")
+    ap.add_argument("--window-cycles", type=int, default=ENVELOPE_WINDOW_CYCLES,
+                    help="cycles per largest-block envelope window "
+                         f"(default {ENVELOPE_WINDOW_CYCLES}, ~10 min)")
     args = ap.parse_args(argv)
 
     path = Path(args.csv)
     rows = read_rows(path)
-    j = judge(rows, requested=args.requested, mode=args.mode)
+    j = judge(rows, requested=args.requested, mode=args.mode,
+              window_cycles=args.window_cycles)
     done, requested, partial = j["done"], j["requested"], j["partial"]
     heap, reboots, fails, verdict = j["heap"], j["reboots"], j["fails"], j["verdict"]
     netstack = sum(num(r.get("netstack_12308")) or 0 for r in rows)
@@ -488,6 +586,23 @@ def main(argv=None) -> int:
     bi = j["bus_idle_closes"]
     L.append("- **bus-idle closes:** " + ("not counted" if bi is None
                                          else str(bi)))
+
+    lg = j["largest"]
+    if lg is None:
+        L.append("- **largest free block:** not reported")
+    else:
+        L.append(f"- **largest free block:** **{lg['state'].upper()}** — upper "
+                 f"envelope per {lg['window_cycles']}-cycle window; leak = "
+                 f"{lg['k']}+ declining windows and > {lg['drop_b']} B, or any "
+                 f"sample < {lg['floor_b']} B (lowest {lg['min_sample']} B at "
+                 f"cycle {lg['min_cycle']})")
+        for d in lg["segments"]:
+            L.append(f"  - segment {d['n']}: {d['windows']} window(s), maxima "
+                     f"{d['window_max'][0]} → {d['window_max'][-1]} B, longest "
+                     f"decline {d['decline_run']} window(s) / {d['decline_b']} B "
+                     f"→ {d['state']}")
+        for r in lg["reasons"]:
+            L.append(f"  - ⚠ {r}")
 
     # Heap, PER BOOT SEGMENT. A reset restores free heap and restarts the
     # min-free low-water mark, so a trend is only meaningful inside one boot.

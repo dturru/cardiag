@@ -17,6 +17,8 @@ reboot". It is a per-boot low-water mark: it restarts at every reset. So:
 from __future__ import annotations
 
 import csv
+
+import pytest
 import sys
 from pathlib import Path
 
@@ -40,7 +42,8 @@ def row(cycle: int, heap: int, *, minheap: int | None = None,
             "fallback_ms": "120", "drop_path": "event", "reason": "201",
             "heap": str(heap),
             "minheap": str(minheap if minheap is not None else heap - 20000),
-            "largest_block": str(largest if largest is not None else heap // 2),
+            # Flat and above LARGEST_FLOOR_B unless a test says otherwise.
+            "largest_block": str(largest if largest is not None else 160_000),
             "netstack_12308": "0", "reboot": "1" if reboot else "0",
             "reset_reason": reason,
             # A healthy loop and no false key-off closes, so these fixtures
@@ -102,8 +105,13 @@ def test_falling_min_free_alone_is_headroom_not_a_failure(tmp_path):
 
 
 def test_fragmentation_fails_even_with_flat_free_heap(tmp_path):
-    rows = [row(i, 200_000, largest=100_000 - i * 1000) for i in range(1, 21)]
-    j = ss.judge_heap(read_back(tmp_path, rows))
+    # 200 B/cycle for 130 cycles: 13 windows, envelope down ~25 KB, all above
+    # the floor. Judged on the envelope (judge_largest), not by judge_heap.
+    rows = [row(i, 200_000, largest=200_000 - i * 200) for i in range(1, 131)]
+    rows = read_back(tmp_path, rows)
+    assert ss.judge_heap(rows)["fails"] == []
+    j = ss.judge(rows)
+    assert j["largest"]["state"] == "leak"
     assert any("largest free block" in f for f in j["fails"])
 
 
@@ -187,3 +195,111 @@ def test_short_segment_is_shown_not_judged(tmp_path):
     j = ss.judge_heap(read_back(tmp_path, rows))
     assert j["segments"][0]["heap_slope"] < ss.HEAP_SLOPE_FAIL
     assert not any("segment 1" in f for f in j["fails"])
+
+
+# --- largest free block: upper envelope (ok / watch / leak) --------------------
+
+UPPER, LOWER = 160_000, 160_000 - 8 * 1024        # two plateaus ~8 KB apart
+
+
+def _flip_rows(n: int) -> list[dict]:
+    """The 09-25 shape: largest_block alternating between two flat plateaus,
+    in irregular runs, plus one isolated low sample. Must never alert."""
+    rows = []
+    for i in range(1, n + 1):
+        v = UPPER if (i * 7) % 11 < 5 else LOWER     # bunched, irregular flips
+        if i == n // 2:
+            v = LOWER - 6000                         # one low sample
+        rows.append(row(i, 200_000, largest=v))
+    return rows
+
+
+def _leak_rows(windows: int, step: int = 2048, w: int = 10) -> list[dict]:
+    """Upper envelope stepping down ~2 KB per window, flipping inside each."""
+    rows, i = [], 1
+    for k in range(windows):
+        top = UPPER - k * step
+        for c in range(w):
+            rows.append(row(i, 200_000, largest=top if c % 2 else top - 8 * 1024))
+            i += 1
+    return rows
+
+
+def test_two_level_flip_is_ok():
+    j = ss.judge(_flip_rows(240))                    # 24 windows
+    assert j["largest"]["state"] == "ok", j["largest"]
+    assert j["verdict"] == "PASS"
+    seg = j["largest"]["segments"][0]
+    assert set(seg["window_max"]) == {UPPER}         # the envelope is flat
+
+
+def test_two_level_flip_never_alerts_at_any_phase():
+    for shift in range(11):
+        rows = _flip_rows(240 + shift)[shift:]
+        assert ss.judge_largest(rows)["state"] == "ok", shift
+
+
+def test_synthetic_leak_alerts():
+    j = ss.judge(_leak_rows(12))                     # 11 steps x 2 KB = 22 KB
+    lg = j["largest"]
+    assert lg["state"] == "leak"
+    assert lg["segments"][0]["decline_run"] == 11
+    assert lg["segments"][0]["decline_b"] == 11 * 2048
+    assert j["verdict"] == "FAIL"
+    assert any("largest free block LEAK" in f for f in j["fails"])
+
+
+def test_short_decline_is_watch_not_leak():
+    # 9 windows: 8 steps x 2 KB = 16 KB, not > 16 KB -> enough windows, small fall.
+    lg = ss.judge_largest(_leak_rows(9))
+    assert lg["state"] == "watch"
+    j = ss.judge(_leak_rows(9))
+    assert j["verdict"] == "PASS"
+    assert any("WATCH: largest free block" in ln for ln in ss.verdict_lines(j))
+
+
+def test_big_fall_in_few_windows_is_watch():
+    lg = ss.judge_largest(_leak_rows(4, step=8000))  # 3 steps, 24 kB
+    assert lg["state"] == "watch"
+
+
+def test_floor_breach_is_leak_with_cycle():
+    rows = [row(i, 200_000) for i in range(1, 31)]
+    rows[11]["largest_block"] = str(100_000)
+    lg = ss.judge_largest(rows)
+    assert lg["state"] == "leak"
+    assert lg["min_sample"] == 100_000 and lg["min_cycle"] == "12"
+    assert "below the" in lg["reasons"][0]
+
+
+def test_floor_is_configurable():
+    rows = [row(i, 200_000, largest=110_000) for i in range(1, 31)]
+    assert ss.judge_largest(rows)["state"] == "leak"
+    assert ss.judge_largest(rows, floor_b=100_000)["state"] == "ok"
+
+
+def test_envelope_is_judged_per_boot():
+    """A reboot restores the heap: a fall across it is not a decline."""
+    rows = _leak_rows(5) + [row(51, 200_000, reboot=True)]
+    rows += [row(52 + i, 200_000, largest=UPPER - 9 * 2048) for i in range(50)]
+    lg = ss.judge_largest(rows)
+    assert lg["state"] != "leak"
+
+
+def test_largest_in_summary_md(tmp_path):
+    text = run_summary(tmp_path, _flip_rows(60))
+    assert "largest free block:** **OK**" in text
+
+
+# The real 09-25 soak, if its run folder is present locally (analysis/ is not
+# all committed). Must not alert. Skipped in CI.
+REAL = sorted((Path(__file__).resolve().parents[1] / "analysis").glob(
+    "soak*2026-09-25*/*.csv"))
+
+
+@pytest.mark.skipif(not REAL, reason="09-25 soak CSV not present (local data)")
+def test_real_0925_soak_does_not_alert():
+    for p in REAL:
+        rows = ss.read_rows(p)
+        lg = ss.judge_largest(rows)
+        assert lg is None or lg["state"] == "ok", (p.name, lg)
