@@ -50,6 +50,12 @@ which is canonical. Summary of what matters to firmware:
 | microSD `J2` (`DM3AT-SF-PEJM5`) | **Not on the dev board.** Until the carrier arrives, the file store is backed by LittleFS on internal flash |
 | SD bus | **Cannot share the MCP2515 SPI bus** — needs its own |
 | RTC | PCF8563 + CR2032, for the `rtc` time-anchor source |
+| Ignition sense | Optional input for `POWER_POLICY=1` (power-off follows ignition, never bus silence alone) |
+
+⚠️ **Firmware pin ASSUMPTIONS, not from the netlist** (`firmware/include/config.h`):
+RTC I2C `SDA=GPIO8`, `SCL=GPIO9`; ignition sense `GPIO5`, active-high, read with a
+pull-down so an unwired input reads OFF. All overridable with `-D`. Confirm against the
+carrier netlist before wiring.
 
 See `docs/hub-integration-plan.md` for how the firmware phases around the carrier's
 arrival.

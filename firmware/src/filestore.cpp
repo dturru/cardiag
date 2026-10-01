@@ -32,6 +32,7 @@ static inline void wdtFeedIfArmed() {
 
 #include "filestore.h"
 #include "busidle.h"
+#include "power.h"
 #include "fsprof.h"
 #include "fsusage.h"
 #include <atomic>
@@ -1019,6 +1020,27 @@ FsSubWindow filestoreSubBoot() { return g_subBoot; }
 
 static void filestoreTick() {
   const uint32_t now = millis();
+
+  // ⭐ IGNITION POLICY: CLEAN KEY-OFF, AND STAY CLOSED. Under POWER_IGNITION
+  // the ignition input -- never bus silence -- ends the trip. Once it is off,
+  // close everything and write nothing more until it is back on: the next
+  // snapshot would otherwise reopen a file and undo the close that power-down
+  // depends on. (Under POWER_BUS_QUIET powerMayRecordNow() is always true and
+  // the bus-idle close below is the mechanism, unchanged.)
+  if (!powerMayRecordNow()) {
+    if (g_actSnapshot.open || g_actChanges.open) {
+      const uint32_t a = g_actSnapshot.bytes, b = g_actChanges.bytes;
+      filestoreCloseActive();
+      g_idleClosed.store(true, std::memory_order_relaxed);
+      Serial.printf("[fs] ignition off %lums -> closed all files "
+                    "(tierB=%lu B, tierA=%lu B); safe to lose power\n",
+                    (unsigned long)powerQuietNowMs(),
+                    (unsigned long)a, (unsigned long)b);
+    }
+    hydrateSome(FS_HYDRATE_PER_PASS);
+    return;
+  }
+
   if ((int32_t)(now - g_nextSnapMs) >= 0) {
     g_nextSnapMs = now + FS_SNAPSHOT_PERIOD_MS;
     writeSnapshotBlock();
@@ -1037,7 +1059,8 @@ static void filestoreTick() {
   // `now` was sampled at the top of this pass; canTask may have stored a newer
   // timestamp since. One read, signed comparison (busidle.h).
   const uint32_t lastBus = g_lastBusMs.load(std::memory_order_relaxed);
-  if (!g_idleClosed.load(std::memory_order_relaxed) &&
+  if (powerPolicy() == POWER_BUS_QUIET &&
+      !g_idleClosed.load(std::memory_order_relaxed) &&
       busIdleFor(now, lastBus, CAN_BUS_IDLE_CLOSE_MS) &&
       (g_actSnapshot.open || g_actChanges.open)) {
     const uint32_t a = g_actSnapshot.bytes, b = g_actChanges.bytes;

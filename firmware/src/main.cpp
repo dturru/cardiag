@@ -43,6 +43,8 @@
 #include "bootguard.h"
 #include "bootguard_rt.h"
 #include "creds.h"
+#include "power.h"
+#include "rtc.h"
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason() -- why this boot was a boot
 #include <esp_core_dump.h>  // and, on a crash, WHERE it died
@@ -660,6 +662,11 @@ void setup() {
   // applyMode() in Phase B -- filenames carry boot_id, so the filestore cannot
   // open anything until the session exists, and applyMode() now opens files.
   sessionBegin();
+  // Lowest-trust time anchor, only if the RTC's voltage-low flag is clear.
+  rtcBegin();
+  // Before the boot-time sleep check below: under the ignition policy that
+  // check needs the input's first sample.
+  powerBegin();
 
   // Persistence. A mount failure is NOT fatal: rule 1 says the logger is
   // standalone, and a board that refuses to log to PSRAM because its flash is
@@ -982,7 +989,13 @@ void loop() {
   // is two integer comparisons until the bus has actually been quiet for
   // CAN_MAX_AWAKE_MS. transceiverRequestSleep() owns the invariant, including
   // closing any file that is somehow still open at the backstop.
-  if (filestoreBusQuietMs() >= CAN_MAX_AWAKE_MS) transceiverRequestSleep();
+  // The clock is the power policy's (power.h): bus silence, or ignition-off
+  // time -- never bus silence under the ignition policy.
+  powerLoop();
+  {
+    const uint32_t sleepMs = powerThresholdsNow().sleepMs;
+    if (sleepMs && powerQuietNowMs() >= sleepMs) transceiverRequestSleep();
+  }
 
   LOOP_STAGE("keys",      handleKeys());
   LOOP_STAGE("button",    handleButton());

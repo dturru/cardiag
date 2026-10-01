@@ -11,6 +11,7 @@
 #include "hubstream.h"
 #include "filestore.h"
 #include "session.h"
+#include "rtc.h"
 #include "sniffer.h"
 #include "config.h"
 #include "creds.h"
@@ -433,6 +434,8 @@ static void handleTime(WebServer &srv) {
   }
 
   const bool applied = sessionSetAnchor((uint64_t)epoch, src);
+  // Keep the RTC on the best time the hub has given (gps/ntp only).
+  if (applied) rtcSyncFromAnchor();
   char buf[192];
   snprintf(buf, sizeof(buf),
       "{\"ok\":true,\"applied\":%s,\"source\":\"%s\",\"uptime_ms\":%lu}",

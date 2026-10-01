@@ -280,6 +280,84 @@
 // on the G variant means nothing will ever turn this board off.
 #define CAN_MAX_AWAKE_MS (5u * 60u * 1000u)
 
+// ---------------------------------------------------------------------------
+// POWER-OFF POLICY (powerpolicy.h). What ends a trip.
+//
+//   0 = bus-quiet  files close after CAN_BUS_IDLE_CLOSE_MS of silence and
+//                  power-down follows at CAN_MAX_AWAKE_MS. The default.
+//   1 = ignition   files close and power-down follow IGN_SENSE_GPIO, never
+//                  bus silence alone. For vehicles whose diagnostic bus is
+//                  silent while running unless a tester polls it.
+//
+// Build-time: -DPOWER_POLICY=1. Both modes close every file before the
+// power-down command (sleepguard.h owns that; the policy only picks the clock).
+// ---------------------------------------------------------------------------
+#ifndef POWER_POLICY
+#define POWER_POLICY 0
+#endif
+
+// ⚠️ ASSUMED PIN, NOT FROM A NETLIST. The ignition-sense input on the carrier
+// is not designed yet (docs/NEXT-SESSION.md §5). GPIO5 is free on the
+// ESP32-CAN-X2 as far as config.h knows (not CAN1, the MCP2515 SPI/INT, the
+// LED, BOOT, USB, UART0 or octal PSRAM). Confirm against the carrier netlist
+// before wiring anything to it -- CLAUDE.md: verify wiring from the NETLIST.
+//
+// Expected circuit: switched supply -> divider/opto -> 3.3 V logic. The pin
+// is read with a PULL-DOWN, so an unwired or broken input reads OFF and the
+// board powers down: the fail-safe direction for the battery.
+#ifndef IGN_SENSE_GPIO
+#define IGN_SENSE_GPIO 5
+#endif
+#ifndef IGN_ACTIVE_HIGH
+#define IGN_ACTIVE_HIGH 1
+#endif
+
+// Debounce. Generic starting points, NOT measured on any vehicle: tune from a
+// trace of the real input. OFF is slow so a supply dip while cranking is not
+// a key-off; ON is quick so the first seconds of a trip are not lost.
+#ifndef IGN_ON_DEBOUNCE_MS
+#define IGN_ON_DEBOUNCE_MS 200
+#endif
+#ifndef IGN_OFF_DEBOUNCE_MS
+#define IGN_OFF_DEBOUNCE_MS 2000
+#endif
+// Ignition off this long: command power-down (close-then-sleep, sleepguard.h).
+// The ignition policy's equivalent of CAN_MAX_AWAKE_MS, and like it the only
+// thing that turns the board off -- 0 disables it, which on the TCAN1043G
+// means nothing ever will.
+#ifndef IGN_OFF_SLEEP_MS
+#define IGN_OFF_SLEEP_MS (60u * 1000u)
+#endif
+
+#if POWER_POLICY != 0 && POWER_POLICY != 1
+#error "POWER_POLICY must be 0 (bus-quiet) or 1 (ignition)"
+#endif
+#if IGN_SENSE_GPIO >= 35 && IGN_SENSE_GPIO <= 37
+#error "IGN_SENSE_GPIO: IO35/36/37 are taken by octal PSRAM"
+#endif
+
+// ---------------------------------------------------------------------------
+// RTC: PCF8563 (rtc8563.h). Read once at boot as the lowest-trust "rtc" anchor
+// when its voltage-low flag is clear; written whenever the hub pushes gps/ntp.
+// ---------------------------------------------------------------------------
+#ifndef RTC_ENABLE
+#define RTC_ENABLE 1
+#endif
+// ⚠️ ASSUMED PINS, NOT FROM A NETLIST. GPIO8/9 are the ESP32-S3 Arduino
+// default I2C pins and are not used by anything else in config.h. Confirm
+// against the carrier netlist. With no RTC fitted the boot read NACKs and the
+// logger says so and carries on with no anchor.
+#ifndef RTC_SDA_GPIO
+#define RTC_SDA_GPIO 8
+#endif
+#ifndef RTC_SCL_GPIO
+#define RTC_SCL_GPIO 9
+#endif
+#define RTC_I2C_HZ 100000
+// An RTC reading before this year is an unset clock counting from its reset
+// value, not a time. Rejected like VL.
+#define RTC_MIN_YEAR 2026
+
 // Hardware task watchdog. Layer 1: the other two failsafes are code, so they
 // cannot help when the code is what stopped running.
 #ifndef WDT_TIMEOUT_S

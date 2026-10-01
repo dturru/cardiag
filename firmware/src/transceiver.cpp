@@ -2,6 +2,7 @@
 
 #include "transceiver.h"
 #include "filestore.h"
+#include "power.h"
 #include "config.h"
 
 // The ESP32-CAN-X2 has no INH path and no EN/nSTB control: those pins exist on
@@ -15,18 +16,20 @@ bool transceiverHasInhPath() { return TRANSCEIVER_HAS_INH != 0; }
 
 SleepVerdict transceiverRequestSleep() {
   const FileStoreStats *fs = filestoreStats();
-  const SleepVerdict v = sleepVerdict(fs->openFiles, fs->mounted,
-                                      filestoreBusQuietMs(),
-                                      CAN_BUS_IDLE_CLOSE_MS,
-                                      CAN_MAX_AWAKE_MS);
+  // The policy picks the clock (bus silence, or ignition-off time); the guard
+  // below is the same for both, so the open-file invariant is written once.
+  const PowerThresholds t = powerThresholdsNow();
+  const uint32_t quiet = powerQuietNowMs();
+  const SleepVerdict v = sleepVerdict(fs->openFiles, fs->mounted, quiet,
+                                      t.closeMs, t.sleepMs);
 
   // ⭐ BACKSTOP. The G variant has no tINACTIVE failsafe, so refusing forever
   // to protect an open file means draining the battery instead. Close it and
   // go -- the invariant is kept by closing, not by refusing.
   if (sleepNeedsClose(v)) {
-    Serial.printf("[sleep] %s (open=%u, quiet=%lums)\n",
+    Serial.printf("[sleep] %s (open=%u, %s quiet=%lums)\n",
                   sleepVerdictName(v), (unsigned)fs->openFiles,
-                  (unsigned long)filestoreBusQuietMs());
+                  powerPolicyName(powerPolicy()), (unsigned long)quiet);
     filestoreCloseActive();
   }
 
@@ -34,9 +37,10 @@ SleepVerdict transceiverRequestSleep() {
     // Loud, because a refusal here is the thing standing between an open file
     // and a power cut. It is also cheap: this is not a hot path.
     Serial.printf("[sleep] NOT commanding sleep -- %s "
-                  "(open=%u mounted=%d quiet=%lums)\n",
+                  "(open=%u mounted=%d %s quiet=%lums)\n",
                   sleepVerdictName(v), (unsigned)fs->openFiles,
-                  (int)fs->mounted, (unsigned long)filestoreBusQuietMs());
+                  (int)fs->mounted, powerPolicyName(powerPolicy()),
+                  (unsigned long)quiet);
     return v;
   }
 
@@ -45,9 +49,9 @@ SleepVerdict transceiverRequestSleep() {
   // On the carrier this is followed by EN high + nSTB low, and INH drops
   // ~20-50 us later. The bench power-cut test cuts power exactly HERE, so what
   // it measures is the real ordering rather than a convenient one.
-  Serial.printf("[sleep] all files closed, bus quiet %lums -- "
+  Serial.printf("[sleep] all files closed, %s quiet %lums -- "
                 "SAFE TO CUT POWER NOW%s\n",
-                (unsigned long)filestoreBusQuietMs(),
+                powerPolicyName(powerPolicy()), (unsigned long)quiet,
                 transceiverHasInhPath() ? "" : " (no INH path on this board)");
 
 #if TRANSCEIVER_HAS_INH
