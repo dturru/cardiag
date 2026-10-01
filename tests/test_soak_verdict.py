@@ -360,3 +360,4 @@ def test_counters_parse_from_their_own_stats_line():
     assert (cyc.heap, cyc.loop_cycle_max_us) == (200_000, 80_000)
     assert (cyc.fs_sub_max_us, cyc.can_rx_missed, cyc.can_id_overflow) == (
         40_000, 0, 0)
+    assert cyc.log_dropped == 12

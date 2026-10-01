@@ -254,7 +254,13 @@ static void canPause() {
 
 static void canResume() { g_canPause = false; }
 
+// The mode an ignition OFF dropped to LISTEN, to bring back on the ON edge.
+static ModeRestore g_modeRestore = {MODE_RESTORE_NONE};
+
 static void applyMode(uint8_t m, bool persist) {
+  // persist == a deliberate choice (key, button, hub): it supersedes any mode
+  // waiting to be restored after an ignition OFF.
+  if (persist) modeRestoreCancel(g_modeRestore);
   canPause();
 
   if (g_twaiUp) {
@@ -994,13 +1000,25 @@ static void ignitionPowerTick() {
   static uint32_t lastCmdMs = 0;
   static bool commanded = false;
   static uint32_t lastBackstopMs = 0;
+  static bool wasOn = true;
   if (powerIgnitionOn()) {
     commanded = false;
+    // ON edge: bring back the mode the OFF dropped, if the gate allows it.
+    if (!wasOn) {
+      const uint8_t m = modeRestoreOnOn(g_modeRestore, canTxAllowed());
+      if (m != MODE_RESTORE_NONE && m != g_mode) {
+        Serial.printf("[power] ignition back on: restoring %s\n", modeName(m));
+        applyMode(m, false);
+      }
+    }
+    wasOn = true;
     return;
   }
+  wasOn = false;
   if (modeTransmits(g_mode)) {
-    Serial.printf("[power] ignition off: %s -> LISTEN (no TX while off)\n",
-                  modeName(g_mode));
+    Serial.printf("[power] ignition off: %s -> LISTEN (no TX while off; "
+                  "restored if it comes back on)\n", modeName(g_mode));
+    modeRestoreOnOff(g_modeRestore, g_mode, true);
     applyMode(MODE_LISTEN, false);
   }
   const uint32_t now = millis();
