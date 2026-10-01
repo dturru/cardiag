@@ -255,6 +255,58 @@ void test_nothing_open_safe_then_sleep(void) {
   TEST_ASSERT_EQUAL_STRING("SZ", f.log);
 }
 
+// --- mode restore across OFF -> ON ------------------------------------------
+
+static const uint8_t M_LISTEN = 0, M_POLL = 3;   // modes are opaque here
+
+void test_off_then_on_within_sleep_window_restores_mode(void) {
+  const uint32_t SLEEP_AFTER = 5000;               // extra wait after OFF
+  ModeRestore r = {MODE_RESTORE_NONE};
+  IgnDebounce d = booted(true, 0);
+  uint8_t mode = M_POLL;
+  // Ignition drops at 1000; OFF believed at 3000 -> POLL dropped to LISTEN.
+  ignDebounce(d, false, 1000, ON_MS, OFF_MS);
+  TEST_ASSERT_FALSE(ignDebounce(d, false, 3000, ON_MS, OFF_MS));
+  modeRestoreOnOff(r, mode, true);
+  mode = M_LISTEN;
+  TEST_ASSERT_FALSE(canTxGate(POWER_IGNITION, d.on));
+  // Back ON at 4000, believed at 4200: still inside OFF_MS + SLEEP_AFTER.
+  ignDebounce(d, true, 4000, ON_MS, OFF_MS);
+  TEST_ASSERT_TRUE(ignDebounce(d, true, 4200, ON_MS, OFF_MS));
+  TEST_ASSERT_TRUE(4200 - 1000 < OFF_MS + SLEEP_AFTER);
+  const uint8_t m = modeRestoreOnOn(r, canTxGate(POWER_IGNITION, d.on));
+  TEST_ASSERT_EQUAL_UINT8(M_POLL, m);
+  // One-shot: the next ON edge restores nothing.
+  TEST_ASSERT_EQUAL_UINT8(MODE_RESTORE_NONE, modeRestoreOnOn(r, true));
+}
+
+void test_restore_needs_the_gate_open(void) {
+  ModeRestore r = {MODE_RESTORE_NONE};
+  modeRestoreOnOff(r, M_POLL, true);
+  TEST_ASSERT_EQUAL_UINT8(MODE_RESTORE_NONE, modeRestoreOnOn(r, false));
+  TEST_ASSERT_EQUAL_UINT8(M_POLL, modeRestoreOnOn(r, true));   // kept until allowed
+}
+
+void test_restore_only_remembers_transmitting_modes(void) {
+  ModeRestore r = {MODE_RESTORE_NONE};
+  modeRestoreOnOff(r, M_LISTEN, false);
+  TEST_ASSERT_EQUAL_UINT8(MODE_RESTORE_NONE, modeRestoreOnOn(r, true));
+}
+
+void test_second_off_keeps_the_configured_mode(void) {
+  ModeRestore r = {MODE_RESTORE_NONE};
+  modeRestoreOnOff(r, M_POLL, true);
+  modeRestoreOnOff(r, 2, true);
+  TEST_ASSERT_EQUAL_UINT8(M_POLL, modeRestoreOnOn(r, true));
+}
+
+void test_deliberate_change_cancels_restore(void) {
+  ModeRestore r = {MODE_RESTORE_NONE};
+  modeRestoreOnOff(r, M_POLL, true);
+  modeRestoreCancel(r);
+  TEST_ASSERT_EQUAL_UINT8(MODE_RESTORE_NONE, modeRestoreOnOn(r, true));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_first_sample_is_taken_as_is);
@@ -278,5 +330,10 @@ int main(int, char **) {
   RUN_TEST(test_never_sleep_when_close_fails);
   RUN_TEST(test_refusal_commands_nothing);
   RUN_TEST(test_nothing_open_safe_then_sleep);
+  RUN_TEST(test_off_then_on_within_sleep_window_restores_mode);
+  RUN_TEST(test_restore_needs_the_gate_open);
+  RUN_TEST(test_restore_only_remembers_transmitting_modes);
+  RUN_TEST(test_second_off_keeps_the_configured_mode);
+  RUN_TEST(test_deliberate_change_cancels_restore);
   return UNITY_END();
 }

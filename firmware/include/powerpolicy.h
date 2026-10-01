@@ -233,3 +233,36 @@ static inline const char *xcvrModeName(XcvrMode m) {
     default:               return "standby";
   }
 }
+
+// ---------------------------------------------------------------------------
+// MODE RESTORE across an ignition OFF -> ON within one boot.
+//
+// Ignition OFF forces a transmitting mode down to LISTEN (no TX while off).
+// If the ignition comes back before the board has powered down, the mode the
+// operator configured comes back with it -- but only if the TX gate is open
+// again, and only if nobody chose a mode in between (any deliberate mode
+// change cancels the restore).
+// ---------------------------------------------------------------------------
+#define MODE_RESTORE_NONE 0xFF
+
+struct ModeRestore {
+  uint8_t mode;   // MODE_RESTORE_NONE = nothing to restore
+};
+
+// Ignition OFF while in `current`: remember it if it is the one being dropped.
+// A second OFF while already holding one keeps the first (the configured mode).
+static inline void modeRestoreOnOff(ModeRestore &r, uint8_t current,
+                                    bool currentTransmits) {
+  if (currentTransmits && r.mode == MODE_RESTORE_NONE) r.mode = current;
+}
+
+// Ignition ON edge: the mode to restore, or MODE_RESTORE_NONE. One-shot.
+static inline uint8_t modeRestoreOnOn(ModeRestore &r, bool txAllowed) {
+  const uint8_t m = r.mode;
+  if (m == MODE_RESTORE_NONE || !txAllowed) return MODE_RESTORE_NONE;
+  r.mode = MODE_RESTORE_NONE;
+  return m;
+}
+
+// A deliberate mode change (key, button, hub) supersedes the remembered one.
+static inline void modeRestoreCancel(ModeRestore &r) { r.mode = MODE_RESTORE_NONE; }
