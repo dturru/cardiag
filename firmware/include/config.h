@@ -572,6 +572,25 @@
 // flight at a time, so a handful covers several ECUs answering at once.
 #define POLL_RX_QUEUE_LEN 16
 
+// ---------------------------------------------------------------------------
+// Tier C trip bookends (bookend.h). Each read (01/01, 03, 07, every Mode 06
+// MID) is one request; a request is answered once BOOKEND_QUIET_MS passes
+// with no frame and nothing mid-assembly, or after BOOKEND_REQ_MAX_MS.
+// ---------------------------------------------------------------------------
+#define BOOKEND_QUIET_MS       OBD_RESPONSE_TIMEOUT_MS
+#define BOOKEND_REQ_MAX_MS     500u
+// Never START a request with less than this left: it could not finish.
+#define BOOKEND_MIN_START_MS   (BOOKEND_QUIET_MS + 50u)
+// Trip start: after ignition ON and the first answered poll. Generous: the
+// trip has only just begun.
+#define BOOKEND_START_BUDGET_MS 5000u
+// Trip end: the reads run inside the ignition OFF debounce window, the only
+// time the TX gate is still open after key-off. This much of the window is
+// kept back so the record is written before the debounce confirms OFF and the
+// files close. Whatever does not fit is cut (flag: truncated); an END with no
+// completed read is skipped and logged.
+#define BOOKEND_END_MARGIN_MS   300u
+
 // PIDs packed into a single Mode 01 request. The standard permits up to 6, and
 // that is the difference between ~30 samples/s and ~180 samples/s -- the number
 // that sets this project's sampling ceiling.

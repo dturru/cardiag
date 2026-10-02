@@ -27,5 +27,11 @@ bool powerMayRecordNow();
 // Debounced ignition level. Always true under bus-quiet.
 bool powerIgnitionOn();
 
+// Ignition policy only: the input reads OFF but the debounce has not confirmed
+// it yet. The TX gate is still open (it follows the debounced level), so this
+// window is the last chance to read the trip-end bookend. *edgeMs = when the
+// input went off. False under bus-quiet.
+bool powerIgnitionOffPending(uint32_t *edgeMs);
+
 // Why this boot happened (powerpolicy.h). WAKE_NA under bus-quiet.
 WakeSource powerWakeSource();

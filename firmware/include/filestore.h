@@ -27,8 +27,8 @@
 //                                             does not fit 3.5 MB of flash
 //   A     changes     9,450 B/s meas  CSV     YES -- ~7 min of partition
 //   B     snapshot    4 + 13N B/s     CDGS    YES -- 186 B/s @ 14 ids, HOURS
-//   C     bookend     bytes per trip  CSV     NO -- trip DTCs / Mode 06, not
-//                                             implemented yet
+//   C     bookend     bytes per trip  CDGB    YES -- trip DTCs / Mode 06,
+//                                             one small file per event
 //
 // ⚠ EARLIER DRAFTS OF THIS MODULE CALLED THE CHANGE LOG "TIER C". That was
 // wrong: Tier C is the trip bookends. The change log is deduplicated raw
@@ -69,14 +69,14 @@ class WebServer;
 // listing's "tier" field, and they are what the deletion order sorts on.
 #define FS_TIER_RAW      'A'     // frame-level record of the bus
 #define FS_TIER_SNAPSHOT 'B'     // 1 Hz snapshot / health
-#define FS_TIER_BOOKEND  'C'     // trip bookends (DTCs, Mode 06) -- not yet
+#define FS_TIER_BOOKEND  'C'     // trip bookends (DTCs, Mode 06)
 
 // Kind letters -- WHAT IS IN THE FILE. Second character of the filename and
 // the listing's "kind" field. Tier A has two kinds; the rest have one each.
 #define FS_KIND_RAW      'r'     // every frame (Tier A) -- not written yet
 #define FS_KIND_CHANGES  'c'     // change log (Tier A)
 #define FS_KIND_SNAPSHOT 's'     // snapshot log (Tier B)
-#define FS_KIND_BOOKEND  'b'     // trip bookend (Tier C) -- not written yet
+#define FS_KIND_BOOKEND  'b'     // trip bookend (Tier C), format cdgb1
 
 // The producing mode is not recoverable for this file.
 //
@@ -239,6 +239,10 @@ void filestoreSetMode(uint8_t mode);
 
 // Closes whatever is open. Called before a mode change and from the API.
 void filestoreCloseActive();
+
+// Write one Tier C bookend record (bookend.h) as its own closed file, format
+// `cdgb1`. False if storage is not mounted/enabled or the write failed.
+bool filestoreWriteBookend(const uint8_t *rec, size_t n);
 
 // Called from the CAN task on every received frame. Cheap on purpose: one
 // volatile store, because it is on the hot path at ~1,500 frames/s.

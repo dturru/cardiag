@@ -70,7 +70,7 @@ per `firmware/partitions_cardiag_8mb.csv` — 2 MB × 2 OTA app slots leaves the
 | **A** | `raw` | every frame, pre-trigger ring | ~16 kB/s | **RAM ONLY** — under 4 min on flash, and it would burn write cycles doing it. PSRAM until SD exists | ✗ |
 | **A** | `changes` | frame appended when a non-heartbeat byte moves | **9,450 B/s** measured · 3,789 B/s if binary | **7 min** · 16 min | ✅ CSV |
 | **B** | `snapshot` | latest frame per ID, **1 Hz**, no decoding | 186 B/s @ 14 IDs · 537 B/s @ 41 | **5.6 h** · 116 min | ✅ binary `CDGS` |
-| **C** | `bookend` | trip bookends — DTCs, Mode 06 at trip start/end | bytes per trip | effectively unbounded | ✗ not implemented |
+| **C** | `bookend` | trip bookends — Mode 01 PID 01, DTCs (03/07), Mode 06 at trip start/end; one `cdgb1` file per event | ≤ 0.9 kB per event | effectively unbounded | ✅ binary `CDGB` |
 | ~~"Tier B" 80 B/s~~ | — | decoded signals @ 1 Hz | — | **the logger never writes this** | — |
 
 **On disk:** `NNNNNN_TK_BBBBBBBB.{part,log,meta}` — `T` is the tier letter, `K` the kind

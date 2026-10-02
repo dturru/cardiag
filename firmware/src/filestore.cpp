@@ -32,6 +32,7 @@ static inline void wdtFeedIfArmed() {
 
 #include "filestore.h"
 #include "busidle.h"
+#include "bookend.h"
 #include "power.h"
 #include "fsprof.h"
 #include "fsusage.h"
@@ -732,6 +733,20 @@ void filestoreCloseActive() {
   closeActive(g_actChanges);
 }
 
+// One Tier C bookend = one small closed file: header + record, then the same
+// close (digest, .meta, rename) as every other file. A bookend never stays
+// open, so key-off has nothing of Tier C left to close.
+bool filestoreWriteBookend(const uint8_t *rec, size_t n) {
+  if (!g_st.mounted || !g_enabled) return false;
+  Active a = {};
+  if (!openActive(a, FS_KIND_BOOKEND)) return false;
+  uint8_t h[BOOKEND_FILE_HDR];
+  bookendFileHeader(h, g_mode, sessionDeviceId(), sessionBootId());
+  const bool ok = writeActive(a, h, sizeof(h)) && writeActive(a, rec, n);
+  closeActive(a);
+  return ok;
+}
+
 // ---------------------------------------------------------------------------
 // Writers
 // ---------------------------------------------------------------------------
@@ -1212,7 +1227,8 @@ static void handleList(WebServer &srv) {
         (e.mode == FS_MODE_UNKNOWN) ? "null"
                                     : ((e.mode == MODE_SELFTEST) ? "true"
                                                                  : "false"),
-        (e.kind == FS_KIND_SNAPSHOT) ? "cdgs1" : "csv");
+        (e.kind == FS_KIND_SNAPSHOT) ? "cdgs1"
+        : (e.kind == FS_KIND_BOOKEND) ? "cdgb1" : "csv");
     srv.sendContent(buf, n);
 
     if (e.hasSha) {
