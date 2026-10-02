@@ -46,6 +46,45 @@ void test_shared_vector(void) {
   TEST_ASSERT_EQUAL_STRING(kVectorHex, h);
 }
 
+// ⭐ carhub's vector (carhub docs/protocol.md §1.7 at c626e3a): record only,
+// no file header.
+void test_carhub_bookend_vector(void) {
+  static const char kHex[] =
+      "0301280002f04c742a000000dc050000010100008207652402002004000103010123c1"
+      "020001800ab80b00008813002180849cff0cfef401";
+  BookendData d;
+  bookendInit(d, BOOKEND_KIND_START);
+  d.flags = BOOKEND_F_COMPLETE;
+  const uint8_t p[4] = {0x82, 0x07, 0x65, 0x24};
+  memcpy(d.pid01, p, 4);
+  d.stored[d.nStored++] = {0, 0x0420};
+  d.stored[d.nStored++] = {0, 0x0301};
+  d.pending[d.nPending++] = {1, 0xC123};
+  d.m06[d.nM06++] = {0, 0x01, 0x80, 0x0A, 3000, 0, 5000};
+  d.m06[d.nM06++] = {0, 0x21, 0x80, 0x84, 0xFF9C, 0xFE0C, 0x01F4};
+  uint8_t buf[BOOKEND_REC_MAX];
+  const size_t n = bookendEncode(d, 0x744CF002, 42, 1500, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL(56, n);
+  char h[2 * BOOKEND_REC_MAX + 1];
+  hex(buf, n, h);
+  TEST_ASSERT_EQUAL_STRING(kHex, h);
+}
+
+// The same bytes arrived on the wire as Mode 03 / Mode 06 replies decode to
+// the carhub vector's entries: big-endian in, little-endian on disk.
+void test_wire_big_endian_to_disk_little_endian(void) {
+  BookendData d;
+  bookendInit(d, BOOKEND_KIND_START);
+  const uint8_t m03[] = {0x43, 0x02, 0x04, 0x20, 0x03, 0x01};
+  bookendParseDtcs(d, 0, false, m03, sizeof(m03));
+  TEST_ASSERT_EQUAL_HEX16(0x0420, d.stored[0].dtc);
+  TEST_ASSERT_EQUAL_HEX16(0x0301, d.stored[1].dtc);
+  const uint8_t m06[] = {0x46, 0x01, 0x80, 0x0A, 0x0B, 0xB8, 0x00, 0x00, 0x13, 0x88};
+  bookendParseM06Results(d, 0, m06, sizeof(m06));
+  TEST_ASSERT_EQUAL_UINT16(3000, d.m06[0].value);
+  TEST_ASSERT_EQUAL_UINT16(5000, d.m06[0].max);
+}
+
 void test_empty_record_and_no_response_pid01(void) {
   BookendData d;
   bookendInit(d, BOOKEND_KIND_END);
@@ -376,6 +415,8 @@ void test_pid01_only_from_ecu0(void) {
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_shared_vector);
+  RUN_TEST(test_carhub_bookend_vector);
+  RUN_TEST(test_wire_big_endian_to_disk_little_endian);
   RUN_TEST(test_empty_record_and_no_response_pid01);
   RUN_TEST(test_max_record_fits);
   RUN_TEST(test_file_header);

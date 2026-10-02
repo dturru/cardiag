@@ -38,6 +38,13 @@ hash       3046906ac3000655
 empty      {"version":1,"entries":[]}  ->  8bcae181d21321b7
 ```
 
+carhub's plan vector (§2.6, `test_carhub_plan_vector`):
+
+```
+canonical  {"version":1,"entries":[{"mode":1,"pid":5,"period_ms":2000},{"mode":1,"pid":12,"period_ms":200},{"mode":1,"pid":13,"period_ms":500}]}
+hash       e52fa6872718765d
+```
+
 `GET /api/v1/session` adds
 `"pollplan":{"hash":"<16 hex>"|null,"entries":N,"source":"nvs"|"none"}`.
 No plan (never set, or cleared): the **empty-plan hash**,
@@ -99,6 +106,16 @@ boot_id 7, ms 123456, trip_start, flags complete, pid01 `81 07 65 00`, stored
 
 ```
 03012800443322110700000040e20100010100008107650001003301020020040123c1020001800a2301000000040121872400801000ffff
+```
+
+**carhub's vector** (carhub `docs/protocol.md` §1.7, c626e3a — the logger's encoder
+matches it byte for byte, `test_carhub_bookend_vector`): device `0x744CF002`, boot 42,
+ms 1500, trip_start, flags 0x01, pid01 `82 07 65 24`, stored
+`[(0,0x0420), (0,0x0301)]`, pending `[(1,0xC123)]`, Mode 06
+`[(0, 01,80,0A, 3000,0,5000), (0, 21,80,84, 0xFF9C,0xFE0C,0x01F4)]` → 56 bytes:
+
+```
+0301280002f04c742a000000dc050000010100008207652402002004000103010123c1020001800ab80b00008813002180849cff0cfef401
 ```
 
 **When the logger reads them.**
