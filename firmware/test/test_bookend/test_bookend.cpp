@@ -12,12 +12,12 @@ void tearDown(void) {}
 
 // ⭐ SHARED VECTOR -- the same hex is in carhub's decoder tests.
 // device_id 0x11223344, boot_id 7, ms 123456, trip_start, complete,
-// pid01 81 07 65 00 (raw), stored [0x0133],
-// pending [0x0420, 0xC123], Mode 06 [(01,80,0A,0123,0000,0400),
-// (21,87,24,8000,0010,FFFF)].
+// pid01 81 07 65 00 (raw), stored [(ecu 0, 0x0133)],
+// pending [(0, 0x0420), (1, 0xC123)], Mode 06 [(0, 01,80,0A,0123,0000,0400),
+// (1, 21,87,24,8000,0010,FFFF)].
 static const char kVectorHex[] =
-    "03012300443322110700000040e20100010100008107650001330102200423c102"
-    "01800a23010000000421872400801000ffff";
+    "03012800443322110700000040e20100010100008107650001003301020020040123c102"
+    "0001800a2301000000040121872400801000ffff";
 
 static BookendData vectorData() {
   BookendData d;
@@ -25,11 +25,11 @@ static BookendData vectorData() {
   d.flags = BOOKEND_F_COMPLETE;
   const uint8_t p[4] = {0x81, 0x07, 0x65, 0x00};
   memcpy(d.pid01, p, 4);
-  d.stored[d.nStored++] = 0x0133;
-  d.pending[d.nPending++] = 0x0420;
-  d.pending[d.nPending++] = 0xC123;
-  d.m06[d.nM06++] = {0x01, 0x80, 0x0A, 0x0123, 0x0000, 0x0400};
-  d.m06[d.nM06++] = {0x21, 0x87, 0x24, 0x8000, 0x0010, 0xFFFF};
+  d.stored[d.nStored++] = {0, 0x0133};
+  d.pending[d.nPending++] = {0, 0x0420};
+  d.pending[d.nPending++] = {1, 0xC123};
+  d.m06[d.nM06++] = {0, 0x01, 0x80, 0x0A, 0x0123, 0x0000, 0x0400};
+  d.m06[d.nM06++] = {1, 0x21, 0x87, 0x24, 0x8000, 0x0010, 0xFFFF};
   return d;
 }
 
@@ -40,7 +40,7 @@ static void hex(const uint8_t *b, size_t n, char *out) {
 void test_shared_vector(void) {
   uint8_t buf[BOOKEND_REC_MAX];
   const size_t n = bookendEncode(vectorData(), 0x11223344, 7, 123456, buf, sizeof(buf));
-  TEST_ASSERT_EQUAL(51, n);
+  TEST_ASSERT_EQUAL(56, n);
   char h[2 * BOOKEND_REC_MAX + 1];
   hex(buf, n, h);
   TEST_ASSERT_EQUAL_STRING(kVectorHex, h);
@@ -87,22 +87,23 @@ void test_dtc_parse_count_padding_and_cap(void) {
   BookendData d;
   bookendInit(d, BOOKEND_KIND_START);
   const uint8_t m03[] = {0x43, 0x03, 0x01, 0x33, 0x00, 0x00, 0xC1, 0x23};
-  TEST_ASSERT_TRUE(bookendParseDtcs(d, false, m03, sizeof(m03)));
+  TEST_ASSERT_TRUE(bookendParseDtcs(d, 2, false, m03, sizeof(m03)));
   TEST_ASSERT_EQUAL_UINT8(2, d.nStored);              // 0x0000 skipped
-  TEST_ASSERT_EQUAL_HEX16(0x0133, d.stored[0]);
-  TEST_ASSERT_EQUAL_HEX16(0xC123, d.stored[1]);
+  TEST_ASSERT_EQUAL_HEX16(0x0133, d.stored[0].dtc);
+  TEST_ASSERT_EQUAL_UINT8(2, d.stored[0].ecu);
+  TEST_ASSERT_EQUAL_HEX16(0xC123, d.stored[1].dtc);
   // Count larger than the bytes present: trust the bytes.
   const uint8_t lying[] = {0x47, 0x09, 0x04, 0x20};
-  TEST_ASSERT_TRUE(bookendParseDtcs(d, true, lying, sizeof(lying)));
+  TEST_ASSERT_TRUE(bookendParseDtcs(d, 0, true, lying, sizeof(lying)));
   TEST_ASSERT_EQUAL_UINT8(1, d.nPending);
-  TEST_ASSERT_FALSE(bookendParseDtcs(d, true, m03, sizeof(m03)));  // wrong mode
+  TEST_ASSERT_FALSE(bookendParseDtcs(d, 0, true, m03, sizeof(m03)));  // wrong mode
   // Cap.
   uint8_t many[2 + 2 * 40];
   many[0] = 0x43; many[1] = 40;
   for (int i = 0; i < 40; i++) { many[2 + 2 * i] = 0x01; many[3 + 2 * i] = (uint8_t)(i + 1); }
   BookendData e;
   bookendInit(e, BOOKEND_KIND_START);
-  bookendParseDtcs(e, false, many, sizeof(many));
+  bookendParseDtcs(e, 0, false, many, sizeof(many));
   TEST_ASSERT_EQUAL_UINT8(BOOKEND_MAX_STORED, e.nStored);
   TEST_ASSERT_TRUE(e.flags & BOOKEND_F_TRUNCATED);
 }
@@ -120,7 +121,8 @@ void test_m06_support_and_results(void) {
   bookendInit(d, BOOKEND_KIND_START);
   const uint8_t r[] = {0x46, 0x01, 0x80, 0x0A, 0x01, 0x23, 0x00, 0x00, 0x04, 0x00,
                        0x01, 0x81, 0x0A, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20, 0x99};
-  TEST_ASSERT_TRUE(bookendParseM06Results(d, r, sizeof(r)));
+  TEST_ASSERT_TRUE(bookendParseM06Results(d, 3, r, sizeof(r)));
+  TEST_ASSERT_EQUAL_UINT8(3, d.m06[0].ecu);
   TEST_ASSERT_EQUAL_UINT8(2, d.nM06);                 // trailing partial group dropped
   TEST_ASSERT_EQUAL_HEX16(0x0123, d.m06[0].value);
   TEST_ASSERT_EQUAL_HEX16(0x0400, d.m06[0].max);
@@ -251,7 +253,7 @@ void test_full_bookend_with_multiframe(void) {
   TEST_ASSERT_EQUAL_HEX8(BOOKEND_F_COMPLETE, s.d.flags);
   TEST_ASSERT_EQUAL_HEX8(0x83, s.d.pid01[0]);
   TEST_ASSERT_EQUAL_UINT8(3, s.d.nStored);             // via FF + CF + FC
-  TEST_ASSERT_EQUAL_HEX16(0x0135, s.d.stored[2]);
+  TEST_ASSERT_EQUAL_HEX16(0x0135, s.d.stored[2].dtc);
   TEST_ASSERT_EQUAL_UINT8(0, s.d.nPending);
   TEST_ASSERT_EQUAL_UINT8(1, s.d.nM06);
   TEST_ASSERT_EQUAL_HEX16(0x0400, s.d.m06[0].max);
@@ -331,7 +333,44 @@ void test_two_ecus_dtcs_accumulate(void) {
   bookendSeqOnFrame(s, 0x7E9, b, 8, 61);
   bookendSeqOnFrame(s, 0x123, a, 8, 62);               // not an OBD responder
   TEST_ASSERT_EQUAL_UINT8(2, s.d.nStored);
-  TEST_ASSERT_EQUAL_HEX16(0x0700, s.d.stored[1]);
+  TEST_ASSERT_EQUAL_HEX16(0x0700, s.d.stored[1].dtc);
+  TEST_ASSERT_EQUAL_UINT8(1, s.d.stored[1].ecu);
+}
+
+// The same DTC from two ECUs is two entries: not de-duplicated.
+void test_same_dtc_from_two_ecus_kept_twice(void) {
+  static BookendSeq s;
+  bookendSeqStart(s, BOOKEND_KIND_START, 0, 5000, kT);
+  BookendTx tx;
+  bookendSeqPoll(s, 0, &tx);
+  for (uint32_t t = 1; bookendSeqPoll(s, t, &tx) != BK_SEND; t++) {}
+  const uint8_t a[8] = {0x04, 0x43, 0x01, 0x01, 0x33, 0x55, 0x55, 0x55};
+  bookendSeqOnFrame(s, 0x7E8, a, 8, 60);
+  bookendSeqOnFrame(s, 0x7EA, a, 8, 61);
+  TEST_ASSERT_EQUAL_UINT8(2, s.d.nStored);
+  TEST_ASSERT_EQUAL_UINT8(0, s.d.stored[0].ecu);
+  TEST_ASSERT_EQUAL_UINT8(2, s.d.stored[1].ecu);
+}
+
+// PID 01 from ECU 1 only: pid01 stays 0xFF and no-response is set, even
+// though something answered.
+void test_pid01_only_from_ecu0(void) {
+  static BookendSeq s;
+  bookendSeqStart(s, BOOKEND_KIND_START, 0, 5000, kT);
+  BookendTx tx;
+  bookendSeqPoll(s, 0, &tx);                           // 01/01
+  const uint8_t f[8] = {0x06, 0x41, 0x01, 0x80, 0x00, 0x00, 0x00, 0x55};
+  bookendSeqOnFrame(s, 0x7E9, f, 8, 10);
+  for (uint32_t t = 11; t < 5000 && bookendSeqPoll(s, t, &tx) != BK_DONE; t++) {}
+  for (int i = 0; i < 4; i++) TEST_ASSERT_EQUAL_HEX8(0xFF, s.d.pid01[i]);
+  TEST_ASSERT_TRUE(s.d.flags & BOOKEND_F_NO_RESPONSE);
+  // And from ECU 0 it is taken.
+  bookendSeqStart(s, BOOKEND_KIND_START, 0, 5000, kT);
+  bookendSeqPoll(s, 0, &tx);
+  bookendSeqOnFrame(s, 0x7E9, f, 8, 10);
+  const uint8_t g[8] = {0x06, 0x41, 0x01, 0x83, 0x07, 0x65, 0x00, 0x55};
+  bookendSeqOnFrame(s, 0x7E8, g, 8, 11);
+  TEST_ASSERT_EQUAL_HEX8(0x83, s.d.pid01[0]);
 }
 
 int main(int, char **) {
@@ -351,5 +390,7 @@ int main(int, char **) {
   RUN_TEST(test_budget_too_small_to_start_sends_nothing);
   RUN_TEST(test_tx_refused_ends_sequence);
   RUN_TEST(test_two_ecus_dtcs_accumulate);
+  RUN_TEST(test_same_dtc_from_two_ecus_kept_twice);
+  RUN_TEST(test_pid01_only_from_ecu0);
   return UNITY_END();
 }

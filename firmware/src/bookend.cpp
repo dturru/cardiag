@@ -28,7 +28,9 @@ size_t bookendEncode(const BookendData &d, uint32_t deviceId, uint32_t bootId,
   const uint8_t ns = d.nStored > BOOKEND_MAX_STORED ? BOOKEND_MAX_STORED : d.nStored;
   const uint8_t np = d.nPending > BOOKEND_MAX_PENDING ? BOOKEND_MAX_PENDING : d.nPending;
   const uint8_t nm = d.nM06 > BOOKEND_MAX_M06 ? BOOKEND_MAX_M06 : d.nM06;
-  const size_t payload = 4 + 4 + 1 + 2u * ns + 1 + 2u * np + 1 + 9u * nm;
+  const size_t payload = 4 + 4 + 1 + (size_t)BOOKEND_DTC_LEN * ns + 1 +
+                         (size_t)BOOKEND_DTC_LEN * np + 1 +
+                         (size_t)BOOKEND_M06_LEN * nm;
   const size_t total = BOOKEND_REC_HDR + payload;
   if (cap < total) return 0;
 
@@ -46,11 +48,18 @@ size_t bookendEncode(const BookendData &d, uint32_t deviceId, uint32_t bootId,
   memcpy(q, d.pid01, 4);
   q += 4;
   *q++ = ns;
-  for (uint8_t i = 0; i < ns; i++) q = put16(q, d.stored[i]);
+  for (uint8_t i = 0; i < ns; i++) {
+    *q++ = d.stored[i].ecu;
+    q = put16(q, d.stored[i].dtc);
+  }
   *q++ = np;
-  for (uint8_t i = 0; i < np; i++) q = put16(q, d.pending[i]);
+  for (uint8_t i = 0; i < np; i++) {
+    *q++ = d.pending[i].ecu;
+    q = put16(q, d.pending[i].dtc);
+  }
   *q++ = nm;
   for (uint8_t i = 0; i < nm; i++) {
+    *q++ = d.m06[i].ecu;
     *q++ = d.m06[i].mid;
     *q++ = d.m06[i].tid;
     *q++ = d.m06[i].uasid;
@@ -82,20 +91,23 @@ bool bookendParsePid01(BookendData &d, const uint8_t *p, size_t n) {
   return true;
 }
 
-bool bookendParseDtcs(BookendData &d, bool pending, const uint8_t *p, size_t n) {
+bool bookendParseDtcs(BookendData &d, uint8_t ecu, bool pending,
+                      const uint8_t *p, size_t n) {
   if (n < 2 || p[0] != (pending ? 0x47 : 0x43)) return false;
   // CAN (ISO 15765-4): byte 1 is the DTC count. Trust the bytes present over
   // the count if they disagree.
   size_t count = p[1];
   if (count > (n - 2) / 2) count = (n - 2) / 2;
-  uint16_t *arr = pending ? d.pending : d.stored;
+  BookendDtc *arr = pending ? d.pending : d.stored;
   uint8_t &have = pending ? d.nPending : d.nStored;
   const uint8_t cap = pending ? BOOKEND_MAX_PENDING : BOOKEND_MAX_STORED;
   for (size_t i = 0; i < count; i++) {
     const uint16_t dtc = (uint16_t)(p[2 + 2 * i] << 8 | p[3 + 2 * i]);
     if (dtc == 0) continue;                 // padding, not a code
     if (have >= cap) { d.flags |= BOOKEND_F_TRUNCATED; break; }
-    arr[have++] = dtc;
+    arr[have].ecu = ecu;
+    arr[have].dtc = dtc;
+    have++;
   }
   return true;
 }
@@ -112,11 +124,13 @@ bool bookendParseM06Support(uint8_t base, const uint8_t *p, size_t n,
   return true;
 }
 
-bool bookendParseM06Results(BookendData &d, const uint8_t *p, size_t n) {
+bool bookendParseM06Results(BookendData &d, uint8_t ecu, const uint8_t *p,
+                            size_t n) {
   if (n < 1 + 9 || p[0] != 0x46) return false;
   for (size_t o = 1; o + 9 <= n; o += 9) {
     if (d.nM06 >= BOOKEND_MAX_M06) { d.flags |= BOOKEND_F_TRUNCATED; break; }
     BookendM06 &m = d.m06[d.nM06++];
+    m.ecu   = ecu;
     m.mid   = p[o];
     m.tid   = p[o + 1];
     m.uasid = p[o + 2];
@@ -191,13 +205,10 @@ void bookendSeqStart(BookendSeq &s, uint8_t kind, uint32_t now,
   s.step = BK_S_PID01;
 }
 
-static bool gotPid01(const BookendSeq &s) {
-  return !(s.d.pid01[0] == 0xFF && s.d.pid01[1] == 0xFF &&
-           s.d.pid01[2] == 0xFF && s.d.pid01[3] == 0xFF);
-}
-
 static void finish(BookendSeq &s) {
-  if (!s.any) s.d.flags |= BOOKEND_F_NO_RESPONSE;
+  // No-response = ECU 0 (the engine) never gave Mode 01 PID 01. That
+  // includes a completely silent bus.
+  if (!s.pid01Ecu0) s.d.flags |= BOOKEND_F_NO_RESPONSE;
   if (s.outOfTime || s.txFailed) s.d.flags |= BOOKEND_F_TRUNCATED;
   if (s.stepsDone == 4 && !(s.d.flags & BOOKEND_F_TRUNCATED))
     s.d.flags |= BOOKEND_F_COMPLETE;
@@ -313,20 +324,24 @@ BookendAct bookendSeqPoll(BookendSeq &s, uint32_t now, BookendTx *out) {
   }
 }
 
-static void handleMessage(BookendSeq &s, const uint8_t *p, size_t n) {
+static void handleMessage(BookendSeq &s, uint8_t ecu, const uint8_t *p,
+                          size_t n) {
   if (n < 1 || p[0] != (uint8_t)(s.reqMode + 0x40)) return;
   s.any = true;
   switch (s.step) {
     case BK_S_PID01:
-      if (!gotPid01(s)) bookendParsePid01(s.d, p, n);   // first responder
+      // ECU 0 (0x7E8) only: other modules' MIL/readiness bytes are not the
+      // engine's, and mixing them would be wrong whichever answered first.
+      if (ecu == 0 && !s.pid01Ecu0 && bookendParsePid01(s.d, p, n))
+        s.pid01Ecu0 = true;
       break;
-    case BK_S_M03: bookendParseDtcs(s.d, false, p, n); break;
-    case BK_S_M07: bookendParseDtcs(s.d, true, p, n); break;
+    case BK_S_M03: bookendParseDtcs(s.d, ecu, false, p, n); break;
+    case BK_S_M07: bookendParseDtcs(s.d, ecu, true, p, n); break;
     case BK_S_M06_SUPPORT:
       bookendParseM06Support(s.m06Base, p, n, s.m06Support);
       break;
     case BK_S_M06_MID:
-      if (n >= 2 && p[1] == s.reqPid) bookendParseM06Results(s.d, p, n);
+      if (n >= 2 && p[1] == s.reqPid) bookendParseM06Results(s.d, ecu, p, n);
       break;
   }
 }
@@ -338,7 +353,7 @@ void bookendSeqOnFrame(BookendSeq &s, uint32_t id, const uint8_t *data,
   s.lastRxMs = now;
   switch (isoTpFeed(s.rx[i], data, dlc)) {
     case ISOTP_NEED_FC: s.fcPending |= (uint8_t)(1u << i); break;
-    case ISOTP_DONE:    handleMessage(s, s.rx[i].buf, s.rx[i].len); break;
+    case ISOTP_DONE:    handleMessage(s, (uint8_t)i, s.rx[i].buf, s.rx[i].len); break;
     default: break;
   }
 }

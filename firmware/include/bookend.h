@@ -19,15 +19,17 @@
 //   header, 16 B   u8 rec_type=3 | u8 version=1 | u16 payload_len
 //                  | u32 device_id | u32 boot_id | u32 ms
 //   payload        u8 kind (1 trip_start, 2 trip_end) | u8 flags | u16 rsv=0
-//                  | u8[4] pid01_raw (all 0xFF if no response)
-//                  | u8 n_stored  | n_stored  x u16 DTC   (Mode 03)
-//                  | u8 n_pending | n_pending x u16 DTC   (Mode 07)
-//                  | u8 n_m06     | n_m06 x {u8 mid, u8 tid, u8 uasid,
+//                  | u8[4] pid01_raw   from ECU 0 (0x7E8) only; all 0xFF
+//                                     and bit2 set if ECU 0 did not answer
+//                  | u8 n_stored  | n_stored  x {u8 ecu, u16 dtc}   (Mode 03)
+//                  | u8 n_pending | n_pending x {u8 ecu, u16 dtc}   (Mode 07)
+//                  | u8 n_m06     | n_m06 x {u8 ecu, u8 mid, u8 tid, u8 uasid,
 //                                            u16 value, u16 min, u16 max}
 //   flags          bit0 complete | bit1 truncated (time budget OR a cap)
-//                  | bit2 no-response
-// A DTC u16 is the two bytes as received, high byte first on the wire:
-// value = b0 << 8 | b1, then stored little-endian like every other u16.
+//                  | bit2 no-response (ECU 0 gave no Mode 01 PID 01 reply)
+// ecu = response CAN id - 0x7E8 (0 = engine). Entries are NOT de-duplicated
+// across ECUs. A DTC u16 is the two bytes as received, high byte first on the
+// wire: dtc = b0 << 8 | b1, then stored little-endian like every other u16.
 // The file starts with a 16 B header like CDGS:
 //   "CDGB" | u8 version=1 | u8 rec_type=3 | u8 mode | u8 rsv | u32 device_id
 //   | u32 boot_id
@@ -50,11 +52,20 @@
 
 #define BOOKEND_REC_HDR        16
 #define BOOKEND_FILE_HDR       16
-#define BOOKEND_PAYLOAD_MAX    (4 + 4 + 1 + 2 * BOOKEND_MAX_STORED + 1 + \
-                                2 * BOOKEND_MAX_PENDING + 1 + 9 * BOOKEND_MAX_M06)
+#define BOOKEND_DTC_LEN        3     // u8 ecu + u16 dtc
+#define BOOKEND_M06_LEN        10    // u8 ecu + mid,tid,uasid + 3 x u16
+#define BOOKEND_PAYLOAD_MAX    (4 + 4 + 1 + BOOKEND_DTC_LEN * BOOKEND_MAX_STORED + \
+                                1 + BOOKEND_DTC_LEN * BOOKEND_MAX_PENDING + 1 + \
+                                BOOKEND_M06_LEN * BOOKEND_MAX_M06)
 #define BOOKEND_REC_MAX        (BOOKEND_REC_HDR + BOOKEND_PAYLOAD_MAX)
 
+struct BookendDtc {
+  uint8_t  ecu;
+  uint16_t dtc;
+};
+
 struct BookendM06 {
+  uint8_t  ecu;
   uint8_t  mid, tid, uasid;
   uint16_t value, min, max;
 };
@@ -64,9 +75,9 @@ struct BookendData {
   uint8_t    flags;
   uint8_t    pid01[4];
   uint8_t    nStored;
-  uint16_t   stored[BOOKEND_MAX_STORED];
+  BookendDtc stored[BOOKEND_MAX_STORED];
   uint8_t    nPending;
-  uint16_t   pending[BOOKEND_MAX_PENDING];
+  BookendDtc pending[BOOKEND_MAX_PENDING];
   uint8_t    nM06;
   BookendM06 m06[BOOKEND_MAX_M06];
 };
@@ -82,16 +93,18 @@ void bookendFileHeader(uint8_t out[BOOKEND_FILE_HDR], uint8_t mode,
 
 // ---------------------------------------------------------------------------
 // Reply parsers. `p` is the reassembled ISO-TP payload (starting at the reply
-// mode byte, 0x41/0x43/0x47/0x46). Each appends to `d` and sets the truncated
-// flag when a cap is hit.
+// mode byte, 0x41/0x43/0x47/0x46) from responder `ecu` (CAN id - 0x7E8). Each
+// appends to `d` and sets the truncated flag when a cap is hit.
 // ---------------------------------------------------------------------------
 bool bookendParsePid01(BookendData &d, const uint8_t *p, size_t n);
-bool bookendParseDtcs(BookendData &d, bool pending, const uint8_t *p, size_t n);
+bool bookendParseDtcs(BookendData &d, uint8_t ecu, bool pending,
+                      const uint8_t *p, size_t n);
 // Mode 06 MID 00/20/40/... bitmap: sets bits for MIDs base+1..base+32 in
 // `supported` (256 bits). Returns false if not a bitmap reply for `base`.
 bool bookendParseM06Support(uint8_t base, const uint8_t *p, size_t n,
                             uint8_t supported[32]);
-bool bookendParseM06Results(BookendData &d, const uint8_t *p, size_t n);
+bool bookendParseM06Results(BookendData &d, uint8_t ecu, const uint8_t *p,
+                            size_t n);
 
 // ---------------------------------------------------------------------------
 // ISO-TP receive (ISO 15765-2), one per responder. Enough for OBD replies:
@@ -158,6 +171,7 @@ struct BookendSeq {
   uint16_t      m06Next;          // next MID to consider
   uint8_t       m06Base;          // support range being walked
   bool          any;              // anything at all answered
+  bool          pid01Ecu0;        // ECU 0 answered Mode 01 PID 01
   uint8_t       stepsDone;        // reads completed (0..4)
   bool          outOfTime;
   bool          txFailed;
