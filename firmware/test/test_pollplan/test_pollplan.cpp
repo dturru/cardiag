@@ -1,6 +1,7 @@
 // pollplan.h: the POST /api/v1/pollplan contract (carhub docs/protocol.md),
 // the shared hash vector, the NVS encoding and the scheduler.
 
+#include <stdio.h>
 #include <string.h>
 #include <unity.h>
 
