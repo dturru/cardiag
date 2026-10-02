@@ -37,6 +37,8 @@ PollPlanResult pollerSetFromJson(const char *json, size_t n,
 
 // For /api/v1/session: false if no plan is stored.
 bool    pollerHasPlan();
+// False if NVS was unreadable (or held an invalid plan): session hash = null.
+bool    pollerNvsOk();
 uint8_t pollerEntries();
 void    pollerHash(char out[POLL_HASH_HEX + 1]);
 

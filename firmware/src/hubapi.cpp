@@ -121,13 +121,15 @@ static void handleSession(WebServer &srv) {
     n = jsonAppend(buf, sizeof(buf), n, "\"anchor\":null,");
   }
 
-  // The hub-supplied poll plan (protocol §2, POST /api/v1/pollplan).
-  if (pollerHasPlan()) {
+  // The hub-supplied poll plan (protocol §2, POST /api/v1/pollplan). No plan
+  // reports the EMPTY plan's hash, the same one POST returns for a clear, so
+  // the two always agree; null only when NVS could not be read.
+  if (pollerHasPlan() || pollerNvsOk()) {
     char h[POLL_HASH_HEX + 1];
     pollerHash(h);
     n = jsonAppend(buf, sizeof(buf), n,
-        "\"pollplan\":{\"hash\":\"%s\",\"entries\":%u,\"source\":\"nvs\"},",
-        h, (unsigned)pollerEntries());
+        "\"pollplan\":{\"hash\":\"%s\",\"entries\":%u,\"source\":\"%s\"},",
+        h, (unsigned)pollerEntries(), pollerHasPlan() ? "nvs" : "none");
   } else {
     n = jsonAppend(buf, sizeof(buf), n,
         "\"pollplan\":{\"hash\":null,\"entries\":0,\"source\":\"none\"},");

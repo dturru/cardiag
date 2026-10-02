@@ -18,6 +18,9 @@ struct PollFrame {
 
 static PollPlan      g_plan = {};
 static bool          g_hasPlan = false;
+// False if NVS could not be opened or held a plan that fails validation: then
+// the session reports hash null rather than vouch for an empty plan.
+static bool          g_nvsOk = false;
 static PollSched     g_sched;
 static bool          g_active = false;
 static QueueHandle_t g_q = nullptr;
@@ -25,7 +28,10 @@ static volatile uint32_t g_rxDropped = 0;
 
 static void loadNvs() {
   Preferences p;
-  if (!p.begin(kNs, true)) return;           // namespace absent = no plan
+  // Read-write so a never-written namespace opens (begin(ro) fails on a
+  // missing namespace, which is "no plan", not "unreadable").
+  if (!p.begin(kNs, false)) return;
+  g_nvsOk = true;
   uint8_t blob[POLLPLAN_BLOB_MAX];
   const size_t n = p.isKey(kKey) ? p.getBytesLength(kKey) : 0;
   if (n && n <= sizeof(blob) && p.getBytes(kKey, blob, n) == n) {
@@ -33,6 +39,7 @@ static void loadNvs() {
       g_hasPlan = true;
     } else {
       memset(&g_plan, 0, sizeof(g_plan));
+      g_nvsOk = false;
       Serial.println("[poll] stored plan fails validation -- ignored");
     }
   }
@@ -134,6 +141,7 @@ PollPlanResult pollerSetFromJson(const char *json, size_t n,
   }
   g_plan = p;
   g_hasPlan = p.n > 0;
+  g_nvsOk = true;
   pollPlanHash(p, hashOut);
   Serial.printf("[poll] plan %s: %u entries, hash %s\n",
                 g_hasPlan ? "set" : "CLEARED", (unsigned)p.n, hashOut);
@@ -142,6 +150,7 @@ PollPlanResult pollerSetFromJson(const char *json, size_t n,
 }
 
 bool    pollerHasPlan() { return g_hasPlan; }
+bool    pollerNvsOk() { return g_nvsOk; }
 uint8_t pollerEntries() { return g_hasPlan ? g_plan.n : 0; }
 void    pollerHash(char out[POLL_HASH_HEX + 1]) { pollPlanHash(g_plan, out); }
 bool    pollerAnyReply() { return g_active && g_sched.anyOk; }
