@@ -26,6 +26,11 @@ bool        credsHaveHubWifi();
 const char *credsHubSsid();   // "" if not provisioned
 const char *credsHubPass();   // "" if not provisioned
 
+// Hub IPv4 for the live UDP stream, if `cred set hub_addr` was committed.
+// False = unset: hublink sends to the Wi-Fi gateway (right on the hub's own
+// AP; wrong on a laptop hotspot, where the gateway is the laptop).
+bool credsHubAddr(uint8_t out[4]);
+
 // X-Hub-Token check, constant time. False when no token is provisioned: the
 // mutating endpoints are LOCKED until one is, never open.
 bool credsTokenOk(const char *got, size_t n);

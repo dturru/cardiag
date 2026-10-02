@@ -38,6 +38,7 @@ A line starting with `:` is a command; it ends at Enter. Nothing is echoed.
 |---|---|
 | `:cred show` | stored fields, commit state, and anything staged |
 | `:cred set ssid\|pass\|mqtt_user\|mqtt_pass\|token <value>` | validate and **stage** |
+| `:cred set hub_addr <a.b.c.d>` | optional hub IPv4 for live UDP. Unset = the Wi-Fi gateway, which is the hub on its own AP. Set it on a laptop-hotspot bench, where the gateway is the laptop. Shown as itself (not a secret) and in `/api/v1/session` `hub_addr` |
 | `:cred ca` | then paste the PEM; it is staged at `-----END CERTIFICATE-----` |
 | `:cred clear <field>` / `:cred clear all` | stage a removal |
 | `:cred commit` | check the whole set, then write it to NVS |

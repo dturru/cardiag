@@ -20,6 +20,7 @@ static const FieldDef kFields[CRED_FIELD_COUNT] = {
   {"mqtt_user", "mqtt_user", CRED_MQTT_USER_MAX},
   {"mqtt_pass", "mqtt_pass", CRED_MQTT_PASS_MAX},
   {"token",     "api_token", CRED_TOKEN_MAX},
+  {"hub_addr",  "hub_addr",  CRED_HUB_ADDR_MAX},
   {"ca",        "ca_pem",    CRED_CA_MAX},
 };
 
@@ -112,6 +113,10 @@ CredErr credValidate(CredField f, const char *v, size_t n) {
       // It travels as an HTTP header value: no spaces, no controls.
       if (!allPrintable(v, n, false)) return CRED_E_CHARSET;
       return credIsPlaceholder(v, n) ? CRED_E_PLACEHOLDER : CRED_OK;
+    case CRED_HUB_ADDR: {
+      uint8_t ip[4];
+      return credParseIPv4(v, n, ip) ? CRED_OK : CRED_E_CHARSET;
+    }
     case CRED_CA: {
       // DER scratch on the heap, per call: a CA is only decoded while
       // provisioning or printing the banner, so a resident 2 kB bought nothing.
@@ -388,8 +393,29 @@ void credCaFingerprint(const char *pem, size_t n, char out[CRED_FP_LEN + 1]) {
   free(der);
 }
 
+bool credParseIPv4(const char *v, size_t n, uint8_t out[4]) {
+  size_t i = 0;
+  for (int part = 0; part < 4; part++) {
+    if (part && (i >= n || v[i++] != '.')) return false;
+    const size_t start = i;
+    unsigned val = 0;
+    while (i < n && v[i] >= '0' && v[i] <= '9' && i - start < 3)
+      val = val * 10 + (unsigned)(v[i++] - '0');
+    const size_t len = i - start;
+    if (len == 0 || val > 255) return false;
+    if (len > 1 && v[start] == '0') return false;      // no leading zeros
+    out[part] = (uint8_t)val;
+  }
+  if (i != n) return false;
+  const uint32_t all = (uint32_t)out[0] << 24 | (uint32_t)out[1] << 16 |
+                       (uint32_t)out[2] << 8 | out[3];
+  return all != 0 && all != 0xFFFFFFFFu;
+}
+
 void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN]) {
-  if (credIsSecret(f)) {
+  if (f == CRED_HUB_ADDR) {                 // an address: shown as itself
+    snprintf(out, CRED_DESC_LEN, "%.*s", (int)n, v);
+  } else if (credIsSecret(f)) {
     snprintf(out, CRED_DESC_LEN, "set, %u chars", (unsigned)n);
   } else if (f == CRED_CA) {
     credCaFingerprint(v, n, out);

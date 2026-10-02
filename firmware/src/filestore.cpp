@@ -204,19 +204,20 @@ static void dropEntry(uint16_t i) { fsTableDrop(&g_tab, i); }
 // only changes the per-tier sums, never what is on disk.
 static void recomputeUsage(bool withFsTotals = true) {
   g_st.files = g_tab.count;
-  g_st.openFiles = 0;
+  // Only THIS boot's handles (fsCountOpen): an earlier boot's .part is a
+  // crash leftover, and counting it held the sleep guard off forever.
+  g_st.openFiles = fsCountOpen(&g_tab, &g_st.leftoverParts);
   g_st.pendingUnacked = 0;
   g_st.unhydrated = 0;
   g_st.tierABytes = g_st.tierBBytes = g_st.tierCBytes = 0;
   for (uint16_t i = 0; i < g_tab.count; i++) {
     const FileEntry &e = g_tab.v[i];
     if (!e.hydrated) g_st.unhydrated++;
-    if (!e.closed) g_st.openFiles++;
     // Closed and above the watermark: finished, and the hub does not have it.
     // Only the logger can count this -- the hub cannot derive it from files,
     // open and acked_through, because evictions punch holes in the index
     // range. Between trips this is normally non-zero; see protocol 2.3.1.
-    else if ((int32_t)e.index > g_st.ackedThrough) g_st.pendingUnacked++;
+    if (e.closed && (int32_t)e.index > g_st.ackedThrough) g_st.pendingUnacked++;
     // Byte totals count only what has been read. Partial until the index is
     // hydrated; they can only grow as it fills in, never overstate.
     if (!e.hydrated) continue;
@@ -955,11 +956,12 @@ bool filestoreBegin() {
                 (unsigned)FS_WARN_USAGE_PCT,
                 (unsigned long)FS_SNAPSHOT_PERIOD_MS);
 
-  if (g_st.openFiles) {
+  if (g_st.leftoverParts) {
     Serial.printf("[fs] %u file(s) left open by an earlier boot -- crash "
                   "artifacts. They are listed closed=false and the hub syncs "
-                  "them as truncated rather than waiting forever.\n",
-                  g_st.openFiles);
+                  "them as truncated rather than waiting forever; they do "
+                  "not count as open and never hold off sleep.\n",
+                  g_st.leftoverParts);
   }
   g_nextSnapMs = millis();
   return true;

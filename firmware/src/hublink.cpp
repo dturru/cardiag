@@ -26,6 +26,7 @@ static uint8_t   g_hubBssid[6];
 static bool      g_hintValid = false;       // use channel+BSSID on this join
 static uint32_t     g_linkUpMs = 0;
 static IPAddress    g_hubIp;
+static bool         g_hubFromNvs = false;   // g_hubIp came from cred hub_addr
 static HubLinkStats g_stats;
 
 // Written by the Wi-Fi task, read by loop(). Only ever set in the event
@@ -241,7 +242,14 @@ static void stepJoin() {
 
     case PH_JOIN_WAIT:
       if (WiFi.status() == WL_CONNECTED) {
-        g_hubIp    = WiFi.gatewayIP();
+        {
+          // NVS hub address if set (bench: laptop hotspot, hub elsewhere);
+          // otherwise the gateway, which IS the hub on the hub's own AP.
+          uint8_t a[4];
+          g_hubFromNvs = credsHubAddr(a);
+          g_hubIp = g_hubFromNvs ? IPAddress(a[0], a[1], a[2], a[3])
+                                 : WiFi.gatewayIP();
+        }
         g_linkUpMs = millis();
         g_dropFlag = false;          // drop the join-phase noise
         g_teardown = false;
@@ -249,9 +257,11 @@ static void stepJoin() {
         g_hubChannel = (uint8_t)WiFi.channel();   // scan here first next time
         g_state = HUBLINK_STA;
         g_phase = PH_IDLE;
-        Serial.printf("[hublink] STA up: ip=%s gw=%s rssi=%d\n",
+        Serial.printf("[hublink] STA up: ip=%s gw=%s hub=%s (%s) rssi=%d\n",
                       WiFi.localIP().toString().c_str(),
-                      g_hubIp.toString().c_str(), WiFi.RSSI());
+                      WiFi.gatewayIP().toString().c_str(),
+                      g_hubIp.toString().c_str(),
+                      g_hubFromNvs ? "cred hub_addr" : "gateway", WiFi.RSSI());
         webuiStartOnCurrentNetwork();   // same routes, no AP
         hublinkPrintStats(g_bootJoin ? "boot-sta" : "rejoin");
         return;
@@ -415,5 +425,6 @@ const char *hublinkStateName() {
 
 bool      hublinkOnHub() { return g_state == HUBLINK_STA && g_phase == PH_IDLE; }
 IPAddress hublinkHubIp() { return g_hubIp; }
+bool hublinkHubIpFromNvs() { return g_hubFromNvs; }
 
 const HubLinkStats *hublinkStats() { return &g_stats; }
