@@ -565,8 +565,12 @@
 // wait for the reply or time out, then send the next. Never flood the bus.
 #define OBD_INTER_REQUEST_MS 5
 
-// How often to run a full sweep of the supported PID list, milliseconds.
-#define OBD_POLL_INTERVAL_MS 1000
+// Poll plan scheduler (pollplan.h): an entry that keeps timing out backs off
+// period << misses, capped here (or at its own period if that is longer).
+#define POLL_BACKOFF_MAX_MS 30000u
+// Replies canTask hands to the scheduler (poller.cpp). One request is in
+// flight at a time, so a handful covers several ECUs answering at once.
+#define POLL_RX_QUEUE_LEN 16
 
 // PIDs packed into a single Mode 01 request. The standard permits up to 6, and
 // that is the difference between ~30 samples/s and ~180 samples/s -- the number

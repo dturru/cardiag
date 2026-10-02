@@ -43,6 +43,7 @@
 #include "bootguard.h"
 #include "bootguard_rt.h"
 #include "creds.h"
+#include "poller.h"
 #include "power.h"
 #include "cantx.h"
 #include "rtc.h"
@@ -66,10 +67,6 @@ static uint32_t g_lastStatsMs    = 0;
 // Distinct 11-bit standard IDs seen, as a bitmap. 2048 bits = 256 bytes.
 static uint8_t  g_seenStd[256]   = {0};
 static uint16_t g_uniqueIds      = 0;
-
-static uint32_t      g_supported[OBD_BITMAP_WORDS] = {0};
-static const ObdPid *g_pollList[16]                = {0};
-static uint8_t       g_pollCount                   = 0;
 
 static uint8_t     g_mode    = CARDIAG_MODE;
 static bool        g_twaiUp  = false;
@@ -204,39 +201,6 @@ static void blinkMode(uint8_t m) {
   }
 }
 
-static void pollEnter() {
-  // Ask the car what it actually supports before asking for anything. A PID
-  // that is absent here will never answer, and polling it just spends the
-  // request budget on timeouts.
-  const uint8_t n = obdDiscoverSupported(g_supported);
-  Serial.printf("supported PIDs (0x01-0x60): %u\n", n);
-
-  if (n == 0) {
-    Serial.println("WARNING: discovery returned nothing.");
-    Serial.println("  Engine off / key not in accessory, wiring, or the bus is asleep.");
-    Serial.println("  MODE_LISTEN should show traffic before this mode can work.");
-  }
-
-  Serial.print("polling:");
-  g_pollCount = 0;
-  for (size_t i = 0; i < OBD_PID_TABLE_LEN; i++) {
-    if (obdPidSupported(g_supported, OBD_PID_TABLE[i].pid)) {
-      g_pollList[g_pollCount++] = &OBD_PID_TABLE[i];
-      Serial.printf(" %s", OBD_PID_TABLE[i].name);
-    }
-  }
-  Serial.println();
-
-  // Named so the gap is visible rather than silently absent from the data.
-  for (size_t i = 0; i < OBD_PID_TABLE_LEN; i++) {
-    if (!obdPidSupported(g_supported, OBD_PID_TABLE[i].pid)) {
-      Serial.printf("  (unsupported on this car: %s / PID 0x%02X)\n",
-                    OBD_PID_TABLE[i].name, OBD_PID_TABLE[i].pid);
-    }
-  }
-  Serial.println();
-}
-
 // Ask the receive task to step away from the driver, and wait for it to say it
 // has. Bounded: worst case is one twai_receive timeout.
 static void canPause() {
@@ -263,6 +227,7 @@ static void applyMode(uint8_t m, bool persist) {
   if (persist) modeRestoreCancel(g_modeRestore);
   canPause();
 
+  pollerExit();
   if (g_twaiUp) {
     twai_stop();
     twai_driver_uninstall();
@@ -293,7 +258,7 @@ static void applyMode(uint8_t m, bool persist) {
     g_prefs.putUChar("mode", m);
   }
 
-  if (m == MODE_POLL) pollEnter();
+  if (m == MODE_POLL) pollerEnter();
 
   // Files are tagged with the mode that produced them and never span two, so
   // a synthetic bench run cannot end up inside a real capture's file.
@@ -374,12 +339,10 @@ static void canTask(void *) {
     }
     g_canIdle = false;
 
-    // MODE_POLL must NOT drain here: obdRequest() is waiting on exactly those
-    // frames, and a second reader silently eats the replies.
-    if (g_mode == MODE_POLL) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
+    // MODE_POLL is NOT special-cased here any more: this task stays the one
+    // reader of the bus in every mode, and hands OBD replies to the poll
+    // scheduler through a queue (poller.h). A blocking request/reply in loop()
+    // used to own the RX queue in this mode and starved everything else.
 
     // Blocks rather than polls, so an idle bus costs nothing.
     if (twai_receive(&rx, pdMS_TO_TICKS(CAN_RX_WAIT_MS)) != ESP_OK) continue;
@@ -411,9 +374,12 @@ static void canTask(void *) {
 #if defined(FSTEST_BENCH_CHANGELOG) && FSTEST_BENCH_CHANGELOG
       snifferNote(rx, g_mode == MODE_SELFTEST);
 #else
-      snifferNote(rx, false);
+      // MODE_POLL: the replies ARE the car's data, so they feed the change
+      // log as raw frames (the logger never decodes them -- rule 3).
+      snifferNote(rx, g_mode == MODE_POLL);
 #endif
-      if (!g_paused) printFrame(rx);
+      if (g_mode == MODE_POLL) pollerNoteFrame(rx);
+      else if (!g_paused) printFrame(rx);
     }
   }
 }
@@ -762,6 +728,7 @@ void setup() {
 
   transceiverRequestSleep();
 
+  pollerBegin();
   applyMode(stored, false);
 
   xTaskCreatePinnedToCore(canTask, "can", CAN_TASK_STACK, nullptr,
@@ -783,34 +750,6 @@ void setup() {
     hublinkBegin();
     hubstreamBegin();
   }
-}
-
-// One sweep of the supported PID list, printed as a single line.
-//
-// Requests are strictly serialized -- send, wait, then send the next. That is
-// slower than pipelining and it is the right default: a flooded bus is a way
-// to annoy a real ECU, and the sweep rate is nowhere near the limit anyway.
-static void pollTick() {
-  Serial.printf("[%8lu]", (unsigned long)millis());
-
-  for (uint8_t i = 0; i < g_pollCount; i++) {
-    const ObdPid *p = g_pollList[i];
-    ObdResult r;
-
-    if (obdRequest(OBD_MODE_CURRENT_DATA, p->pid, &r) && r.len >= p->nbytes) {
-      // NOTE: %f needs full newlib formatting. Arduino-ESP32 ships with it
-      // enabled; if these ever print as garbage that is the reason, not the
-      // decode maths.
-      Serial.printf("  %s %.1f%s", p->name, p->decode(r.data), p->unit);
-    } else if (r.multiframe) {
-      Serial.printf("  %s MULTIFRAME", p->name);
-    } else {
-      Serial.printf("  %s --", p->name);
-    }
-
-    delay(OBD_INTER_REQUEST_MS);
-  }
-  Serial.println();
 }
 
 // Transmit a frame to ourselves once per second and verify it comes back.
@@ -1082,13 +1021,9 @@ void loop() {
   }
 
   // Receiving happens in canTask. This loop only transmits, prints and serves.
-  if (g_mode == MODE_POLL) {
-    static uint32_t lastPoll = 0;
-    if (millis() - lastPoll >= OBD_POLL_INTERVAL_MS) {
-      lastPoll = millis();
-      LOOP_STAGE("poll", pollTick());
-    }
-  }
+  // Non-blocking: match queued replies, retire a timeout, send the next due
+  // request. Never waits on the bus.
+  if (g_mode == MODE_POLL) LOOP_STAGE("poll", pollerTick());
 
   // SELFTEST transmits from selfTestTask(), not from here -- see above.
 
@@ -1101,23 +1036,7 @@ void loop() {
     twai_get_status_info(&st);
 
     if (g_mode == MODE_POLL) {
-      const ObdStats *s = obdStats();
-      Serial.printf("-- %lu req | %lu ok | %lu timeout | %lu malformed | "
-                    "%lu multiframe | last %lu ms | ECUs",
-                    (unsigned long)s->requests,
-                    (unsigned long)s->replies,
-                    (unsigned long)s->timeouts,
-                    (unsigned long)s->malformed,
-                    (unsigned long)s->multiframe,
-                    (unsigned long)s->lastLatencyMs);
-      if (s->respondersMask == 0) {
-        Serial.print(" none");
-      } else {
-        for (uint8_t i = 0; i < 8; i++) {
-          if (s->respondersMask & (1u << i)) Serial.printf(" %03X", OBD_RESP_ID_FIRST + i);
-        }
-      }
-      Serial.println();
+      pollerPrintStats();
     } else if (g_mode == MODE_SNIFF) {
       if (!g_paused) {
         snifferPrint(g_frames, st.rx_missed_count, st.bus_error_count);
