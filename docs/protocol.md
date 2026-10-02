@@ -40,7 +40,9 @@ empty      {"version":1,"entries":[]}  ->  8bcae181d21321b7
 
 `GET /api/v1/session` adds
 `"pollplan":{"hash":"<16 hex>"|null,"entries":N,"source":"nvs"|"none"}`.
-After a clear: `{"hash":null,"entries":0,"source":"none"}`.
+No plan (never set, or cleared): the **empty-plan hash**,
+`{"hash":"8bcae181d21321b7","entries":0,"source":"none"}`, so POST and session
+always agree. `hash` is `null` only when NVS is unreadable.
 
 The plan persists in NVS (namespace `pollplan`), which an app upload does not
 touch: it survives reboot and a normal reflash. Only a full flash erase clears it.
