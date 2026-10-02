@@ -40,6 +40,22 @@ void test_shared_vector_canonical_and_hash(void) {
   TEST_ASSERT_EQUAL_STRING(kVectorHash, h);
 }
 
+// ⭐ carhub's vector (carhub docs/protocol.md §2.6), fed in its canonical form.
+void test_carhub_plan_vector(void) {
+  static const char kCanon[] =
+      "{\"version\":1,\"entries\":[{\"mode\":1,\"pid\":5,\"period_ms\":2000},"
+      "{\"mode\":1,\"pid\":12,\"period_ms\":200},"
+      "{\"mode\":1,\"pid\":13,\"period_ms\":500}]}";
+  PollPlan p;
+  TEST_ASSERT_EQUAL(POLLPLAN_OK, parse(kCanon, &p).status);
+  char canon[POLLPLAN_CANON_MAX];
+  pollPlanCanonical(p, canon, sizeof(canon));
+  TEST_ASSERT_EQUAL_STRING(kCanon, canon);           // canonical form is a fixed point
+  char h[POLL_HASH_HEX + 1];
+  pollPlanHash(p, h);
+  TEST_ASSERT_EQUAL_STRING("e52fa6872718765d", h);
+}
+
 void test_empty_entries_is_a_valid_clear(void) {
   PollPlan p;
   TEST_ASSERT_EQUAL(POLLPLAN_OK, parse("{\"version\":1,\"entries\":[]}", &p).status);
@@ -254,6 +270,7 @@ void test_millis_wrap(void) {
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_shared_vector_canonical_and_hash);
+  RUN_TEST(test_carhub_plan_vector);
   RUN_TEST(test_empty_entries_is_a_valid_clear);
   RUN_TEST(test_malformed_json_is_400);
   RUN_TEST(test_contract_violations_are_422);
