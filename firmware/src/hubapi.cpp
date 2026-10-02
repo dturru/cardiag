@@ -15,6 +15,7 @@
 #include "sniffer.h"
 #include "config.h"
 #include "creds.h"
+#include "poller.h"
 #include "coredump.h"
 #include "logq.h"
 #include "power.h"
@@ -118,6 +119,18 @@ static void handleSession(WebServer &srv) {
   } else {
     // Protocol 3.4: no anchor means null. Never a guessed timestamp.
     n = jsonAppend(buf, sizeof(buf), n, "\"anchor\":null,");
+  }
+
+  // The hub-supplied poll plan (protocol §2, POST /api/v1/pollplan).
+  if (pollerHasPlan()) {
+    char h[POLL_HASH_HEX + 1];
+    pollerHash(h);
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"pollplan\":{\"hash\":\"%s\",\"entries\":%u,\"source\":\"nvs\"},",
+        h, (unsigned)pollerEntries());
+  } else {
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"pollplan\":{\"hash\":null,\"entries\":0,\"source\":\"none\"},");
   }
 
   // Retention is MEASURED, not assumed: distinct ids counted at runtime, so the
@@ -473,6 +486,27 @@ static void handleTime(WebServer &srv) {
   srv.send(200, "application/json", buf);
 }
 
+// POST /api/v1/pollplan  {"version":1,"entries":[{"mode":1,"pid":12,"period_ms":200}]}
+// 200 {"ok":true,"hash":"<16 hex>"} | 400 malformed JSON | 401 bad token |
+// 422 {"ok":false,"error":"<reason>"}. Empty entries clears the plan.
+static void handlePollPlan(WebServer &srv) {
+  if (!tokenOk(srv)) { denied(srv); return; }
+  const String body = srv.arg("plain");
+  char hash[POLL_HASH_HEX + 1] = "";
+  const PollPlanResult r = pollerSetFromJson(body.c_str(), body.length(), hash);
+  char buf[160];
+  if (r.status == POLLPLAN_OK) {
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"hash\":\"%s\"}", hash);
+    srv.send(200, "application/json", buf);
+  } else if (r.status == POLLPLAN_MALFORMED) {
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\"}", r.error);
+    srv.send(400, "application/json", buf);
+  } else {
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\"}", r.error);
+    srv.send(422, "application/json", buf);
+  }
+}
+
 void hubapiRegister(WebServer &srv) {
   // WebServer only retains headers it was told to collect.
   // ONE call for the whole server: collectHeaders REPLACES the retained list,
@@ -485,4 +519,5 @@ void hubapiRegister(WebServer &srv) {
   srv.on("/api/v1/time",    HTTP_POST, [&srv]() { handleTime(srv); });
   srv.on("/api/v1/fast",    HTTP_GET,  [&srv]() { handleFastGet(srv); });
   srv.on("/api/v1/fast",    HTTP_POST, [&srv]() { handleFastPost(srv); });
+  srv.on("/api/v1/pollplan", HTTP_POST, [&srv]() { handlePollPlan(srv); });
 }
