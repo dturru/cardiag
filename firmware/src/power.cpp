@@ -107,6 +107,13 @@ bool powerMayRecordNow() {
 }
 
 bool powerIgnitionOn() { return kPolicy != POWER_IGNITION || g_ign.on; }
+
+bool powerIgnitionOffPending(uint32_t *edgeMs) {
+  if (kPolicy != POWER_IGNITION || !g_ign.init || !g_ign.on || !g_ign.pending)
+    return false;
+  if (edgeMs) *edgeMs = g_ign.edgeMs;
+  return true;
+}
 WakeSource powerWakeSource() { return g_wake; }
 
 // ---------------------------------------------------------------------------
