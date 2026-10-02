@@ -41,7 +41,9 @@ bool transceiverHasInhPath();
 // standby to match the board's pull-downs. No-ops otherwise.
 void transceiverBegin();
 // Drive EN/nSTB for `m` (powerpolicy.h mode table). There is no normal mode.
-void transceiverSetMode(XcvrMode m);
+// True once both pins read back at the levels `m` needs; only then is the
+// mode logged and recorded. Always true when this build has no INH path.
+bool transceiverSetMode(XcvrMode m);
 XcvrMode transceiverMode();
 
 // Close every file, print SAFE TO CUT POWER, command go-to-sleep -- forced,

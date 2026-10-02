@@ -18,7 +18,8 @@ enum CredField : uint8_t {
   CRED_MQTT_USER,
   CRED_MQTT_PASS,
   CRED_TOKEN,        // X-Hub-Token for the mutating /api/v1 endpoints
-  CRED_CA,           // hub CA certificate, PEM, exactly one cert
+  CRED_HUB_ADDR,     // hub IPv4 for live UDP; unset = the Wi-Fi gateway
+  CRED_CA,           // (must stay last: creds.cpp sizes by it)           // hub CA certificate, PEM, exactly one cert
   CRED_FIELD_COUNT,
   CRED_NONE = 0xFF,
 };
@@ -30,6 +31,7 @@ enum CredField : uint8_t {
 #define CRED_MQTT_PASS_MAX  128
 #define CRED_TOKEN_MIN      8
 #define CRED_TOKEN_MAX      128
+#define CRED_HUB_ADDR_MAX   15   // "255.255.255.255"
 // PEM bytes. The hub CA is EC P-256 (~0.7 kB PEM); 2 kB also fits RSA-2048/3072.
 // Kept well under the NVS budget: the whole nvs partition is 20 kB (0x5000),
 // shared with bootguard and the mode prefs, and a commit that replaces the CA
@@ -62,6 +64,10 @@ const char *credErrName(CredErr e);
 // Secret fields reject them outright; import skips them.
 bool    credIsPlaceholder(const char *v, size_t n);
 CredErr credValidate(CredField f, const char *v, size_t n);
+
+// Dotted-quad IPv4, each part 0-255, no leading zeros, not 0.0.0.0 and not
+// 255.255.255.255. The only form CRED_HUB_ADDR accepts (no DNS on the bench).
+bool credParseIPv4(const char *v, size_t n, uint8_t out[4]);
 
 // Fields whose value is a secret: pass, mqtt_pass, token.
 bool credIsSecret(CredField f);

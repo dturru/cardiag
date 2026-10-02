@@ -111,7 +111,8 @@ struct FileStoreStats {
   uint32_t usedBytes;
   uint32_t totalBytes;
   uint16_t files;
-  uint16_t openFiles;
+  uint16_t openFiles;       // THIS boot's open handles only (fsCountOpen)
+  uint16_t leftoverParts;   // .part files from earlier boots: crash leftovers
   // Closed files the hub has not acked. Between trips this is normally
   // NON-ZERO and that is correct, not a stalled sync: the bus goes quiet, the
   // files close ~3 s later and the board sleeps before the hub can pull them,

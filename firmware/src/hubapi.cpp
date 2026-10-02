@@ -88,6 +88,12 @@ static void handleSession(WebServer &srv) {
       hublinkStateName(),
       (unsigned long)logqDropped());
 
+  // Where live UDP goes: the NVS `hub_addr` if committed, else the gateway.
+  n = jsonAppend(buf, sizeof(buf), n,
+      "\"hub_addr\":{\"ip\":\"%s\",\"source\":\"%s\"},",
+      hublinkHubIp().toString().c_str(),
+      hublinkHubIpFromNvs() ? "nvs" : "gateway");
+
   // Why this boot happened and what the power policy sees now. `ignition` is
   // null under bus-quiet, which has no ignition input.
   if (powerPolicy() == POWER_IGNITION) {
@@ -268,7 +274,8 @@ static void handleSession(WebServer &srv) {
   n = jsonAppend(buf, sizeof(buf), n,
       "\"storage\":{\"mounted\":%s,\"used\":%lu,\"total\":%lu,"
       "\"usage_pct\":%u,\"warn_pct\":%u,\"warn\":%s,"
-      "\"files\":%u,\"open\":%u,\"pending_unacked\":%u,"
+      "\"files\":%u,\"open\":%u,\"leftover_parts\":%u,"
+      "\"pending_unacked\":%u,"
       "\"acked_through\":%ld,"
       "\"tier_a_bytes\":%lu,\"tier_b_bytes\":%lu,\"tier_c_bytes\":%lu,"
       "\"deleted_acked\":%lu,\"deleted_unacked\":%lu,"
@@ -289,7 +296,7 @@ static void handleSession(WebServer &srv) {
       (unsigned)filestoreUsagePct(), (unsigned)FS_WARN_USAGE_PCT,
       filestoreWarn() ? "true" : "false",
       (unsigned)fs->files, (unsigned)fs->openFiles,
-      (unsigned)fs->pendingUnacked, (long)fs->ackedThrough,
+      (unsigned)fs->leftoverParts, (unsigned)fs->pendingUnacked, (long)fs->ackedThrough,
       (unsigned long)fs->tierABytes, (unsigned long)fs->tierBBytes,
       (unsigned long)fs->tierCBytes,
       (unsigned long)fs->deletedAcked, (unsigned long)fs->deletedUnacked,

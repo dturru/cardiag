@@ -176,6 +176,18 @@ static inline bool isAcked(const FsEntry &e, int32_t ackedThrough) {
   return (int32_t)e.index <= ackedThrough;
 }
 
+uint16_t fsCountOpen(const FsTable *t, uint16_t *leftovers) {
+  uint16_t open = 0, stale = 0;
+  for (uint16_t i = 0; i < t->count; i++) {
+    const FsEntry &e = t->v[i];
+    if (e.closed) continue;
+    if (e.active) open++;
+    else stale++;
+  }
+  if (leftovers) *leftovers = stale;
+  return open;
+}
+
 uint32_t fsTierABytes(const FsTable *t) {
   uint32_t sum = 0;
   for (uint16_t i = 0; i < t->count; i++) {

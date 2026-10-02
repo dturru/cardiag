@@ -26,6 +26,8 @@ HubLinkState hublinkState();
 const char  *hublinkStateName();
 bool         hublinkOnHub();
 IPAddress    hublinkHubIp();
+// True when hublinkHubIp() is the NVS `hub_addr`, false when it is the gateway.
+bool         hublinkHubIpFromNvs();
 
 // ---------------------------------------------------------------------------
 // Transition counters.

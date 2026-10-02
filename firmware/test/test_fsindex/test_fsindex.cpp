@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "fsindex.h"
+#include "sleepguard.h"
 
 // ---------------------------------------------------------------------------
 // Fake disk
@@ -441,6 +442,35 @@ void test_unhydrated_victim_is_hydrated_before_it_is_counted(void) {
   free(t.v);
 }
 
+// 10-01 bench: .part files left by boots 86 and 91 counted as open, so the
+// sleep guard refused every key-off and retried every 5 s, forever.
+void test_leftover_parts_from_earlier_boots_do_not_block_sleep(void) {
+  diskReset();
+  diskAddPart(86, FS_KIND_SNAPSHOT, 100);    // crash leftovers, earlier boots
+  diskAddPart(91, FS_KIND_CHANGES, 100);
+  diskAddClosed(92, FS_KIND_SNAPSHOT, 100);
+  FsTable t;
+  fsTableInit(&t, growOk);
+  scanDisk(&t);
+
+  uint16_t leftovers = 0;
+  const uint16_t open = fsCountOpen(&t, &leftovers);
+  TEST_ASSERT_EQUAL_UINT16(0, open);
+  TEST_ASSERT_EQUAL_UINT16(2, leftovers);
+  // Both policies feed the same guard: past the close threshold it sleeps.
+  TEST_ASSERT_EQUAL(SLEEP_OK, sleepVerdict(open, true, 3000, 3000, 300000));
+  TEST_ASSERT_EQUAL(SLEEP_OK, sleepVerdict(open, true, 2000, 2000, 2000));
+
+  // A file THIS boot is writing still counts, and still blocks.
+  fsTableFind(&t, 91)->active = true;
+  TEST_ASSERT_EQUAL_UINT16(1, fsCountOpen(&t, &leftovers));
+  TEST_ASSERT_EQUAL_UINT16(1, leftovers);
+  TEST_ASSERT_EQUAL(SLEEP_REFUSED_FILES_OPEN,
+                    sleepVerdict(1, true, 3000, 3000, 300000));
+  TEST_ASSERT_EQUAL_UINT16(1, fsCountOpen(&t, nullptr));
+  free(t.v);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_names_parse_and_classify);
@@ -456,5 +486,6 @@ int main(int, char **) {
   RUN_TEST(test_stale_part_is_evictable_but_active_never_is);
   RUN_TEST(test_duplicate_log_and_part_keep_the_log);
   RUN_TEST(test_unhydrated_victim_is_hydrated_before_it_is_counted);
+  RUN_TEST(test_leftover_parts_from_earlier_boots_do_not_block_sleep);
   return UNITY_END();
 }

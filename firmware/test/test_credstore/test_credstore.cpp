@@ -344,6 +344,46 @@ void test_wipe_zeroes_every_byte(void) {
   credWipe(b, 0);                        // n == 0 is a no-op, not a crash
 }
 
+// --- hub address --------------------------------------------------------------
+
+static bool ip(const char *s, uint8_t o[4]) { return credParseIPv4(s, strlen(s), o); }
+
+void test_hub_addr_parses_dotted_quad(void) {
+  uint8_t o[4];
+  TEST_ASSERT_TRUE(ip("192.168.137.1", o));
+  TEST_ASSERT_EQUAL_UINT8(192, o[0]);
+  TEST_ASSERT_EQUAL_UINT8(1, o[3]);
+  TEST_ASSERT_TRUE(ip("10.42.0.1", o));
+  TEST_ASSERT_EQUAL(CRED_OK, v(CRED_HUB_ADDR, "10.42.0.1"));
+}
+
+void test_hub_addr_rejects(void) {
+  uint8_t o[4];
+  const char *bad[] = {"", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1.2.3.04",
+                       "a.b.c.d", "1..2.3", "1.2.3.4 ", " 1.2.3.4", "0.0.0.0",
+                       "255.255.255.255", "1.2.3.-4", "hub.local"};
+  for (const char *b : bad) {
+    TEST_ASSERT_FALSE_MESSAGE(ip(b, o), b);
+    if (*b) TEST_ASSERT_NOT_EQUAL(CRED_OK, v(CRED_HUB_ADDR, b));
+  }
+}
+
+void test_hub_addr_is_a_staged_field_shown_as_itself(void) {
+  const CredParsed p = parse("cred set hub_addr 192.168.137.1");
+  TEST_ASSERT_EQUAL(CRED_CMD_SET, p.cmd);
+  TEST_ASSERT_EQUAL(CRED_HUB_ADDR, p.field);
+  TEST_ASSERT_FALSE(credIsSecret(CRED_HUB_ADDR));
+  char d[CRED_DESC_LEN];
+  credDescribe(CRED_HUB_ADDR, "192.168.137.1", 13, d);
+  TEST_ASSERT_EQUAL_STRING("192.168.137.1", d);
+  TEST_ASSERT_EQUAL(CRED_CMD_CLEAR, parse("cred clear hub_addr").cmd);
+  // Unpaired: a hub address alone is a valid set.
+  bool present[CRED_FIELD_COUNT] = {false};
+  present[CRED_HUB_ADDR] = true;
+  TEST_ASSERT_EQUAL(CRED_OK, credCheckSet(present, nullptr));
+  TEST_ASSERT_TRUE(strlen(credNvsKey(CRED_HUB_ADDR)) <= 15);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_sha256_known_vectors);
@@ -376,5 +416,8 @@ int main(int, char **) {
   RUN_TEST(test_interrupted_commit_is_incomplete);
   RUN_TEST(test_finished_commit_is_complete);
   RUN_TEST(test_wipe_zeroes_every_byte);
+  RUN_TEST(test_hub_addr_parses_dotted_quad);
+  RUN_TEST(test_hub_addr_rejects);
+  RUN_TEST(test_hub_addr_is_a_staged_field_shown_as_itself);
   return UNITY_END();
 }

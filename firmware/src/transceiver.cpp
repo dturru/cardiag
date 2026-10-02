@@ -13,21 +13,64 @@ bool transceiverHasInhPath() { return TRANSCEIVER_HAS_INH != 0; }
 
 static XcvrMode g_mode = XCVR_STANDBY;
 
+#if TRANSCEIVER_HAS_INH
+#include <driver/gpio.h>
+
+static bool g_pinsReady = false;
+
+// ESP-IDF, not digitalWrite(): the 10-01 bench showed Arduino's pin manager
+// rejecting IO38/IO39 ("not set as GPIO") while the log claimed the mode had
+// changed. Here the output latch is written FIRST, then the pin becomes an
+// input+output (so its level can be read back), so it never glitches: the
+// 10 k pull-downs hold it low until then, and the latch already says low.
+static bool pinSetup(int pin) {
+  gpio_set_level((gpio_num_t)pin, 0);
+  gpio_config_t c = {};
+  c.pin_bit_mask = 1ULL << pin;
+  c.mode = GPIO_MODE_INPUT_OUTPUT;
+  c.pull_up_en = GPIO_PULLUP_DISABLE;
+  c.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  c.intr_type = GPIO_INTR_DISABLE;
+  if (gpio_config(&c) != ESP_OK) return false;
+  return gpio_set_level((gpio_num_t)pin, 0) == ESP_OK &&
+         gpio_get_level((gpio_num_t)pin) == 0;
+}
+
+static bool pinWrite(int pin, bool high) {
+  return gpio_set_level((gpio_num_t)pin, high ? 1 : 0) == ESP_OK;
+}
+
+// Both pins read back at the levels `m` needs.
+static bool pinsAre(XcvrPins p) {
+  return gpio_get_level((gpio_num_t)XCVR_EN_GPIO) == (int)p.en &&
+         gpio_get_level((gpio_num_t)XCVR_NSTB_GPIO) == (int)p.nstb;
+}
+#endif
+
 void transceiverBegin() {
 #if TRANSCEIVER_HAS_INH
-  // Same levels as the 10 k pull-downs: standby, INH on. Written before the
-  // pins become outputs so they never glitch to anything else.
-  digitalWrite(XCVR_EN_GPIO, LOW);
-  digitalWrite(XCVR_NSTB_GPIO, LOW);
-  pinMode(XCVR_EN_GPIO, OUTPUT);
-  pinMode(XCVR_NSTB_GPIO, OUTPUT);
+  // Standby (EN=0, nSTB=0), the same levels as the pull-downs: INH on.
+  g_pinsReady = pinSetup(XCVR_EN_GPIO) && pinSetup(XCVR_NSTB_GPIO);
+  if (g_pinsReady)
+    Serial.printf("[xcvr] TCAN1043 EN=GPIO%d nSTB=GPIO%d outputs, standby "
+                  "(read back EN=0 nSTB=0)\n", XCVR_EN_GPIO, XCVR_NSTB_GPIO);
+  else
+    Serial.printf("[xcvr] TCAN1043 pin setup FAILED (EN=GPIO%d nSTB=GPIO%d): "
+                  "mode changes will not be attempted\n",
+                  XCVR_EN_GPIO, XCVR_NSTB_GPIO);
 #endif
   g_mode = XCVR_STANDBY;
 }
 
-void transceiverSetMode(XcvrMode m) {
+bool transceiverSetMode(XcvrMode m) {
 #if TRANSCEIVER_HAS_INH
+  if (!g_pinsReady) {
+    Serial.printf("[xcvr] TCAN1043 -> %s NOT done: pins not set up\n",
+                  xcvrModeName(m));
+    return false;
+  }
   const XcvrPins p = xcvrPinsFor(m);
+  bool ok;
   if (m == XCVR_GO_TO_SLEEP) {
     // Go-to-sleep is entered from silent, so get there first (from standby
     // after a bus-wake boot). Then EN high, nSTB low -- the datasheet order;
@@ -35,23 +78,32 @@ void transceiverSetMode(XcvrMode m) {
     // back to back (sub-microsecond): EN=1/nSTB=1 exists only for that instant,
     // and with TXD unconnected (internal pull-up, recessive) it sends nothing.
     // ⚠️ Verify on a scope that INH falls; this is the one place it can.
-    digitalWrite(XCVR_EN_GPIO, LOW);
-    digitalWrite(XCVR_NSTB_GPIO, HIGH);
+    ok = pinWrite(XCVR_EN_GPIO, false) && pinWrite(XCVR_NSTB_GPIO, true);
     delayMicroseconds(50);
-    digitalWrite(XCVR_EN_GPIO, HIGH);
-    digitalWrite(XCVR_NSTB_GPIO, LOW);
+    ok = ok && pinWrite(XCVR_EN_GPIO, true) && pinWrite(XCVR_NSTB_GPIO, false);
   } else {
-    // silent/standby: nSTB first, so EN and nSTB are never both high.
-    digitalWrite(XCVR_EN_GPIO, LOW);
-    digitalWrite(XCVR_NSTB_GPIO, p.nstb ? HIGH : LOW);
+    // silent/standby: EN first, so EN and nSTB are never both high.
+    ok = pinWrite(XCVR_EN_GPIO, false) && pinWrite(XCVR_NSTB_GPIO, p.nstb);
+  }
+  // Only a confirmed mode is reported, or recorded.
+  ok = ok && pinsAre(p);
+  if (!ok) {
+    Serial.printf("[xcvr] TCAN1043 -> %s FAILED: read back EN=%d nSTB=%d, "
+                  "wanted EN=%d nSTB=%d\n", xcvrModeName(m),
+                  gpio_get_level((gpio_num_t)XCVR_EN_GPIO),
+                  gpio_get_level((gpio_num_t)XCVR_NSTB_GPIO),
+                  (int)p.en, (int)p.nstb);
+    return false;
   }
   if (m != g_mode)
-    Serial.printf("[xcvr] TCAN1043 -> %s (EN=%d nSTB=%d)\n", xcvrModeName(m),
-                  (int)p.en, (int)p.nstb);
-#else
-  (void)m;
-#endif
+    Serial.printf("[xcvr] TCAN1043 -> %s (read back EN=%d nSTB=%d)\n",
+                  xcvrModeName(m), (int)p.en, (int)p.nstb);
   g_mode = m;
+  return true;
+#else
+  g_mode = m;
+  return true;
+#endif
 }
 
 XcvrMode transceiverMode() { return g_mode; }

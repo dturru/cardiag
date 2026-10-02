@@ -184,6 +184,13 @@ struct FsRetentionResult {
 // which can only make the Tier A cap fire LATER, never evict early.
 uint32_t fsTierABytes(const FsTable *t);
 
+// Files THIS boot holds open: !closed AND active. A .part left by an earlier
+// boot is a crash leftover (synced and flagged truncated), never "open" --
+// counting it made the sleep guard refuse forever (10-01 bench: .part files
+// from boots 86 and 91 held openFiles at 2 through every key-off). Leftovers
+// are counted separately into *leftovers when it is non-null.
+uint16_t fsCountOpen(const FsTable *t, uint16_t *leftovers);
+
 // Protocol 2.3 deletion order, as a pure choice:
 //   1. acked, oldest first
 //   2. unacked Tier A, oldest first
