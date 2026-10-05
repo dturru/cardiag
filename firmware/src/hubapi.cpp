@@ -16,6 +16,7 @@
 #include "config.h"
 #include "creds.h"
 #include "hubresolve.h"
+#include "heapdiag.h"
 #include "poller.h"
 #include "coredump.h"
 #include "logq.h"
@@ -82,7 +83,9 @@ static void handleSession(WebServer &srv) {
   //
   // 3584 -> 4096 (2026-10-05): pollplan (~80 B) and hub_addr.mdns (~230 B)
   // together would eat the remaining headroom. Same reasoning as above.
-  char buf[4096];
+  //
+  // 4096 -> 4608 (2026-10-06): heapdiag (~330 B). Same reasoning again.
+  char buf[4608];
   int n = jsonAppend(buf, sizeof(buf), 0,
       "{\"proto\":%d,"
       "\"device_id\":%lu,"
@@ -129,6 +132,34 @@ static void handleSession(WebServer &srv) {
         (unsigned long)m->lastQueryMs, cache,
         (long)m->heapBefore - (long)m->heapAfter,
         (unsigned long)m->largestBefore, (unsigned long)m->largestAfter);
+
+    // heapdiag.h: what this build does with mDNS, the mdns task's stack
+    // headroom, and (heapdebug envs) the integrity checks. The heap numbers
+    // further down are this sample's, `sample_age_ms` old.
+    const HeapSample *hs = heapdiagSample();
+    const HeapCheckState *hc = heapdiagCheck();
+    char prev[160] = "null";
+    if (hc->prevValid)
+      snprintf(prev, sizeof(prev),
+               "{\"boot_id\":%lu,\"fail_ms\":%lu,\"last_ok_ms\":%lu,\"mdns\":\"%s\"}",
+               (unsigned long)hc->prevBootId, (unsigned long)hc->prevFailMs,
+               (unsigned long)hc->prevLastOkMs, hc->prevMdns);
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"heapdiag\":{\"mdns_build\":{\"resolve\":%s,\"advertise\":%s},"
+        "\"mdns_parked\":%lu,\"mdns_reaped\":%lu,"
+        "\"sample_age_ms\":%lu,\"mdns_stack_free\":%ld,\"mdns_stack_free_min\":%ld,"
+        "\"check\":{\"enabled\":%s,\"checks\":%lu,\"failures\":%lu,"
+        "\"last_ok_ms\":%lu,\"first_fail_ms\":%lu,\"max_check_us\":%lu,"
+        "\"first_fail_mdns\":\"%s\"},\"prev_boot_fail\":%s},",
+        CARDIAG_MDNS_RESOLVE ? "true" : "false",
+        CARDIAG_MDNS_ADVERTISE ? "true" : "false",
+        (unsigned long)m->parked, (unsigned long)m->reaped,
+        (unsigned long)(millis() - hs->atMs),
+        (long)hs->mdnsStackFree, (long)hs->mdnsStackFreeMin,
+        hc->enabled ? "true" : "false", (unsigned long)hc->checks,
+        (unsigned long)hc->failures, (unsigned long)hc->lastOkMs,
+        (unsigned long)hc->firstFailMs, (unsigned long)hc->maxCheckUs,
+        hc->firstFailMdns, prev);
   }
 
   // Why this boot happened and what the power policy sees now. `ignition` is
@@ -411,11 +442,14 @@ static void handleSession(WebServer &srv) {
       (unsigned long)ls->worstFallbackMs,
       (unsigned long)ESP.getFreeHeap(),
       (unsigned long)ESP.getMinFreeHeap(),
-      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+      // Both sampled in loop() every HEAP_SAMPLE_MS (heapdiag.h): the
+      // largest-block call walks the heap, and a corrupted heap made this
+      // handler the place it crashed (PR #29 bench, boots 99->101).
+      (unsigned long)heapdiagSample()->largest8bit,
       // Internal SRAM specifically. PSRAM is 8 MB and would mask exhaustion of
       // the internal heap, which is what WiFi, lwIP and the WebServer actually
       // allocate from -- the pool that ran out at cycle 34.
-      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      (unsigned long)heapdiagSample()->largestInternal,
 #if defined(FSTEST_BENCH_CHANGELOG) && FSTEST_BENCH_CHANGELOG
       "\"fstest_bench_changelog\""
 #else

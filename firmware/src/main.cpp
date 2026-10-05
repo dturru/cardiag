@@ -47,6 +47,7 @@
 #include "power.h"
 #include "cantx.h"
 #include "rtc.h"
+#include "heapdiag.h"
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason() -- why this boot was a boot
 #include <esp_core_dump.h>  // and, on a crash, WHERE it died
@@ -642,6 +643,9 @@ void setup() {
   // applyMode() in Phase B -- filenames carry boot_id, so the filestore cannot
   // open anything until the session exists, and applyMode() now opens files.
   sessionBegin();
+  // A previous boot's heap-integrity failure (RTC memory), and the sample
+  // the stats line and /api/v1/session report from now on (heapdiag.h).
+  heapdiagBegin();
   // Lowest-trust time anchor, only if the RTC's voltage-low flag is clear.
   rtcBegin();
   // Before the boot-time sleep check below: under the ignition policy that
@@ -1013,6 +1017,7 @@ void loop() {
   LOOP_STAGE("session", if (sessionTick()) hubstreamRequestFullSnapshot());
   // Lines other tasks queued (canTask frames, ESP-IDF logs), written whole.
   LOOP_STAGE("log", logqDrain(LOGQ_DRAIN_PER_PASS));
+  LOOP_STAGE("heap", heapdiagLoop());
 
   if (!g_twaiUp) {
     loopAccount(t0, slow, slowUs);
