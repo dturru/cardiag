@@ -15,6 +15,7 @@
 #include "sniffer.h"
 #include "config.h"
 #include "creds.h"
+#include "hubresolve.h"
 #include "poller.h"
 #include "coredump.h"
 #include "logq.h"
@@ -53,6 +54,12 @@ static int jsonAppend(char *buf, size_t cap, int n, const char *fmt, ...) {
 
 // GET /api/v1/session
 static void handleSession(WebServer &srv) {
+  // The hub polls this every 30 s: proof it can reach us (hubresolve.h).
+  {
+    const IPAddress r = srv.client().remoteIP();
+    hubResolveNoteRequest((uint32_t)r[0] << 24 | (uint32_t)r[1] << 16 |
+                          (uint32_t)r[2] << 8 | r[3]);
+  }
   const uint16_t ids = snifferIdCount();
   const uint32_t rate = sessionSnapshotBytesPerSec(ids);
   const uint32_t secs = sessionSnapshotSeconds(ids);
@@ -72,7 +79,10 @@ static void handleSession(WebServer &srv) {
   // bytes, which would leave the worst case within ~300 B of the edge. Same
   // reasoning again: half a kB more on the loop task's stack is not the
   // constraint, and jsonAppend() truncates rather than overflowing.
-  char buf[3584];
+  //
+  // 3584 -> 4096 (2026-10-05): pollplan (~80 B) and hub_addr.mdns (~230 B)
+  // together would eat the remaining headroom. Same reasoning as above.
+  char buf[4096];
   int n = jsonAppend(buf, sizeof(buf), 0,
       "{\"proto\":%d,"
       "\"device_id\":%lu,"
@@ -89,11 +99,29 @@ static void handleSession(WebServer &srv) {
       hublinkStateName(),
       (unsigned long)logqDropped());
 
-  // Where live UDP goes: the NVS `hub_addr` if committed, else the gateway.
-  n = jsonAppend(buf, sizeof(buf), n,
-      "\"hub_addr\":{\"ip\":\"%s\",\"source\":\"%s\"},",
-      hublinkHubIp().toString().c_str(),
-      hublinkHubIpFromNvs() ? "nvs" : "gateway");
+  // Where live UDP goes and how it was found (hubaddr.h): source is mdns |
+  // mdns-cache | nvs | gateway | none. `mdns` is the discovery itself,
+  // including what the component cost when it started.
+  {
+    const HubMdnsStats *m = hubResolveStats();
+    const uint32_t c = m->lastAnswerIp;
+    char cache[24] = "null";
+    if (c)
+      snprintf(cache, sizeof(cache), "\"%u.%u.%u.%u\"", (unsigned)(c >> 24),
+               (unsigned)(c >> 16 & 0xFF), (unsigned)(c >> 8 & 0xFF), (unsigned)(c & 0xFF));
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"hub_addr\":{\"ip\":\"%s\",\"source\":\"%s\",\"name\":\"%s\","
+        "\"mdns\":{\"init\":%s,\"queries\":%lu,\"answers\":%lu,\"failures\":%lu,"
+        "\"last_query_ms\":%lu,\"cached\":%s,\"heap_cost\":%ld,"
+        "\"largest_before\":%lu,\"largest_after\":%lu}},",
+        hublinkHubIp().toString().c_str(),
+        hubAddrSourceName(hubResolveSource()), hubResolveName(),
+        m->initOk ? "true" : "false", (unsigned long)m->queries,
+        (unsigned long)m->answers, (unsigned long)m->failures,
+        (unsigned long)m->lastQueryMs, cache,
+        (long)m->heapBefore - (long)m->heapAfter,
+        (unsigned long)m->largestBefore, (unsigned long)m->largestAfter);
+  }
 
   // Why this boot happened and what the power policy sees now. `ignition` is
   // null under bus-quiet, which has no ignition input.

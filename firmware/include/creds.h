@@ -31,6 +31,9 @@ const char *credsHubPass();   // "" if not provisioned
 // AP; wrong on a laptop hotspot, where the gateway is the laptop).
 bool credsHubAddr(uint8_t out[4]);
 
+// Hub mDNS hostname (without ".local"): `cred set hub_name`, else "carhub".
+const char *credsHubName();
+
 // X-Hub-Token check, constant time. False when no token is provisioned: the
 // mutating endpoints are LOCKED until one is, never open.
 bool credsTokenOk(const char *got, size_t n);

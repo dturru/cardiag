@@ -125,6 +125,22 @@
 // read ONLY by the one-time `:cred import`.
 // How long to wait for the hub network before falling back to AP mode.
 #define WIFI_STA_TIMEOUT_MS 8000
+
+// ---------------------------------------------------------------------------
+// Hub discovery (hubaddr.h). The hub is asked for as <hub_name>.local over
+// mDNS when the STA link comes up and whenever it looks unreachable.
+// ---------------------------------------------------------------------------
+// One A-record query's own timeout. Asynchronous: loop() never waits on it.
+#define HUB_MDNS_TIMEOUT_MS      2000u
+// Failed queries retry at BASE << (fails-1), capped.
+#define HUB_MDNS_BACKOFF_BASE_MS 2000u
+#define HUB_MDNS_BACKOFF_MAX_MS  60000u
+// Never start queries closer together than this, however often the hub is
+// declared unreachable.
+#define HUB_MDNS_MIN_GAP_MS      5000u
+// The hub polls GET /api/v1/session every 30 s (carhub loggerlink.py). Three
+// missed polls from the current hub address = unreachable -> re-resolve.
+#define HUB_SILENT_MS            90000u
 // SCAN, THEN JOIN (scansched.h). On the fallback AP the board scans for the
 // hub's SSID and joins only once a scan has seen it. Every
 // WIFI_SCAN_FAST_MS from the last drop or sighting; every WIFI_SCAN_SLOW_MS

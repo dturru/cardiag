@@ -1,0 +1,160 @@
+#include <Arduino.h>
+#include <ESPmDNS.h>      // links the mdns component; the raw IDF API is below
+#include <mdns.h>
+#include <esp_heap_caps.h>
+
+#include "hubresolve.h"
+#include "creds.h"
+#include "credstore.h"   // CRED_HUB_NAME_MAX
+#include "config.h"
+
+static HubResolveSched     g_sched;
+static mdns_search_once_t *g_query = nullptr;
+static uint32_t            g_queryT0 = 0;
+static HubAddrInputs       g_in = {};
+static HubAddrChoice       g_choice = {0, HUBADDR_NONE};
+static HubMdnsStats        g_st = {};
+static bool                g_mdnsTried = false;
+static uint32_t            g_linkUpMs = 0;
+static uint32_t            g_lastSeenMs = 0;
+static bool                g_up = false;
+static char                g_name[CRED_HUB_NAME_MAX + 7];   // + ".local"
+
+static void ipStr(uint32_t ip, char out[16]) {
+  snprintf(out, 16, "%u.%u.%u.%u", (unsigned)(ip >> 24), (unsigned)(ip >> 16 & 0xFF),
+           (unsigned)(ip >> 8 & 0xFF), (unsigned)(ip & 0xFF));
+}
+
+static void reselect(const char *why) {
+  const HubAddrChoice c = hubAddrSelect(g_in);
+  if (c.ip == g_choice.ip && c.source == g_choice.source) return;
+  g_choice = c;
+  char s[16];
+  ipStr(c.ip, s);
+  Serial.printf("[hub] address %s (%s) -- %s\n", s, hubAddrSourceName(c.source), why);
+}
+
+// The mdns component starts its own task and allocates its state on the
+// heap. Measured once, here, so the cost is a number rather than a guess.
+static void mdnsInitOnce() {
+  if (g_mdnsTried) return;
+  g_mdnsTried = true;
+  g_st.heapBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  g_st.largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  const esp_err_t e = mdns_init();
+  g_st.initOk = (e == ESP_OK || e == ESP_ERR_INVALID_STATE);   // already up = fine
+  g_st.heapAfter = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  g_st.largestAfter = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  Serial.printf("[mdns] init %s: internal heap %lu -> %lu (%ld B), largest "
+                "block %lu -> %lu\n", g_st.initOk ? "ok" : "FAILED",
+                (unsigned long)g_st.heapBefore, (unsigned long)g_st.heapAfter,
+                (long)g_st.heapAfter - (long)g_st.heapBefore,
+                (unsigned long)g_st.largestBefore, (unsigned long)g_st.largestAfter);
+}
+
+void hubResolveLinkUp(uint32_t gateway, uint32_t nvs) {
+  snprintf(g_name, sizeof(g_name), "%s.local", credsHubName());
+  g_in.gateway = gateway;
+  g_in.nvs = nvs;
+  g_in.mdns = 0;                 // a new session: no fresh answer yet
+  g_up = true;
+  g_linkUpMs = millis();
+  reselect("link up");
+  mdnsInitOnce();
+  if (!g_st.initOk) return;      // nvs / gateway only
+  hubResolveReset(g_sched);
+  hubResolveKick(g_sched, millis(), HUB_MDNS_MIN_GAP_MS);
+}
+
+void hubResolveLinkDown() {
+  g_up = false;
+  if (g_query) {
+    mdns_query_async_delete(g_query);
+    g_query = nullptr;
+  }
+  hubResolveReset(g_sched);
+}
+
+static uint32_t firstV4(const mdns_result_t *r) {
+  for (; r; r = r->next) {
+    for (const mdns_ip_addr_t *a = r->addr; a; a = a->next) {
+      if (a->addr.type != ESP_IPADDR_TYPE_V4) continue;
+      const uint8_t *b = (const uint8_t *)&a->addr.u_addr.ip4.addr;  // network order
+      const uint32_t ip = (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 |
+                          (uint32_t)b[2] << 8 | b[3];
+      if (hubAddrUsable(ip)) return ip;
+    }
+  }
+  return 0;
+}
+
+void hubResolveLoop() {
+  if (!g_up || !g_st.initOk) return;
+  const uint32_t now = millis();
+
+  if (g_query) {
+    mdns_result_t *res = nullptr;
+    uint8_t n = 0;
+    // Zero timeout: done or not, never wait.
+    if (!mdns_query_async_get_results(g_query, 0, &res, &n)) return;
+    const uint32_t ip = firstV4(res);
+    mdns_query_results_free(res);
+    mdns_query_async_delete(g_query);
+    g_query = nullptr;
+    g_st.lastQueryMs = now - g_queryT0;
+    hubResolveFinished(g_sched, now, ip != 0, HUB_MDNS_BACKOFF_BASE_MS,
+                       HUB_MDNS_BACKOFF_MAX_MS);
+    if (ip) {
+      g_st.answers++;
+      g_st.lastAnswerIp = ip;
+      g_in.mdns = ip;
+      g_in.mdnsCache = ip;
+      g_lastSeenMs = now;        // a fresh answer: give it a full silence window
+      reselect("mDNS answer");
+    } else {
+      g_st.failures++;
+      g_in.mdns = 0;
+      char why[64];
+      snprintf(why, sizeof(why), "no mDNS answer for %s (retry in %lus)", g_name,
+               (unsigned long)((g_sched.nextMs - now) / 1000));
+      reselect(why);
+      if (g_st.failures == 1 || g_sched.fails <= 1)
+        Serial.printf("[hub] %s\n", why);
+    }
+    return;
+  }
+
+  if (hubSilent(now, g_lastSeenMs, g_linkUpMs, HUB_SILENT_MS))
+    hubResolveKick(g_sched, now, HUB_MDNS_MIN_GAP_MS);
+
+  if (!hubResolveDue(g_sched, now)) return;
+  g_query = mdns_query_async_new(credsHubName(), nullptr, nullptr, MDNS_TYPE_A,
+                                 HUB_MDNS_TIMEOUT_MS, 1, nullptr);
+  hubResolveStarted(g_sched, now);
+  g_queryT0 = now;
+  g_st.queries++;
+  if (!g_query) {                // could not even start: counts as a failure
+    g_st.failures++;
+    hubResolveFinished(g_sched, now, false, HUB_MDNS_BACKOFF_BASE_MS,
+                       HUB_MDNS_BACKOFF_MAX_MS);
+  }
+}
+
+void hubResolveNoteRequest(uint32_t remote) {
+  if (!g_up || !remote) return;
+  if (remote == g_choice.ip) {
+    g_lastSeenMs = millis();
+    return;
+  }
+  // Not from where we send UDP: maybe the hub on a new address -- or just a
+  // laptop on the bench polling /api/v1. Only a hint once the current hub
+  // address has missed a poll, so a bench tool cannot drive a query storm.
+  const uint32_t now = millis();
+  if (g_st.initOk && hubSilent(now, g_lastSeenMs, g_linkUpMs, HUB_SILENT_MS / 2))
+    hubResolveKick(g_sched, now, HUB_MDNS_MIN_GAP_MS);
+}
+
+uint32_t      hubResolveIp() { return g_choice.ip; }
+HubAddrSource hubResolveSource() { return g_choice.source; }
+const char   *hubResolveName() { return g_name; }
+const HubMdnsStats *hubResolveStats() { return &g_st; }

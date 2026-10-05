@@ -368,6 +368,22 @@ void test_hub_addr_rejects(void) {
   }
 }
 
+void test_hub_name_label_rules(void) {
+  TEST_ASSERT_EQUAL(CRED_OK, v(CRED_HUB_NAME, "carhub"));
+  TEST_ASSERT_EQUAL(CRED_OK, v(CRED_HUB_NAME, "hub-2"));
+  const char *bad[] = {"carhub.local", "CarHub", "-hub", "hub-", "car hub",
+                       "car_hub", "abcdefghijklmnopqrstuvwxyz0123456"};
+  for (const char *b : bad) TEST_ASSERT_NOT_EQUAL_MESSAGE(CRED_OK, v(CRED_HUB_NAME, b), b);
+  TEST_ASSERT_NOT_EQUAL(CRED_OK, v(CRED_HUB_NAME, ""));
+  const CredParsed p = parse("cred set hub_name carhub");
+  TEST_ASSERT_EQUAL(CRED_CMD_SET, p.cmd);
+  TEST_ASSERT_EQUAL(CRED_HUB_NAME, p.field);
+  TEST_ASSERT_FALSE(credIsSecret(CRED_HUB_NAME));
+  char d[CRED_DESC_LEN];
+  credDescribe(CRED_HUB_NAME, "carhub", 6, d);
+  TEST_ASSERT_EQUAL_STRING("carhub", d);
+}
+
 void test_hub_addr_is_a_staged_field_shown_as_itself(void) {
   const CredParsed p = parse("cred set hub_addr 192.168.137.1");
   TEST_ASSERT_EQUAL(CRED_CMD_SET, p.cmd);
@@ -419,5 +435,6 @@ int main(int, char **) {
   RUN_TEST(test_hub_addr_parses_dotted_quad);
   RUN_TEST(test_hub_addr_rejects);
   RUN_TEST(test_hub_addr_is_a_staged_field_shown_as_itself);
+  RUN_TEST(test_hub_name_label_rules);
   return UNITY_END();
 }

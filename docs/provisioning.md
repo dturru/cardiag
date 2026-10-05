@@ -38,7 +38,8 @@ A line starting with `:` is a command; it ends at Enter. Nothing is echoed.
 |---|---|
 | `:cred show` | stored fields, commit state, and anything staged |
 | `:cred set ssid\|pass\|mqtt_user\|mqtt_pass\|token <value>` | validate and **stage** |
-| `:cred set hub_addr <a.b.c.d>` | optional hub IPv4 for live UDP. Unset = the Wi-Fi gateway, which is the hub on its own AP. Set it on a laptop-hotspot bench, where the gateway is the laptop. Shown as itself (not a secret) and in `/api/v1/session` `hub_addr` |
+| `:cred set hub_addr <a.b.c.d>` | optional hub IPv4: manual override and fallback when mDNS finds nothing (see **Hub discovery** below). Shown as itself (not a secret) |
+| `:cred set hub_name <label>` | the hub's mDNS hostname **without** `.local`. Unset = `carhub` (→ `carhub.local`). One lowercase label: `a-z 0-9 -`, 1–32 chars, no dots |
 | `:cred ca` | then paste the PEM; it is staged at `-----END CERTIFICATE-----` |
 | `:cred clear <field>` / `:cred clear all` | stage a removal |
 | `:cred commit` | check the whole set, then write it to NVS |
@@ -113,6 +114,57 @@ The active SSID, passphrase and token sit in RAM, so a crash dump
 private:** fetched by the hub only, never attached to a public issue or
 committed. Share a decoded backtrace, not the dump.
 
+## Hub discovery (mDNS)
+
+On a laptop hotspot the hub's address changes between sessions (no DHCP
+reservations), so a fixed `hub_addr` goes stale. The logger finds the hub by
+name instead. Where live UDP goes, in order:
+
+| # | source | what |
+|---|---|---|
+| 1 | `mdns` | a fresh A-record answer for `<hub_name>.local` |
+| 2 | `mdns-cache` | the last good answer this boot, while a re-query is failing |
+| 3 | `nvs` | `hub_addr` — manual override / last known |
+| 4 | `gateway` | the Wi-Fi gateway, which is the hub on its own AP |
+
+The query runs when the STA link comes up and whenever the hub looks
+unreachable: no `/api/v1/session` poll from the current hub address for
+`HUB_SILENT_MS` (90 s = three missed 30 s polls), or a poll from a different
+address once the current one has missed a poll. It is asynchronous (2 s
+timeout) and polled from `loop()` with a zero wait; the CAN task never sees it.
+Failed queries back off 2 → 4 → … → 60 s; queries are never closer than 5 s.
+
+`/api/v1/session` `hub_addr` reports
+`{"ip","source","name","mdns":{"init","queries","answers","failures","last_query_ms","cached","heap_cost","largest_before","largest_after"}}`.
+`heap_cost` and `largest_*` are measured around `mdns_init()` on the board, so
+the component's cost is a number from the board in hand, not an estimate.
+
+### Bench check
+
+Needs the Pi (avahi announces `carhub.local`; carhub `deploy/pi/bootstrap.sh`
+opens UDP 5353) and the laptop hotspot.
+
+1. **Found by name, no address provisioned.** Clear the override, reset:
+
+       python tools/serial_capture.py --port COM3 --seconds 5 --send ":cred clear hub_addr`n" --send ":cred commit`n"
+       python tools/serial_capture.py --port COM3 --seconds 30 --reset
+
+   Expect `[mdns] init ok: internal heap A -> B (...)` and
+   `[hub] address <pi-ip> (mdns) -- mDNS answer`. On the Pi, `curl
+   http://<logger>/api/v1/session` shows `"source":"mdns"`, and live UDP
+   arrives.
+2. **The Pi moves.** Change the Pi's address without touching the logger
+   (`sudo dhclient -r && sudo dhclient wlan0`, or reconnect it to the
+   hotspot until it gets a new lease). Within about 90 s + 2 s the logger logs a
+   new `[hub] address <new-ip> (mdns)` and UDP resumes at the new address. No
+   `:cred` command was sent.
+3. **Fallback.** Stop avahi on the Pi (`sudo systemctl stop avahi-daemon`),
+   reset the logger: expect `no mDNS answer for carhub.local`, then source
+   `nvs` if `hub_addr` is set, else `gateway`. Restart avahi.
+4. **Heap.** Read `hub_addr.mdns.heap_cost` and `largest_after` from
+   `/api/v1/session`, and run the soak: the largest internal block must stay
+   above the 120 KB floor (`tools/soak_summary.py` `LARGEST_FLOOR_B`).
+
 ## TLS / MQTT (not built yet)
 
 The logger has **no MQTT or TLS client yet**. The MQTT credentials and CA are
@@ -123,4 +175,6 @@ Pi's server cert (carhub `deploy/pi/bootstrap.sh`) carries
 10.42.0.1 covers the Pi's own AP in the car, but a laptop-hotspot address on
 the bench is not in it. Because the bench address keeps changing, the client
 should connect by IP and verify the name `carhub` (set the expected hostname
-explicitly), rather than the SAN chasing every address.
+explicitly), rather than the SAN chasing every address. mDNS discovery does not
+change this: whether it connects to the resolved address or to
+`carhub.local`, the expected certificate name stays `carhub`.
