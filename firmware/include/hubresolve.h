@@ -2,7 +2,9 @@
 
 // Hub discovery runtime: an asynchronous mDNS A-record query for
 // <hub_name>.local, the selection order in hubaddr.h, and the hub-silence
-// trigger. Runs on the loop task and never waits: the query is started, then
+// trigger. The same mDNS instance also ADVERTISES this logger as
+// <logger_name>.local with a _cardiag._tcp service (TXT device_id), so the hub
+// can find the logger by name too. Runs on the loop task and never waits: the query is started, then
 // polled with a zero timeout on later passes. The CAN task is not involved.
 
 #include <stdint.h>
@@ -25,13 +27,16 @@ void hubResolveNoteRequest(uint32_t remote);
 uint32_t      hubResolveIp();       // host order; 0 = none
 HubAddrSource hubResolveSource();
 const char   *hubResolveName();     // "<hub_name>.local"
+const char   *hubResolveSelfName(); // "<logger_name>.local"
 
 struct HubMdnsStats {
   uint32_t queries, answers, failures;
   uint32_t lastAnswerIp;             // host order, the cache; 0 = never
   uint32_t lastQueryMs;              // how long the last query took
   bool     initOk;
-  // Measured around mdns_init(): what the component costs this board.
+  bool     advertised;               // hostname + _cardiag._tcp registered
+  // Measured around mdns_init() + the advertisement: what the component
+  // costs this board, responder included.
   uint32_t heapBefore, heapAfter, largestBefore, largestAfter;
 };
 const HubMdnsStats *hubResolveStats();

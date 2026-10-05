@@ -40,6 +40,7 @@ A line starting with `:` is a command; it ends at Enter. Nothing is echoed.
 | `:cred set ssid\|pass\|mqtt_user\|mqtt_pass\|token <value>` | validate and **stage** |
 | `:cred set hub_addr <a.b.c.d>` | optional hub IPv4: manual override and fallback when mDNS finds nothing (see **Hub discovery** below). Shown as itself (not a secret) |
 | `:cred set hub_name <label>` | the hub's mDNS hostname **without** `.local`. Unset = `carhub` (→ `carhub.local`). One lowercase label: `a-z 0-9 -`, 1–32 chars, no dots |
+| `:cred set logger_name <label>` | **this logger's** mDNS hostname, same rules. Unset = `cardiag` (→ `cardiag.local`). Change it if two loggers share a network |
 | `:cred ca` | then paste the PEM; it is staged at `-----END CERTIFICATE-----` |
 | `:cred clear <field>` / `:cred clear all` | stage a removal |
 | `:cred commit` | check the whole set, then write it to NVS |
@@ -136,8 +137,20 @@ Failed queries back off 2 → 4 → … → 60 s; queries are never closer than 
 
 `/api/v1/session` `hub_addr` reports
 `{"ip","source","name","mdns":{"init","queries","answers","failures","last_query_ms","cached","heap_cost","largest_before","largest_after"}}`.
-`heap_cost` and `largest_*` are measured around `mdns_init()` on the board, so
-the component's cost is a number from the board in hand, not an estimate.
+`heap_cost` and `largest_*` are measured around `mdns_init()` **and** the
+logger's own advertisement (below), on the board, so the component's cost is a
+number from the board in hand, not an estimate.
+
+**The logger advertises itself too.** Its DHCP address on the hotspot moves just
+like the hub's, so on the first STA link-up it registers `<logger_name>.local`
+(default `cardiag.local`) and a `_cardiag._tcp` service on the HTTP port (80)
+whose TXT record carries `device_id` (decimal, as in `/api/v1/session`). The
+hub can then poll `http://cardiag.local/` instead of a fixed address, and use
+the TXT `device_id` against its allowlist before trusting what it reads.
+`/api/v1/session` reports it as
+`"mdns_self":{"host":"cardiag.local","service":"_cardiag._tcp","port":80,"advertised":true}`.
+It is registered on the hub network only (first STA link), not on the
+logger's own fallback AP.
 
 ### Bench check
 
@@ -161,9 +174,21 @@ opens UDP 5353) and the laptop hotspot.
 3. **Fallback.** Stop avahi on the Pi (`sudo systemctl stop avahi-daemon`),
    reset the logger: expect `no mDNS answer for carhub.local`, then source
    `nvs` if `hub_addr` is set, else `gateway`. Restart avahi.
-4. **Heap.** Read `hub_addr.mdns.heap_cost` and `largest_after` from
-   `/api/v1/session`, and run the soak: the largest internal block must stay
-   above the 120 KB floor (`tools/soak_summary.py` `LARGEST_FLOOR_B`).
+4. **The hub finds the logger.** On the Pi:
+
+       avahi-resolve -n cardiag.local
+       avahi-browse -rt _cardiag._tcp        # TXT shows device_id=<decimal>
+       curl -s http://cardiag.local/api/v1/session | head -c 300
+
+   Point carhub's `network.logger_http` at `http://cardiag.local` (needs the
+   Pi to resolve `.local` names: avahi + `libnss-mdns` in `/etc/nsswitch.conf`)
+   and check the hub page shows the logger polled. Then let the logger's
+   hotspot lease change (reconnect it, or reboot the hotspot) and check the
+   hub keeps polling with no config edit. Expect `"mdns_self":{..."advertised":true}`.
+5. **Heap.** Read `hub_addr.mdns.heap_cost` and `largest_after` from
+   `/api/v1/session` (init + advertisement), and run the soak: the largest
+   internal block must stay above the 120 KB floor (`tools/soak_summary.py`
+   `LARGEST_FLOOR_B`).
 
 ## TLS / MQTT (not built yet)
 

@@ -109,6 +109,14 @@ static void handleSession(WebServer &srv) {
     if (c)
       snprintf(cache, sizeof(cache), "\"%u.%u.%u.%u\"", (unsigned)(c >> 24),
                (unsigned)(c >> 16 & 0xFF), (unsigned)(c >> 8 & 0xFF), (unsigned)(c & 0xFF));
+    // How the hub can find US (hubresolve.h): <logger_name>.local and a
+    // _cardiag._tcp service whose TXT carries device_id.
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"mdns_self\":{\"host\":\"%s\",\"service\":\"%s.%s\",\"port\":%u,"
+        "\"advertised\":%s},",
+        hubResolveSelfName()[0] ? hubResolveSelfName() : "",
+        LOGGER_MDNS_SERVICE, LOGGER_MDNS_PROTO, (unsigned)WEB_HTTP_PORT,
+        m->advertised ? "true" : "false");
     n = jsonAppend(buf, sizeof(buf), n,
         "\"hub_addr\":{\"ip\":\"%s\",\"source\":\"%s\",\"name\":\"%s\","
         "\"mdns\":{\"init\":%s,\"queries\":%lu,\"answers\":%lu,\"failures\":%lu,"

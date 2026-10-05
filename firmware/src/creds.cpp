@@ -33,6 +33,7 @@ static char g_token[CRED_TOKEN_MAX + 1];
 static uint8_t g_hubAddr[4];
 static bool    g_hubAddrSet = false;
 static char    g_hubName[CRED_HUB_NAME_MAX + 1];   // "" = default
+static char    g_loggerName[CRED_LOGGER_NAME_MAX + 1];   // "" = default
 
 // Staged changes, applied only by `cred commit`.
 enum StageOp : uint8_t { ST_KEEP = 0, ST_SET, ST_CLEAR };
@@ -199,6 +200,7 @@ void credsBegin() {
     loadActive(p, CRED_HUB_ADDR, a, sizeof(a));
     g_hubAddrSet = a[0] && credParseIPv4(a, strlen(a), g_hubAddr);
     loadActive(p, CRED_HUB_NAME, g_hubName, sizeof(g_hubName));
+    loadActive(p, CRED_LOGGER_NAME, g_loggerName, sizeof(g_loggerName));
     if (credsHaveHubWifi()) {
       Serial.println("[creds] hub link PROVISIONED (NVS):");
     } else {
@@ -218,6 +220,10 @@ void credsBegin() {
 bool        credsHaveHubWifi() { return g_ssid[0] && g_pass[0]; }
 const char *credsHubSsid()     { return g_ssid; }
 const char *credsHubPass()     { return g_pass; }
+
+const char *credsLoggerName() {
+  return g_loggerName[0] ? g_loggerName : CRED_LOGGER_NAME_DEFAULT;
+}
 
 const char *credsHubName() {
   return g_hubName[0] ? g_hubName : CRED_HUB_NAME_DEFAULT;
@@ -241,7 +247,7 @@ static void printHelp() {
   Serial.println("cred commands (start the line with ':', end with Enter; "
                  "nothing is echoed):");
   Serial.println("  :cred show                         stored + staged, no values");
-  Serial.println("  :cred set ssid|pass|mqtt_user|mqtt_pass|token|hub_addr|hub_name <value>");
+  Serial.println("  :cred set ssid|pass|mqtt_user|mqtt_pass|token|hub_addr|hub_name|logger_name <value>");
   Serial.println("  :cred ca                           then paste the PEM");
   Serial.println("  :cred clear <field>|all");
   Serial.println("  :cred commit                       validate all, then save");

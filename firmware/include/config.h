@@ -141,6 +141,11 @@
 // The hub polls GET /api/v1/session every 30 s (carhub loggerlink.py). Three
 // missed polls from the current hub address = unreachable -> re-resolve.
 #define HUB_SILENT_MS            90000u
+// The logger advertises itself as <logger_name>.local plus this service, so
+// the hub can find it the same way (its DHCP address moves too).
+#define WEB_HTTP_PORT            80
+#define LOGGER_MDNS_SERVICE      "_cardiag"
+#define LOGGER_MDNS_PROTO        "_tcp"
 // SCAN, THEN JOIN (scansched.h). On the fallback AP the board scans for the
 // hub's SSID and joins only once a scan has seen it. Every
 // WIFI_SCAN_FAST_MS from the last drop or sighting; every WIFI_SCAN_SLOW_MS

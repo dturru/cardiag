@@ -7,6 +7,7 @@
 #include "creds.h"
 #include "credstore.h"   // CRED_HUB_NAME_MAX
 #include "config.h"
+#include "session.h"
 
 static HubResolveSched     g_sched;
 static mdns_search_once_t *g_query = nullptr;
@@ -19,6 +20,7 @@ static uint32_t            g_linkUpMs = 0;
 static uint32_t            g_lastSeenMs = 0;
 static bool                g_up = false;
 static char                g_name[CRED_HUB_NAME_MAX + 7];   // + ".local"
+static char                g_self[CRED_LOGGER_NAME_MAX + 7];
 
 static void ipStr(uint32_t ip, char out[16]) {
   snprintf(out, 16, "%u.%u.%u.%u", (unsigned)(ip >> 24), (unsigned)(ip >> 16 & 0xFF),
@@ -34,8 +36,22 @@ static void reselect(const char *why) {
   Serial.printf("[hub] address %s (%s) -- %s\n", s, hubAddrSourceName(c.source), why);
 }
 
+// Register <logger_name>.local and _cardiag._tcp (TXT device_id, decimal as
+// in /api/v1/session) on the responder mdns_init() started.
+static bool advertiseSelf() {
+  snprintf(g_self, sizeof(g_self), "%s.local", credsLoggerName());
+  if (mdns_hostname_set(credsLoggerName()) != ESP_OK) return false;
+  mdns_instance_name_set(credsLoggerName());
+  char id[12];
+  snprintf(id, sizeof(id), "%lu", (unsigned long)sessionDeviceId());
+  mdns_txt_item_t txt[] = {{"device_id", id}};
+  return mdns_service_add(nullptr, LOGGER_MDNS_SERVICE, LOGGER_MDNS_PROTO,
+                          WEB_HTTP_PORT, txt, 1) == ESP_OK;
+}
+
 // The mdns component starts its own task and allocates its state on the
-// heap. Measured once, here, so the cost is a number rather than a guess.
+// heap. Measured once, here, around init AND the advertisement, so the cost
+// is a number rather than a guess.
 static void mdnsInitOnce() {
   if (g_mdnsTried) return;
   g_mdnsTried = true;
@@ -43,8 +59,12 @@ static void mdnsInitOnce() {
   g_st.largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
   const esp_err_t e = mdns_init();
   g_st.initOk = (e == ESP_OK || e == ESP_ERR_INVALID_STATE);   // already up = fine
+  if (g_st.initOk) g_st.advertised = advertiseSelf();
   g_st.heapAfter = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   g_st.largestAfter = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  Serial.printf("[mdns] advertising %s + %s.%s port %u: %s\n",
+                g_self[0] ? g_self : "?", LOGGER_MDNS_SERVICE, LOGGER_MDNS_PROTO,
+                (unsigned)WEB_HTTP_PORT, g_st.advertised ? "ok" : "FAILED");
   Serial.printf("[mdns] init %s: internal heap %lu -> %lu (%ld B), largest "
                 "block %lu -> %lu\n", g_st.initOk ? "ok" : "FAILED",
                 (unsigned long)g_st.heapBefore, (unsigned long)g_st.heapAfter,
@@ -157,4 +177,5 @@ void hubResolveNoteRequest(uint32_t remote) {
 uint32_t      hubResolveIp() { return g_choice.ip; }
 HubAddrSource hubResolveSource() { return g_choice.source; }
 const char   *hubResolveName() { return g_name; }
+const char   *hubResolveSelfName() { return g_self; }
 const HubMdnsStats *hubResolveStats() { return &g_st; }

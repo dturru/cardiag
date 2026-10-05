@@ -20,6 +20,7 @@ enum CredField : uint8_t {
   CRED_TOKEN,        // X-Hub-Token for the mutating /api/v1 endpoints
   CRED_HUB_ADDR,     // hub IPv4: manual override / fallback (hubaddr.h)
   CRED_HUB_NAME,     // hub mDNS hostname, without ".local"; unset = "carhub"
+  CRED_LOGGER_NAME,  // this logger's mDNS hostname; unset = "cardiag"
   CRED_CA,           // (must stay last: creds.cpp sizes by it)           // hub CA certificate, PEM, exactly one cert
   CRED_FIELD_COUNT,
   CRED_NONE = 0xFF,
@@ -35,6 +36,8 @@ enum CredField : uint8_t {
 #define CRED_HUB_ADDR_MAX   15   // "255.255.255.255"
 #define CRED_HUB_NAME_MAX   32   // one DNS label is 63; 32 is plenty here
 #define CRED_HUB_NAME_DEFAULT "carhub"
+#define CRED_LOGGER_NAME_MAX  CRED_HUB_NAME_MAX
+#define CRED_LOGGER_NAME_DEFAULT "cardiag"
 // PEM bytes. The hub CA is EC P-256 (~0.7 kB PEM); 2 kB also fits RSA-2048/3072.
 // Kept well under the NVS budget: the whole nvs partition is 20 kB (0x5000),
 // shared with bootguard and the mode prefs, and a commit that replaces the CA
@@ -72,7 +75,7 @@ CredErr credValidate(CredField f, const char *v, size_t n);
 // 255.255.255.255. The only form CRED_HUB_ADDR accepts (no DNS on the bench).
 bool credParseIPv4(const char *v, size_t n, uint8_t out[4]);
 
-// One lowercase DNS label for CRED_HUB_NAME: [a-z0-9-], 1..32, no leading or
+// One lowercase DNS label for CRED_HUB_NAME and CRED_LOGGER_NAME: [a-z0-9-], 1..32, no leading or
 // trailing '-'. No dots: the logger asks mDNS for "<name>.local" itself, so
 // "carhub.local" is refused rather than becoming "carhub.local.local".
 bool credValidHostLabel(const char *v, size_t n);

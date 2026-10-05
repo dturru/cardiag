@@ -22,6 +22,7 @@ static const FieldDef kFields[CRED_FIELD_COUNT] = {
   {"token",     "api_token", CRED_TOKEN_MAX},
   {"hub_addr",  "hub_addr",  CRED_HUB_ADDR_MAX},
   {"hub_name",  "hub_name",  CRED_HUB_NAME_MAX},
+  {"logger_name", "logger_name", CRED_LOGGER_NAME_MAX},
   {"ca",        "ca_pem",    CRED_CA_MAX},
 };
 
@@ -119,6 +120,7 @@ CredErr credValidate(CredField f, const char *v, size_t n) {
       return credParseIPv4(v, n, ip) ? CRED_OK : CRED_E_CHARSET;
     }
     case CRED_HUB_NAME:
+    case CRED_LOGGER_NAME:
       return credValidHostLabel(v, n) ? CRED_OK : CRED_E_CHARSET;
     case CRED_CA: {
       // DER scratch on the heap, per call: a CA is only decoded while
@@ -427,7 +429,8 @@ bool credValidHostLabel(const char *v, size_t n) {
 }
 
 void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN]) {
-  if (f == CRED_HUB_ADDR || f == CRED_HUB_NAME) {   // not secrets: shown as is
+  if (f == CRED_HUB_ADDR || f == CRED_HUB_NAME ||
+      f == CRED_LOGGER_NAME) {              // not secrets: shown as is
     snprintf(out, CRED_DESC_LEN, "%.*s", (int)n, v);
   } else if (credIsSecret(f)) {
     snprintf(out, CRED_DESC_LEN, "set, %u chars", (unsigned)n);

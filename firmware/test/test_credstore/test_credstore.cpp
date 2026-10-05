@@ -384,6 +384,27 @@ void test_hub_name_label_rules(void) {
   TEST_ASSERT_EQUAL_STRING("carhub", d);
 }
 
+// logger_name follows exactly the hub_name label rules.
+void test_logger_name_label_rules(void) {
+  TEST_ASSERT_EQUAL(CRED_OK, v(CRED_LOGGER_NAME, "cardiag"));
+  TEST_ASSERT_EQUAL(CRED_OK, v(CRED_LOGGER_NAME, "cardiag-2"));
+  const char *bad[] = {"cardiag.local", "CarDiag", "-cardiag", "cardiag-",
+                       "car diag", "car_diag", "abcdefghijklmnopqrstuvwxyz0123456", ""};
+  for (const char *b : bad)
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(CRED_OK, v(CRED_LOGGER_NAME, b), b);
+  const CredParsed p = parse("cred set logger_name cardiag");
+  TEST_ASSERT_EQUAL(CRED_CMD_SET, p.cmd);
+  TEST_ASSERT_EQUAL(CRED_LOGGER_NAME, p.field);
+  TEST_ASSERT_FALSE(credIsSecret(CRED_LOGGER_NAME));
+  TEST_ASSERT_EQUAL_STRING("logger_name", credFieldName(CRED_LOGGER_NAME));
+  TEST_ASSERT_TRUE(strlen(credNvsKey(CRED_LOGGER_NAME)) <= 15);   // NVS key limit
+  char d[CRED_DESC_LEN];
+  credDescribe(CRED_LOGGER_NAME, "cardiag", 7, d);
+  TEST_ASSERT_EQUAL_STRING("cardiag", d);
+  // The longest set line still fits the console.
+  TEST_ASSERT_TRUE(strlen("cred set logger_name ") + CRED_LOGGER_NAME_MAX <= CRED_LINE_MAX);
+}
+
 void test_hub_addr_is_a_staged_field_shown_as_itself(void) {
   const CredParsed p = parse("cred set hub_addr 192.168.137.1");
   TEST_ASSERT_EQUAL(CRED_CMD_SET, p.cmd);
@@ -436,5 +457,6 @@ int main(int, char **) {
   RUN_TEST(test_hub_addr_rejects);
   RUN_TEST(test_hub_addr_is_a_staged_field_shown_as_itself);
   RUN_TEST(test_hub_name_label_rules);
+  RUN_TEST(test_logger_name_label_rules);
   return UNITY_END();
 }
