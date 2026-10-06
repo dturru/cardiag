@@ -299,7 +299,11 @@ size_t pollPlanCanonical(const PollPlan &p, char *buf, size_t cap) {
 
 void pollPlanHash(const PollPlan &p, char out[POLL_HASH_HEX + 1]) {
   static const char hex[] = "0123456789abcdef";
-  char canon[POLLPLAN_CANON_MAX];
+  // Static, not on the stack: this runs inside handleSession on the 8 kB loop
+  // stack, and 1.5 kB here plus the session buffer and printf overflowed it
+  // (bench 4, stackguard.h). Every caller is on the loop task (session GET,
+  // pollplan POST, pollerBegin in setup), so one buffer is enough.
+  static char canon[POLLPLAN_CANON_MAX];
   const size_t n = pollPlanCanonical(p, canon, sizeof(canon));
   uint8_t d[32];
   credSha256((const uint8_t *)canon, n, d);

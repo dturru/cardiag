@@ -204,7 +204,8 @@ static void handleGet(WebServer &srv) {
   srv.setContentLength(len);
   srv.send(200, "application/octet-stream", "");
 
-  uint8_t buf[1024];
+  // Static: off the 8 kB loop stack (stackguard.h); handlers never overlap.
+  static uint8_t buf[1024];
   for (uint32_t done = 0; done < len;) {
     const uint32_t n = (len - done) < sizeof(buf) ? (len - done) : sizeof(buf);
     if (!readImage(nullptr, off + done, buf, n)) break;   // short body; the hub's sha check catches it

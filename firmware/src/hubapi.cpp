@@ -21,6 +21,8 @@
 #include "logq.h"
 #include "power.h"
 #include "cantx.h"
+#include "canrecov.h"
+#include "stackguard.h"
 
 // The token lives in NVS (creds.h); the compare is constant-time
 // (credTokenEqual) and fails closed when no token is provisioned.
@@ -81,8 +83,17 @@ static void handleSession(WebServer &srv) {
   // constraint, and jsonAppend() truncates rather than overflowing.
   //
   // 3584 -> 4096 (2026-10-05): pollplan (~80 B) and hub_addr.mdns (~230 B)
-  // together would eat the remaining headroom. Same reasoning as above.
-  char buf[4096];
+  // together would eat the remaining headroom.
+  //
+  // STATIC since 2026-10-06 (bench 4): the reasoning above was wrong. This
+  // frame (~4 kB) plus pollPlanHash's (1.6 kB, called below) plus newlib's
+  // printf DID overflow the 8 kB loop stack, silently into the heap on normal
+  // builds and as a stack-canary panic on the heap-debug build, on every
+  // session GET once this buffer grew. Every WebServer handler runs on the
+  // loop task, one request at a time, so one static buffer is safe.
+  // 4096 -> 4608 now that size no longer costs stack: can_bus + loop_stack
+  // add ~200 bytes on top of the mDNS block.
+  static char buf[4608];
   int n = jsonAppend(buf, sizeof(buf), 0,
       "{\"proto\":%d,"
       "\"device_id\":%lu,"
@@ -368,6 +379,28 @@ static void handleSession(WebServer &srv) {
       (unsigned long)fs->scanEntries, (unsigned long)fs->scanFiles,
       (unsigned long)fs->scanForeign, (unsigned long)fs->scanEvictedForRoom,
       (unsigned long)FS_BOOT_WDT_S * 1000ul);
+
+  // The CAN controller (canrecov.h) and the loop stack (stackguard.h).
+  // `recoveries` counts bus-off recoveries and driver restarts since boot; a
+  // non-zero value with state "running" is a stuck transmitter that came
+  // back. `loop_stack.free_min` is the loop task's lowest stack margin seen,
+  // in bytes; `warn` once it has gone under `warn_below`.
+  {
+    const CanBusInfo cb = cardiagCanBus();
+    const uint32_t sf = cardiagLoopStackFreeMin();
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"can_bus\":{\"state\":\"%s\",\"tec\":%lu,\"rec\":%lu,"
+        "\"recoveries\":%lu,\"last_action\":\"%s\",\"last_action_ms\":%lu},"
+        "\"loop_stack\":{\"free_min\":%ld,\"warn_below\":%u,\"warn\":%s},",
+        cb.twaiUp ? canBusStateName(cb.state) : "down",
+        (unsigned long)cb.tec, (unsigned long)cb.rec,
+        (unsigned long)cb.recoveries,
+        cb.lastAction == CANRECOV_RECOVER   ? "recover"
+        : cb.lastAction == CANRECOV_RESTART ? "restart" : "none",
+        (unsigned long)cb.lastActionMs,
+        sf == UINT32_MAX ? -1L : (long)sf, (unsigned)STACKGUARD_MARGIN_BYTES,
+        (sf != UINT32_MAX && sf < STACKGUARD_MARGIN_BYTES) ? "true" : "false");
+  }
 
   // Link transition counters, for the AP<->STA soak test. A fault that
   // RECOVERED leaves no other trace.

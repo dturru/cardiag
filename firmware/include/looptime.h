@@ -32,3 +32,7 @@ const LoopStats *cardiagLoopStats();
 // task (the web server and the stats line both run inside loop()), so no lock.
 enum LoopWindowId { LOOP_WIN_API = 0, LOOP_WIN_LOG = 1 };
 LoopStats cardiagLoopTakeWindow(LoopWindowId w);
+
+// The loop task's lowest stack margin seen this boot, bytes (stackguard.h).
+// UINT32_MAX until the first sample, ~1 s after boot.
+uint32_t cardiagLoopStackFreeMin();

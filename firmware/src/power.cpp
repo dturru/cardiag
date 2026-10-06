@@ -17,6 +17,8 @@ static WakeSource  g_wake = WAKE_NA;
 // Bumped from canTask (OBD) and the selftest task: atomic.
 static std::atomic<uint32_t> g_txBlocked{0};
 static std::atomic<uint32_t> g_txBlockedLogMs{0};
+// Gate open but the driver refused (queue full, bus-off): canrecov.h's input.
+static std::atomic<uint32_t> g_txFailed{0};
 
 static bool readIgnRaw() {
   const int v = digitalRead(IGN_SENSE_GPIO);
@@ -132,7 +134,10 @@ esp_err_t canTransmit(const twai_message_t *msg, TickType_t ticksToWait) {
     }
     return ESP_ERR_INVALID_STATE;
   }
-  return twai_transmit(msg, ticksToWait);
+  const esp_err_t err = twai_transmit(msg, ticksToWait);
+  if (err != ESP_OK) ++g_txFailed;
+  return err;
 }
 
 uint32_t canTxBlocked() { return g_txBlocked.load(); }
+uint32_t canTxFailed()  { return g_txFailed.load(); }
