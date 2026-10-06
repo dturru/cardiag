@@ -46,6 +46,8 @@
 #include "poller.h"
 #include "power.h"
 #include "cantx.h"
+#include "canrecov.h"
+#include "stackguard.h"
 #include "rtc.h"
 #include "heapdiag.h"
 #include <esp_task_wdt.h>
@@ -896,6 +898,93 @@ LoopStats cardiagLoopTakeWindow(LoopWindowId w) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Loop stack margin (stackguard.h). The high-water mark is the task's lowest
+// margin ever, so a 1 s sample still catches a peak between samples.
+// ---------------------------------------------------------------------------
+static StackGuard g_stackGuard = {UINT32_MAX, false};
+static uint32_t   g_stackLastMs = 0;
+
+static void stackGuardTick(uint32_t now) {
+  if (now - g_stackLastMs < 1000) return;
+  g_stackLastMs = now;
+  const uint32_t freeB = uxTaskGetStackHighWaterMark(nullptr);  // bytes on ESP-IDF
+  if (stackGuardSample(&g_stackGuard, freeB, STACKGUARD_MARGIN_BYTES)) {
+    Serial.printf("[stack] WARNING: loop task stack margin down to %lu B "
+                  "(warn below %u B). A large local in a handler? See "
+                  "stackguard.h.\n",
+                  (unsigned long)freeB, (unsigned)STACKGUARD_MARGIN_BYTES);
+  }
+}
+
+uint32_t cardiagLoopStackFreeMin() { return g_stackGuard.minFree; }
+
+// ---------------------------------------------------------------------------
+// CAN controller recovery (canrecov.h). Runs on the loop task, once a second,
+// while the driver is up. RESTART is applyMode() with the current mode, which
+// re-derives the TWAI mode from the TX gate: recovery never transmits and never
+// opens the gate.
+// ---------------------------------------------------------------------------
+static CanRecov g_canRecov;
+static bool     g_canRecovInit = false;
+static uint32_t g_canRecovLastMs = 0;
+
+static uint8_t canBusStateOf(twai_state_t s) {
+  switch (s) {
+    case TWAI_STATE_RUNNING:    return CANBUS_RUNNING;
+    case TWAI_STATE_BUS_OFF:    return CANBUS_BUS_OFF;
+    case TWAI_STATE_RECOVERING: return CANBUS_RECOVERING;
+    default:                    return CANBUS_STOPPED;
+  }
+}
+
+static void canRecoveryTick(uint32_t now) {
+  if (!g_canRecovInit) {
+    canRecovInit(&g_canRecov, now);
+    g_canRecovInit = true;
+  }
+  if (now - g_canRecovLastMs < 1000) return;
+  g_canRecovLastMs = now;
+  twai_status_info_t st;
+  if (twai_get_status_info(&st) != ESP_OK) return;
+  const uint8_t state = canBusStateOf(st.state);
+  const CanRecovAction a = canRecovStep(&g_canRecov, state, st.tx_error_counter,
+                                        canTxFailed(), now);
+  if (a == CANRECOV_NONE) return;
+  Serial.printf("[can] %s: state=%s tec=%lu rec=%lu bus_err=%lu txfail=%lu "
+                "(action #%lu; next no sooner than +%lu ms)\n",
+                a == CANRECOV_RECOVER ? "bus-off, initiating recovery"
+                                      : "restarting the TWAI driver",
+                canBusStateName(state), (unsigned long)st.tx_error_counter,
+                (unsigned long)st.rx_error_counter,
+                (unsigned long)st.bus_error_count,
+                (unsigned long)canTxFailed(),
+                (unsigned long)g_canRecov.recoveries,
+                (unsigned long)(g_canRecov.nextAllowedMs - now));
+  if (a == CANRECOV_RECOVER) {
+    const esp_err_t err = twai_initiate_recovery();
+    if (err != ESP_OK) {
+      Serial.printf("[can] twai_initiate_recovery: %s\n", esp_err_to_name(err));
+    }
+  } else {
+    applyMode(g_mode, false);
+  }
+}
+
+CanBusInfo cardiagCanBus() {
+  CanBusInfo i = {g_twaiUp, CANBUS_STOPPED, 0, 0, g_canRecov.recoveries,
+                  g_canRecov.lastAction, g_canRecov.lastActionMs};
+  if (g_twaiUp) {
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) == ESP_OK) {
+      i.state = canBusStateOf(st.state);
+      i.tec = st.tx_error_counter;
+      i.rec = st.rx_error_counter;
+    }
+  }
+  return i;
+}
+
 static void loopNote(LoopStats &s, uint32_t pass, const char *slow,
                      uint32_t slowUs) {
   s.passes++;
@@ -1018,6 +1107,9 @@ void loop() {
   // Lines other tasks queued (canTask frames, ESP-IDF logs), written whole.
   LOOP_STAGE("log", logqDrain(LOGQ_DRAIN_PER_PASS));
   LOOP_STAGE("heap", heapdiagLoop());
+  stackGuardTick(millis());
+
+  if (g_twaiUp) LOOP_STAGE("canrecov", canRecoveryTick(millis()));
 
   if (!g_twaiUp) {
     loopAccount(t0, slow, slowUs);
