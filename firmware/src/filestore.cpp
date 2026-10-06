@@ -1314,7 +1314,10 @@ static void handleFetch(WebServer &srv) {
   srv.send(partial ? 206 : 200, ctype, "");
 
   f.seek(start);
-  uint8_t buf[REC_CSV_CHUNK];
+  // Static: 2 kB on the 8 kB loop stack under sendContent()'s lwIP calls is
+  // the same risk that overflowed handleSession (stackguard.h). WebServer
+  // handlers run on the loop task one at a time.
+  static uint8_t buf[REC_CSV_CHUNK];
   size_t left = len;
   while (left) {
     const size_t want = left < sizeof(buf) ? left : sizeof(buf);

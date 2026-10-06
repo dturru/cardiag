@@ -14,3 +14,4 @@ bool canTxAllowed();
 esp_err_t canTransmit(const twai_message_t *msg, TickType_t ticksToWait);
 
 uint32_t canTxBlocked();   // transmits refused by the gate since boot
+uint32_t canTxFailed();    // gate open, driver refused (queue full, bus-off)

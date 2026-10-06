@@ -144,7 +144,15 @@ void test_nvs_encoding_round_trip_and_rejects(void) {
   const size_t n = pollPlanEncode(p, blob, sizeof(blob));
   TEST_ASSERT_EQUAL(2 + 3 * 6, n);
   TEST_ASSERT_TRUE(pollPlanDecode(blob, n, &q));
-  TEST_ASSERT_EQUAL_MEMORY(&p.e, &q.e, sizeof(PollEntry) * 3);
+  // Field by field: PollEntry has 2 padding bytes after pid, and a memory
+  // compare read whatever the stack held there (it broke when an unrelated
+  // change moved the stack layout).
+  TEST_ASSERT_EQUAL_UINT8(p.n, q.n);
+  for (int i = 0; i < 3; i++) {
+    TEST_ASSERT_EQUAL_UINT8(p.e[i].mode, q.e[i].mode);
+    TEST_ASSERT_EQUAL_UINT8(p.e[i].pid, q.e[i].pid);
+    TEST_ASSERT_EQUAL_UINT32(p.e[i].periodMs, q.e[i].periodMs);
+  }
   TEST_ASSERT_FALSE(pollPlanDecode(blob, n - 1, &q));     // short
   blob[0] = 2;
   TEST_ASSERT_FALSE(pollPlanDecode(blob, n, &q));         // version

@@ -34,3 +34,18 @@ struct CanDrops {
 };
 
 CanDrops cardiagCanDrops();
+
+// The controller itself, for "can_bus" on /api/v1/session (canrecov.h).
+// state is a CanBusState; tec/rec are the TWAI error counters (reset by a
+// driver restart); recoveries/lastAction come from the recovery state machine.
+struct CanBusInfo {
+  bool     twaiUp;
+  uint8_t  state;
+  uint32_t tec;
+  uint32_t rec;
+  uint32_t recoveries;
+  uint8_t  lastAction;
+  uint32_t lastActionMs;
+};
+
+CanBusInfo cardiagCanBus();
