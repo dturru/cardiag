@@ -15,6 +15,8 @@
 #include "sniffer.h"
 #include "config.h"
 #include "creds.h"
+#include "hubresolve.h"
+#include "heapdiag.h"
 #include "poller.h"
 #include "coredump.h"
 #include "logq.h"
@@ -55,6 +57,12 @@ static int jsonAppend(char *buf, size_t cap, int n, const char *fmt, ...) {
 
 // GET /api/v1/session
 static void handleSession(WebServer &srv) {
+  // The hub polls this every 30 s: proof it can reach us (hubresolve.h).
+  {
+    const IPAddress r = srv.client().remoteIP();
+    hubResolveNoteRequest((uint32_t)r[0] << 24 | (uint32_t)r[1] << 16 |
+                          (uint32_t)r[2] << 8 | r[3]);
+  }
   const uint16_t ids = snifferIdCount();
   const uint32_t rate = sessionSnapshotBytesPerSec(ids);
   const uint32_t secs = sessionSnapshotSeconds(ids);
@@ -75,14 +83,18 @@ static void handleSession(WebServer &srv) {
   // reasoning again: half a kB more on the loop task's stack is not the
   // constraint, and jsonAppend() truncates rather than overflowing.
   //
+  // 3584 -> 4096 (2026-10-05): pollplan (~80 B) and hub_addr.mdns (~230 B)
+  // together would eat the remaining headroom.
+  //
   // STATIC since 2026-10-06 (bench 4): the reasoning above was wrong. This
   // frame (~4 kB) plus pollPlanHash's (1.6 kB, called below) plus newlib's
   // printf DID overflow the 8 kB loop stack, silently into the heap on normal
   // builds and as a stack-canary panic on the heap-debug build, on every
-  // session GET once #29 grew this buffer. Every WebServer handler runs on the
-  // loop task, one request at a time, so one static buffer is safe. 4096 now
-  // that size no longer costs stack: can_bus + loop_stack add ~200 bytes.
-  static char buf[4096];
+  // session GET once this buffer grew. Every WebServer handler runs on the
+  // loop task, one request at a time, so one static buffer is safe.
+  // 4096 -> 5120 now that size no longer costs stack: heapdiag (~330 B) and
+  // can_bus + loop_stack (~200 B) on top of the mDNS block.
+  static char buf[5120];
   int n = jsonAppend(buf, sizeof(buf), 0,
       "{\"proto\":%d,"
       "\"device_id\":%lu,"
@@ -99,11 +111,65 @@ static void handleSession(WebServer &srv) {
       hublinkStateName(),
       (unsigned long)logqDropped());
 
-  // Where live UDP goes: the NVS `hub_addr` if committed, else the gateway.
-  n = jsonAppend(buf, sizeof(buf), n,
-      "\"hub_addr\":{\"ip\":\"%s\",\"source\":\"%s\"},",
-      hublinkHubIp().toString().c_str(),
-      hublinkHubIpFromNvs() ? "nvs" : "gateway");
+  // Where live UDP goes and how it was found (hubaddr.h): source is mdns |
+  // mdns-cache | nvs | gateway | none. `mdns` is the discovery itself,
+  // including what the component cost when it started.
+  {
+    const HubMdnsStats *m = hubResolveStats();
+    const uint32_t c = m->lastAnswerIp;
+    char cache[24] = "null";
+    if (c)
+      snprintf(cache, sizeof(cache), "\"%u.%u.%u.%u\"", (unsigned)(c >> 24),
+               (unsigned)(c >> 16 & 0xFF), (unsigned)(c >> 8 & 0xFF), (unsigned)(c & 0xFF));
+    // How the hub can find US (hubresolve.h): <logger_name>.local and a
+    // _cardiag._tcp service whose TXT carries device_id.
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"mdns_self\":{\"host\":\"%s\",\"service\":\"%s.%s\",\"port\":%u,"
+        "\"advertised\":%s},",
+        hubResolveSelfName()[0] ? hubResolveSelfName() : "",
+        LOGGER_MDNS_SERVICE, LOGGER_MDNS_PROTO, (unsigned)WEB_HTTP_PORT,
+        m->advertised ? "true" : "false");
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"hub_addr\":{\"ip\":\"%s\",\"source\":\"%s\",\"name\":\"%s\","
+        "\"mdns\":{\"init\":%s,\"queries\":%lu,\"answers\":%lu,\"failures\":%lu,"
+        "\"last_query_ms\":%lu,\"cached\":%s,\"heap_cost\":%ld,"
+        "\"largest_before\":%lu,\"largest_after\":%lu}},",
+        hublinkHubIp().toString().c_str(),
+        hubAddrSourceName(hubResolveSource()), hubResolveName(),
+        m->initOk ? "true" : "false", (unsigned long)m->queries,
+        (unsigned long)m->answers, (unsigned long)m->failures,
+        (unsigned long)m->lastQueryMs, cache,
+        (long)m->heapBefore - (long)m->heapAfter,
+        (unsigned long)m->largestBefore, (unsigned long)m->largestAfter);
+
+    // heapdiag.h: what this build does with mDNS, the mdns task's stack
+    // headroom, and (heapdebug envs) the integrity checks. The heap numbers
+    // further down are this sample's, `sample_age_ms` old.
+    const HeapSample *hs = heapdiagSample();
+    const HeapCheckState *hc = heapdiagCheck();
+    char prev[160] = "null";
+    if (hc->prevValid)
+      snprintf(prev, sizeof(prev),
+               "{\"boot_id\":%lu,\"fail_ms\":%lu,\"last_ok_ms\":%lu,\"mdns\":\"%s\"}",
+               (unsigned long)hc->prevBootId, (unsigned long)hc->prevFailMs,
+               (unsigned long)hc->prevLastOkMs, hc->prevMdns);
+    n = jsonAppend(buf, sizeof(buf), n,
+        "\"heapdiag\":{\"mdns_build\":{\"resolve\":%s,\"advertise\":%s},"
+        "\"mdns_parked\":%lu,\"mdns_reaped\":%lu,"
+        "\"sample_age_ms\":%lu,\"mdns_stack_free\":%ld,\"mdns_stack_free_min\":%ld,"
+        "\"check\":{\"enabled\":%s,\"checks\":%lu,\"failures\":%lu,"
+        "\"last_ok_ms\":%lu,\"first_fail_ms\":%lu,\"max_check_us\":%lu,"
+        "\"first_fail_mdns\":\"%s\"},\"prev_boot_fail\":%s},",
+        CARDIAG_MDNS_RESOLVE ? "true" : "false",
+        CARDIAG_MDNS_ADVERTISE ? "true" : "false",
+        (unsigned long)m->parked, (unsigned long)m->reaped,
+        (unsigned long)(millis() - hs->atMs),
+        (long)hs->mdnsStackFree, (long)hs->mdnsStackFreeMin,
+        hc->enabled ? "true" : "false", (unsigned long)hc->checks,
+        (unsigned long)hc->failures, (unsigned long)hc->lastOkMs,
+        (unsigned long)hc->firstFailMs, (unsigned long)hc->maxCheckUs,
+        hc->firstFailMdns, prev);
+  }
 
   // Why this boot happened and what the power policy sees now. `ignition` is
   // null under bus-quiet, which has no ignition input.
@@ -407,11 +473,14 @@ static void handleSession(WebServer &srv) {
       (unsigned long)ls->worstFallbackMs,
       (unsigned long)ESP.getFreeHeap(),
       (unsigned long)ESP.getMinFreeHeap(),
-      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+      // Both sampled in loop() every HEAP_SAMPLE_MS (heapdiag.h): the
+      // largest-block call walks the heap, and a corrupted heap made this
+      // handler the place it crashed (PR #29 bench, boots 99->101).
+      (unsigned long)heapdiagSample()->largest8bit,
       // Internal SRAM specifically. PSRAM is 8 MB and would mask exhaustion of
       // the internal heap, which is what WiFi, lwIP and the WebServer actually
       // allocate from -- the pool that ran out at cycle 34.
-      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      (unsigned long)heapdiagSample()->largestInternal,
 #if defined(FSTEST_BENCH_CHANGELOG) && FSTEST_BENCH_CHANGELOG
       "\"fstest_bench_changelog\""
 #else

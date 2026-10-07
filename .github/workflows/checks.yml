@@ -122,5 +122,16 @@ jobs:
       - name: Build esp32-can-x2-ignition
         run: pio run -e esp32-can-x2-ignition
 
+      # The heap-hunt source paths (docs/heap-debug.md): the integrity check,
+      # and mDNS fully off. The bench's heapdebug-* envs add only sdkconfig
+      # (hybrid compile, too heavy for CI) on top of these same sources.
+      - name: Build esp32-can-x2-heapcheck
+        run: pio run -e esp32-can-x2-heapcheck
+
+      - name: Build esp32-can-x2-heapcheck with mDNS off
+        env:
+          PLATFORMIO_BUILD_FLAGS: -DCARDIAG_MDNS_RESOLVE=0 -DCARDIAG_MDNS_ADVERTISE=0
+        run: pio run -e esp32-can-x2-heapcheck
+
       - name: Native tests
         run: pio test -e native

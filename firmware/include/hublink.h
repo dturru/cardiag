@@ -25,9 +25,9 @@ void hublinkLoop();
 HubLinkState hublinkState();
 const char  *hublinkStateName();
 bool         hublinkOnHub();
+// Where live UDP goes. Chosen by hubresolve.h: mDNS <hub_name>.local, its
+// cache, the NVS hub_addr, then the gateway; hubResolveSource() says which.
 IPAddress    hublinkHubIp();
-// True when hublinkHubIp() is the NVS `hub_addr`, false when it is the gateway.
-bool         hublinkHubIpFromNvs();
 
 // ---------------------------------------------------------------------------
 // Transition counters.
