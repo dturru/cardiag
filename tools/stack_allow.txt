@@ -1,0 +1,11 @@
+# Stack frames allowed over the 2 KB budget (tools/stack_budget.py).
+# Format: <file.cpp>:<function>  <max bytes>  # why
+# The number is a CAP: the frame may grow to it and no further. Every entry
+# needs a reason. Prefer shrinking the frame (static or heap buffer) to
+# adding a line here.
+
+# The change-log drain buffer is FS_FLUSH_BUDGET_BYTES (2048) on the stack, by
+# design: one writer on the loop task (8 KB stack), so a static would cost
+# 2 KB of DRAM for the whole run to save stack only during this call.
+# Runtime margin is watched by stackguard.h (loop_stack.free_min).
+filestore.cpp:drainChangeLog  2560  # 2 KB FS_FLUSH_BUDGET_BYTES chunk, loop task only
