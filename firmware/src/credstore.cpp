@@ -21,6 +21,8 @@ static const FieldDef kFields[CRED_FIELD_COUNT] = {
   {"mqtt_pass", "mqtt_pass", CRED_MQTT_PASS_MAX},
   {"token",     "api_token", CRED_TOKEN_MAX},
   {"hub_addr",  "hub_addr",  CRED_HUB_ADDR_MAX},
+  {"hub_name",  "hub_name",  CRED_HUB_NAME_MAX},
+  {"logger_name", "logger_name", CRED_LOGGER_NAME_MAX},
   {"ca",        "ca_pem",    CRED_CA_MAX},
 };
 
@@ -117,6 +119,9 @@ CredErr credValidate(CredField f, const char *v, size_t n) {
       uint8_t ip[4];
       return credParseIPv4(v, n, ip) ? CRED_OK : CRED_E_CHARSET;
     }
+    case CRED_HUB_NAME:
+    case CRED_LOGGER_NAME:
+      return credValidHostLabel(v, n) ? CRED_OK : CRED_E_CHARSET;
     case CRED_CA: {
       // DER scratch on the heap, per call: a CA is only decoded while
       // provisioning or printing the banner, so a resident 2 kB bought nothing.
@@ -412,8 +417,20 @@ bool credParseIPv4(const char *v, size_t n, uint8_t out[4]) {
   return all != 0 && all != 0xFFFFFFFFu;
 }
 
+bool credValidHostLabel(const char *v, size_t n) {
+  if (n == 0 || n > CRED_HUB_NAME_MAX) return false;
+  if (v[0] == '-' || v[n - 1] == '-') return false;
+  for (size_t i = 0; i < n; i++) {
+    const char c = v[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+      return false;
+  }
+  return true;
+}
+
 void credDescribe(CredField f, const char *v, size_t n, char out[CRED_DESC_LEN]) {
-  if (f == CRED_HUB_ADDR) {                 // an address: shown as itself
+  if (f == CRED_HUB_ADDR || f == CRED_HUB_NAME ||
+      f == CRED_LOGGER_NAME) {              // not secrets: shown as is
     snprintf(out, CRED_DESC_LEN, "%.*s", (int)n, v);
   } else if (credIsSecret(f)) {
     snprintf(out, CRED_DESC_LEN, "set, %u chars", (unsigned)n);

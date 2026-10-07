@@ -11,6 +11,8 @@
 #include "scansched.h"
 #include "config.h"
 #include "creds.h"
+#include "hubresolve.h"
+#include "heapdiag.h"
 
 static HubLinkState g_state    = HUBLINK_OFF;
 static bool         g_standalone = false;   // no hub credentials
@@ -25,8 +27,6 @@ static uint8_t   g_hubChannel = 0;          // 0 = not known yet
 static uint8_t   g_hubBssid[6];
 static bool      g_hintValid = false;       // use channel+BSSID on this join
 static uint32_t     g_linkUpMs = 0;
-static IPAddress    g_hubIp;
-static bool         g_hubFromNvs = false;   // g_hubIp came from cred hub_addr
 static HubLinkStats g_stats;
 
 // Written by the Wi-Fi task, read by loop(). Only ever set in the event
@@ -117,7 +117,8 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)s.worstFallbackMs,
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMinFreeHeap(),
-                (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                // Sampled in loop() (heapdiag.h), not walked here.
+                (unsigned long)heapdiagSample()->largestInternal,
                 (unsigned long)cardiagLoopStats()->maxUs,
                 (bootStage && *bootStage) ? bootStage : "-",
                 (unsigned long)win.maxUs,
@@ -205,6 +206,7 @@ static void fallBackToAp(bool viaEvent, uint32_t noticedMs) {
                 viaEvent ? "event" : "poll", (unsigned)g_dropReason);
 
   g_teardown = true;
+  hubResolveLinkDown();              // drop any mDNS query; keep the cache
   g_state = HUBLINK_AP;              // not on the hub any more, from now
   g_fallbackNoticedMs = noticedMs;
   g_linkUpMs = 0;
@@ -243,12 +245,16 @@ static void stepJoin() {
     case PH_JOIN_WAIT:
       if (WiFi.status() == WL_CONNECTED) {
         {
-          // NVS hub address if set (bench: laptop hotspot, hub elsewhere);
-          // otherwise the gateway, which IS the hub on the hub's own AP.
+          // Where the hub is (hubaddr.h): mDNS <hub_name>.local, then the
+          // NVS hub_addr, then the gateway (the hub on its own AP). Picks
+          // from what is known now and starts the mDNS query; never waits.
           uint8_t a[4];
-          g_hubFromNvs = credsHubAddr(a);
-          g_hubIp = g_hubFromNvs ? IPAddress(a[0], a[1], a[2], a[3])
-                                 : WiFi.gatewayIP();
+          const uint32_t nvs = credsHubAddr(a)
+              ? (uint32_t)a[0] << 24 | (uint32_t)a[1] << 16 | (uint32_t)a[2] << 8 | a[3]
+              : 0;
+          const IPAddress gw = WiFi.gatewayIP();
+          hubResolveLinkUp((uint32_t)gw[0] << 24 | (uint32_t)gw[1] << 16 |
+                           (uint32_t)gw[2] << 8 | gw[3], nvs);
         }
         g_linkUpMs = millis();
         g_dropFlag = false;          // drop the join-phase noise
@@ -260,8 +266,8 @@ static void stepJoin() {
         Serial.printf("[hublink] STA up: ip=%s gw=%s hub=%s (%s) rssi=%d\n",
                       WiFi.localIP().toString().c_str(),
                       WiFi.gatewayIP().toString().c_str(),
-                      g_hubIp.toString().c_str(),
-                      g_hubFromNvs ? "cred hub_addr" : "gateway", WiFi.RSSI());
+                      hublinkHubIp().toString().c_str(),
+                      hubAddrSourceName(hubResolveSource()), WiFi.RSSI());
         webuiStartOnCurrentNetwork();   // same routes, no AP
         hublinkPrintStats(g_bootJoin ? "boot-sta" : "rejoin");
         return;
@@ -342,6 +348,7 @@ void hublinkBegin() {
 
 void hublinkLoop() {
   if (g_standalone) return;
+  hubResolveReap();                // a query cancelled at link-down, once done
   if (g_phase != PH_IDLE) {
     stepJoin();
     return;
@@ -359,7 +366,9 @@ void hublinkLoop() {
     // counter says so rather than the failure being invisible.
     if (WiFi.status() != WL_CONNECTED) {
       fallBackToAp(/*viaEvent=*/false, millis());
+      return;
     }
+    hubResolveLoop();              // mDNS: poll, never wait
     return;
   }
 
@@ -424,7 +433,10 @@ const char *hublinkStateName() {
 }
 
 bool      hublinkOnHub() { return g_state == HUBLINK_STA && g_phase == PH_IDLE; }
-IPAddress hublinkHubIp() { return g_hubIp; }
-bool hublinkHubIpFromNvs() { return g_hubFromNvs; }
+IPAddress hublinkHubIp() {
+  const uint32_t ip = hubResolveIp();
+  return IPAddress((uint8_t)(ip >> 24), (uint8_t)(ip >> 16), (uint8_t)(ip >> 8),
+                   (uint8_t)ip);
+}
 
 const HubLinkStats *hublinkStats() { return &g_stats; }

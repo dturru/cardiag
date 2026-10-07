@@ -10,7 +10,7 @@
 #include "filestore.h"
 #include "coredump.h"
 
-static WebServer g_server(80);
+static WebServer g_server(WEB_HTTP_PORT);
 static bool g_apMode = false;
 static bool      g_running = false;
 
