@@ -146,6 +146,37 @@
 #define WEB_HTTP_PORT            80
 #define LOGGER_MDNS_SERVICE      "_cardiag"
 #define LOGGER_MDNS_PROTO        "_tcp"
+// mDNS on/off at build time, the two halves separately, so the bench can
+// bisect the heap corruption seen on PR #29 with otherwise identical firmware
+// (the heapdebug-* envs). RESOLVE=0: never query <hub_name>.local (nvs /
+// gateway only). ADVERTISE=0: no <logger_name>.local, no _cardiag._tcp. Both
+// 0: mdns_init() is never called, so the component's task never runs.
+#ifndef CARDIAG_MDNS_RESOLVE
+#define CARDIAG_MDNS_RESOLVE     1
+#endif
+#ifndef CARDIAG_MDNS_ADVERTISE
+#define CARDIAG_MDNS_ADVERTISE   1
+#endif
+
+// Heap numbers for /api/v1/session and the stats line are sampled in loop()
+// this often (heapdiag.h): the largest-free-block call walks the whole heap.
+#ifndef HEAP_SAMPLE_MS
+#define HEAP_SAMPLE_MS           5000u
+#endif
+// heapdebug envs: heap_caps_check_integrity_all() this often (heapdiag.h).
+#ifndef CARDIAG_HEAP_CHECK
+#define CARDIAG_HEAP_CHECK       0
+#endif
+// The INTERNAL heap (where PR #29's corruption was found) is checked every
+// HEAP_CHECK_PERIOD_MS; everything, PSRAM included, every HEAP_CHECK_ALL_MS --
+// with comprehensive poisoning a check reads every free byte, and 8 MB of
+// PSRAM is too slow for every 2 s on the loop task.
+#ifndef HEAP_CHECK_PERIOD_MS
+#define HEAP_CHECK_PERIOD_MS     2000u
+#endif
+#ifndef HEAP_CHECK_ALL_MS
+#define HEAP_CHECK_ALL_MS        60000u
+#endif
 // SCAN, THEN JOIN (scansched.h). On the fallback AP the board scans for the
 // hub's SSID and joins only once a scan has seen it. Every
 // WIFI_SCAN_FAST_MS from the last drop or sighting; every WIFI_SCAN_SLOW_MS

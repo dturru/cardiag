@@ -12,6 +12,7 @@
 #include "config.h"
 #include "creds.h"
 #include "hubresolve.h"
+#include "heapdiag.h"
 
 static HubLinkState g_state    = HUBLINK_OFF;
 static bool         g_standalone = false;   // no hub credentials
@@ -116,7 +117,8 @@ void hublinkPrintStats(const char *what) {
                 (unsigned long)s.worstFallbackMs,
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMinFreeHeap(),
-                (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                // Sampled in loop() (heapdiag.h), not walked here.
+                (unsigned long)heapdiagSample()->largestInternal,
                 (unsigned long)cardiagLoopStats()->maxUs,
                 (bootStage && *bootStage) ? bootStage : "-",
                 (unsigned long)win.maxUs,
@@ -346,6 +348,7 @@ void hublinkBegin() {
 
 void hublinkLoop() {
   if (g_standalone) return;
+  hubResolveReap();                // a query cancelled at link-down, once done
   if (g_phase != PH_IDLE) {
     stepJoin();
     return;
