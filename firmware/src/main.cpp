@@ -3,9 +3,11 @@
 // Four modes. The mode is chosen at RUNTIME -- serial key or the BOOT button --
 // and persisted in NVS, so changing it no longer means a reflash.
 //
-//   MODE_SELFTEST : TWAI internal loopback. *** TRANSMITS (NO_ACK) ***.
-//                   Bench only, nothing connected. Proves toolchain, driver,
-//                   timing config and frame handling.
+//   MODE_SELFTEST : TWAI_MODE_NO_ACK + self-reception. *** TRANSMITS ***.
+//                   NOT an internal loopback: frames go out through the CAN1
+//                   transceiver onto X1 and come back on RX. Nobody ACKs them
+//                   and NO_ACK mode does not need it. Bench only, CAN1
+//                   termination ON (docs/selftest-bench.md).
 //   MODE_LISTEN   : Listen-only frame dump. Never transmits, never ACKs.
 //   MODE_SNIFF    : Listen-only per-ID table with sticky change marks. The
 //                   readable mode; use this on a live bus.

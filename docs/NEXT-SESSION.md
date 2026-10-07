@@ -1,5 +1,24 @@
 # Handoff — next session
 
+## 👁 WATCH — SELFTEST bus-off after ~2 h on the bare bench (2026-10-05, twice)
+
+Two overnight SELFTEST runs went **bus-off about 2 h in**: a burst of 107 bus
+errors, `tec` 128. #31 (`canrecov.h`) now recovers it. Full write-up:
+`docs/selftest-bench.md`.
+
+- **Not the no-ACK signature.** SELFTEST runs `TWAI_MODE_NO_ACK`, where a
+  missing ACK counts as success, and a pure no-ACK node parks at TEC 128 without
+  ever reaching bus-off. Bus-off here means a burst of **bit/stuff/form errors**.
+- **Likely cause, ⚪ UNVERIFIED:** an EMI/ground transient (USB ground, laptop
+  sleep or charger, open X1 leads) or a load problem (termination cut or a
+  marginal contact on that board).
+- **Check:** confirm CAN1 termination is ON. Run one night with X1 bare, one
+  on a USB power bank, and line up the `[can] ... bus-off` timestamps with
+  host events.
+- **In the car:** impossible in LISTEN/SNIFF (they never transmit). In POLL the
+  ECUs ACK, so only a real error burst could cause it (EMI, bad ground, or an
+  uncut X2 terminator), and #31 recovers it. Never run SELFTEST in the car.
+
 ## §0-BRICK — 2026-09-25, board slow-boot root-caused (LOCAL NOTE, uncommitted)
 
 📂 **Preserved failing image: `analysis/brick-2026-09-25-0748/`** — `README.md`

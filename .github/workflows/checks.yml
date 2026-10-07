@@ -109,6 +109,13 @@ jobs:
           test ! -e include/secrets.h
           pio run -e esp32-can-x2
 
+      # Per-function stack frame budget (2 KB) on OUR code, from the .su files
+      # -fstack-usage writes. The #29 panics were one ~5 KB frame on the 8 KB
+      # loop stack; this fails the build instead of the board. Exceptions go
+      # in tools/stack_allow.txt with a reason and a cap.
+      - name: Stack frame budget
+        run: python ../tools/stack_budget.py .pio/build/esp32-can-x2/src --budget 2048 --allow ../tools/stack_allow.txt --top 10
+
       # captest builds WITH the placeholder secrets.h, which compiles the
       # one-time `:cred import` path (it skips placeholder values).
       - name: Placeholder secrets.h
