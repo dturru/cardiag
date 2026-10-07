@@ -1,9 +1,11 @@
 # Handoff — next session
 
-## 👁 WATCH — SELFTEST bus-off after ~2 h on the bare bench (2026-10-05, twice)
+## 👁 WATCH — SELFTEST bus-off on the bare bench (2026-10-05 twice, 2026-10-06 once)
 
-Two overnight SELFTEST runs went **bus-off about 2 h in**: a burst of 107 bus
-errors, `tec` 128. #31 (`canrecov.h`) now recovers it. Full write-up:
+Overnight SELFTEST runs went **bus-off, seen ~2 h and ~5.5 h after boot**: a
+burst of bus errors (107 on 10-05), `tec` 128. On 10-06 (bench 5, boot 129)
+#31 recovered it unattended: 28 recovery actions, CAN running again ~12 min
+later, no further events overnight. #31 (`canrecov.h`) now recovers it. Full write-up:
 `docs/selftest-bench.md`.
 
 - **Not the no-ACK signature.** SELFTEST runs `TWAI_MODE_NO_ACK`, where a
@@ -19,13 +21,24 @@ errors, `tec` 128. #31 (`canrecov.h`) now recovers it. Full write-up:
   ECUs ACK, so only a real error burst could cause it (EMI, bad ground, or an
   uncut X2 terminator), and #31 recovers it. Never run SELFTEST in the car.
 
+## §0-BENCH4 — 2026-10-05 night
+
+📂 **Read results from `analysis/2026-10-05-bench4/summary.md`** (section "6.") and
+the overnight control soak: `analysis/2026-10-05-bench4/P6-control/sessionwatch.log`
++ `control-serial.log` (logger on master `3e3087a`, boot_id 124 at start).
+PR #30 heapdebug boot-loops: loopTask stack overflow in `handleSession`
+(hubapi.cpp:196) on every session GET — backtrace `P6/boot105-panic-backtrace.txt`.
+✅ Fixed in #30 `4e5b131` (bench 5: 14 h, 0 heap-integrity failures); #29, #30
+and #32 merged 2026-10-07.
+
 ## §0-BRICK — 2026-09-25, board slow-boot root-caused (LOCAL NOTE, uncommitted)
 
 📂 **Preserved failing image: `analysis/brick-2026-09-25-0748/`** — `README.md`
 has provenance + SHA-256 for both 8 MB reads (they differ only in 29 NVS bytes =
-`boot_id`; **the spiffs partition is byte-identical**). Also holds `firmware.elf`
-(the binary that was running), `spiffs.bin` and `fstrace.log`. **Gitignored —
-local to this machine only.**
+`boot_id`; **the spiffs partition is byte-identical**). Also holds `spiffs.bin`
+and `fstrace.log`. **The two 8 MB reads (`flash-A.bin`, `flash-B.bin`) and
+`firmware.elf` carry credentials and now live OUTSIDE the repo**, same relative
+path, under `%USERPROFILE%\bench-private\cardiag-dumps\` (`docs/bench-dumps.md`).
 
 **Not a hang: a 187 s boot.** Root cause is two defects that compound:
 1. **`scanDir()` is O(n²)** — `openNextFile()` constructs a `VFSFileImpl`, which
