@@ -52,17 +52,21 @@ class Frame:
         return "dynamic" in self.qualifier and "bounded" not in self.qualifier
 
 
-_NAME_RE = re.compile(r"([A-Za-z_~][A-Za-z0-9_]*)\s*\(")
+_NAME_RE = re.compile(r"([A-Za-z_~][A-Za-z0-9_.]*)\s*\(")
+# GCC clones keep the original name plus a suffix: foo.constprop.0,
+# foo.isra.0, foo.part.0, foo.cold. The key is the original name.
+_CLONE_RE = re.compile(r"\.(constprop|isra|part|cold|lto_priv)(\.\d+)*")
 
 
 def bare_name(signature: str) -> str:
-    """'void ns::Cls::handleSession(WebServer&)' -> 'handleSession'.
+    """'void ns::Cls::handleSession(WebServer&)' -> 'handleSession';
+    'bool cdelfFind.constprop.0(const uint8_t*)' -> 'cdelfFind'.
     Lambdas and odd names fall back to the whole signature."""
     head = signature.split("(", 1)[0] + "("
     names = _NAME_RE.findall(head)
     if not names:
         return signature.strip()
-    return names[-1].split("::")[-1]
+    return _CLONE_RE.sub("", names[-1].split("::")[-1]).split(".")[0]
 
 
 def parse_su_line(text: str) -> Frame | None:

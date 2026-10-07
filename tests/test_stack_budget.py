@@ -28,6 +28,10 @@ def test_parse_line_and_bare_name():
         "hubapi.cpp", 57, "handleSession", 5168, "static")
     assert f.key == "hubapi.cpp:handleSession"
     assert sb.bare_name("int ns::Cls::method(int) const") == "method"
+    # GCC clones: the key is the original function, not the clone suffix.
+    assert sb.bare_name("bool cdelfFind.constprop.0(const uint8_t*, size_t)") == "cdelfFind"
+    assert sb.bare_name("void foo.isra.0(int)") == "foo"
+    assert sb.bare_name("void bar.part.0.cold(int)") == "bar"
     assert sb.parse_su_line("garbage line") is None
 
 
