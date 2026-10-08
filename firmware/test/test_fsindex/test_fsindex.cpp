@@ -471,6 +471,64 @@ void test_leftover_parts_from_earlier_boots_do_not_block_sleep(void) {
   free(t.v);
 }
 
+// cardiag #34 (bench 5 -> 6): boot 129's 012790 .part was synced as truncated
+// and acked, and still listed open=false through boots 130-132. Once acked, a
+// leftover goes; unacked it stays for the hub, and nothing else changes.
+void test_acked_leftover_part_is_dropped_whatever_the_limits(void) {
+  diskReset();
+  diskAddPart(10, FS_KIND_SNAPSHOT, 100);    // leftover, acked
+  diskAddClosed(11, FS_KIND_SNAPSHOT, 100);  // closed, acked: the local copy stays
+  diskAddPart(12, FS_KIND_SNAPSHOT, 100);    // leftover, NOT acked yet
+  diskAddPart(13, FS_KIND_CHANGES, 100);     // this boot's, being written
+  FsTable t;
+  fsTableInit(&t, growOk);
+  scanDisk(&t);
+  fsTableFind(&t, 13)->active = true;
+
+  const FsRetentionCfg roomy = {100, 0xFFFFFFFFu, 0xFFFFFFFFu};  // no limit hit
+  FsRetentionResult r = fsEnforceRetention(&t, /*ackedThrough=*/11, &roomy, &OPS, 0, 100);
+  TEST_ASSERT_EQUAL_UINT16(1, r.leftovers);
+  TEST_ASSERT_EQUAL_UINT16(1, r.evictedAcked);
+  TEST_ASSERT_EQUAL_UINT16(0, r.evictedUnacked);
+  TEST_ASSERT_NULL(fsTableFind(&t, 10));
+  TEST_ASSERT_NULL(diskFind(10, false));
+  TEST_ASSERT_NOT_NULL(fsTableFind(&t, 11));
+  TEST_ASSERT_NOT_NULL(fsTableFind(&t, 12));
+  TEST_ASSERT_NOT_NULL(fsTableFind(&t, 13));
+  TEST_ASSERT_EQUAL_UINT32(1, g_disk.deletedAcked);
+  TEST_ASSERT_EQUAL_UINT32(0, g_disk.lostFiles);
+  assertIndexMatchesDisk(&t);
+
+  // The hub acks #12 next sync: it goes too. #13 is active and never does.
+  r = fsEnforceRetention(&t, /*ackedThrough=*/13, &roomy, &OPS, 0, 100);
+  TEST_ASSERT_EQUAL_UINT16(1, r.leftovers);
+  TEST_ASSERT_NULL(fsTableFind(&t, 12));
+  TEST_ASSERT_NOT_NULL(fsTableFind(&t, 13));
+  TEST_ASSERT_EQUAL_UINT16(2, t.count);
+  uint16_t leftovers = 9;
+  fsCountOpen(&t, &leftovers);
+  TEST_ASSERT_EQUAL_UINT16(0, leftovers);
+  free(t.v);
+}
+
+void test_leftover_drop_respects_the_budget(void) {
+  diskReset();
+  for (uint32_t i = 0; i < 5; i++) diskAddPart(i, FS_KIND_SNAPSHOT, 10);
+  FsTable t;
+  fsTableInit(&t, growOk);
+  scanDisk(&t);
+  const FsRetentionCfg roomy = {100, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  FsRetentionResult r = fsEnforceRetention(&t, 10, &roomy, &OPS, 0, /*budget=*/2);
+  TEST_ASSERT_TRUE(r.more);
+  TEST_ASSERT_EQUAL_UINT16(2, r.leftovers);
+  TEST_ASSERT_EQUAL_UINT16(3, t.count);
+  do { r = fsEnforceRetention(&t, 10, &roomy, &OPS, 0, 2); } while (r.more);
+  TEST_ASSERT_EQUAL_UINT16(0, t.count);
+  TEST_ASSERT_EQUAL_UINT32(5, g_disk.deletedAcked);
+  assertIndexMatchesDisk(&t);
+  free(t.v);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_names_parse_and_classify);
@@ -487,5 +545,7 @@ int main(int, char **) {
   RUN_TEST(test_duplicate_log_and_part_keep_the_log);
   RUN_TEST(test_unhydrated_victim_is_hydrated_before_it_is_counted);
   RUN_TEST(test_leftover_parts_from_earlier_boots_do_not_block_sleep);
+  RUN_TEST(test_acked_leftover_part_is_dropped_whatever_the_limits);
+  RUN_TEST(test_leftover_drop_respects_the_budget);
   return UNITY_END();
 }

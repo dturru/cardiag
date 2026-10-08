@@ -246,7 +246,20 @@ FsRetentionResult fsEnforceRetention(FsTable *t, int32_t ackedThrough,
                                      const FsRetentionCfg *cfg,
                                      const FsRetentionOps *ops,
                                      uint16_t reserve, uint16_t budget) {
-  FsRetentionResult r = {0, 0, 0, false, false};
+  FsRetentionResult r = {0, 0, 0, false, false, 0};
+
+  // 0. ACKED CRASH LEFTOVERS, whatever the limits. A .part from an earlier
+  //    boot is never closed by anybody; once the hub has acked it (it synced
+  //    it as truncated) it is dead weight, and keeping it listed as an open
+  //    file forever is cardiag #34. Closed acked files stay until a limit
+  //    needs them -- they are the local copy; a leftover is not even that.
+  for (uint16_t i = 0; i < t->count;) {
+    const FsEntry &e = t->v[i];
+    if (e.closed || e.active || !isAcked(e, ackedThrough)) { i++; continue; }
+    if (r.evicted >= budget) { r.more = true; return r; }
+    evictAt(t, i, ackedThrough, ops, &r);   // drops entry i: do not advance
+    r.leftovers++;
+  }
 
   // 1. COUNT. Leave `reserve` slots so opening the next file cannot push the
   //    count back over the cap.
