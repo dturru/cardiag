@@ -487,7 +487,11 @@ static void retHydrate(void *, FsEntry *e) { hydrate(e); }
 // the gap retention run 2 found was one path doing its own bookkeeping.
 static void retRemove(void *, const FsEntry *e, bool acked) {
   if (acked) {
-    Serial.printf("[fs] evict acked #%lu\n", (unsigned long)e->index);
+    if (!e->closed && !e->active)
+      Serial.printf("[fs] drop acked crash leftover #%lu (.part from boot %lu)\n",
+                    (unsigned long)e->index, (unsigned long)e->bootId);
+    else
+      Serial.printf("[fs] evict acked #%lu\n", (unsigned long)e->index);
     removeFiles(*e);
     g_st.deletedAcked++;
   } else {
@@ -975,7 +979,8 @@ bool filestoreBegin() {
     Serial.printf("[fs] %u file(s) left open by an earlier boot -- crash "
                   "artifacts. They are listed closed=false and the hub syncs "
                   "them as truncated rather than waiting forever; they do "
-                  "not count as open and never hold off sleep.\n",
+                  "not count as open, never hold off sleep, and are deleted "
+                  "once acked.\n",
                   g_st.leftoverParts);
   }
   g_nextSnapMs = millis();

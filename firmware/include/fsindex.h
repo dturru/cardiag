@@ -178,6 +178,9 @@ struct FsRetentionResult {
   // True when a limit is exceeded but nothing is evictable (only active
   // files remain). Not a loop: the policy stops and says so.
   bool     stuck;
+  // Acked crash leftovers (.part from an earlier boot) deleted regardless of
+  // the limits; included in `evicted` and `evictedAcked` too.
+  uint16_t leftovers;
 };
 
 // Sum of hydrated Tier A bytes. Unhydrated entries count as zero until read,
@@ -202,9 +205,9 @@ uint16_t fsPickVictim(const FsTable *t, int32_t ackedThrough);
 // Oldest Tier A file, acked ones first. Returns t->count when none.
 uint16_t fsPickTierAVictim(const FsTable *t, int32_t ackedThrough);
 
-// Enforces, in order: the count cap (leaving `reserve` free slots for files
-// about to be opened), the Tier A cap, and the used-bytes limit. Evicts at
-// most `budget` files per call.
+// Enforces, in order: acked crash leftovers out (whatever the limits), the
+// count cap (leaving `reserve` free slots for files about to be opened), the
+// Tier A cap, and the used-bytes limit. Evicts at most `budget` files per call.
 FsRetentionResult fsEnforceRetention(FsTable *t, int32_t ackedThrough,
                                      const FsRetentionCfg *cfg,
                                      const FsRetentionOps *ops,
