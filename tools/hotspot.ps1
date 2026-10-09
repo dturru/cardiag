@@ -15,14 +15,41 @@
   the laptop is offline, this reports NoProfile rather than pretending.
 
 .PARAMETER Action
-  state | start | stop
+  state | start | stop | watch
+
+  watch: a watchdog for unattended runs, in its own window. The hotspot
+  switches ITSELF off (twice on 2026-10-08: ~16 min and ~1 h 40 min of lost
+  polls), and after hours on it can stop passing mDNS multicast between its
+  clients while unicast keeps working (10-08 overnight). Every -Every seconds:
+  if it is Off, start it; if -Probe names a host and that name has failed to
+  resolve -ProbeFails checks in a row while the hotspot is On, restart it
+  (stop, 5 s, start). One log line per action, nothing while healthy.
+
+.PARAMETER Every
+  watch: seconds between checks (default 60).
+
+.PARAMETER Probe
+  watch: an mDNS name a client advertises (e.g. cardiag.local). Optional.
+
+.PARAMETER ProbeFails
+  watch: consecutive probe failures before a restart (default 5).
+
+.PARAMETER Log
+  watch: append actions here as well as to the console.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File tools/hotspot.ps1 -Action state
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File tools/hotspot.ps1 -Action watch -Probe cardiag.local -Log analysis\<run>\hotspot-watch.log
 #>
 param(
-  [ValidateSet('state', 'start', 'stop')]
-  [string]$Action = 'state'
+  [ValidateSet('state', 'start', 'stop', 'watch')]
+  [string]$Action = 'state',
+  [int]$Every = 60,
+  [string]$Probe = '',
+  [int]$ProbeFails = 5,
+  [string]$Log = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,14 +79,64 @@ function Get-Manager {
   return [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($profile)
 }
 
+$resultType = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]
+
+if ($Action -eq 'watch') {
+  function Say($msg) {
+    $line = "$(Get-Date -Format s) $msg"
+    Write-Output $line
+    if ($Log) { Add-Content -Path $Log -Value $line -Encoding utf8 }
+  }
+  function Resolves($name) {
+    try {
+      $r = Resolve-DnsName $name -Type A -ErrorAction Stop | Where-Object Type -eq 'A'
+      return [bool]$r
+    } catch { return $false }
+  }
+  Say "watch: every ${Every}s$(if ($Probe) { ", probe $Probe, restart after $ProbeFails misses" })"
+  $misses = 0; $lastState = ''
+  while ($true) {
+    try {
+      $m = Get-Manager    # every pass: the internet profile changes when Wi-Fi rejoins
+      if ($null -eq $m) {
+        if ($lastState -ne 'NoProfile') { Say 'no internet connection profile; waiting' }
+        $lastState = 'NoProfile'
+      } else {
+        $st = $m.TetheringOperationalState.ToString()
+        if ($st -eq 'Off') {
+          $r = Await ($m.StartTetheringAsync()) $resultType
+          Say "hotspot was Off -> start: $($r.Status)"
+          $misses = 0
+        } elseif ($st -eq 'On' -and $Probe) {
+          if (Resolves $Probe) {
+            if ($misses -ge $ProbeFails) { Say "$Probe resolves again" }
+            $misses = 0
+          } else {
+            $misses++
+            if ($misses % $ProbeFails -eq 0) {   # again every $ProbeFails misses, not every pass
+              $a = Await ($m.StopTetheringAsync()) $resultType
+              Start-Sleep 5
+              $b = Await ($m.StartTetheringAsync()) $resultType
+              Say "$Probe unresolved $misses checks in a row -> restart: stop $($a.Status), start $($b.Status)"
+            }
+          }
+        }
+        if ($lastState -eq 'NoProfile') { Say "internet profile back (hotspot $st)" }
+        $lastState = $st
+      }
+    } catch {
+      Say "error: $($_.Exception.Message)"
+    }
+    Start-Sleep $Every
+  }
+}
+
 $mgr = Get-Manager
 if ($null -eq $mgr) {
   # Emitted as one token so the caller can branch on it without parsing prose.
   Write-Output 'NoProfile'
   exit 2
 }
-
-$resultType = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]
 
 switch ($Action) {
   'state' {
