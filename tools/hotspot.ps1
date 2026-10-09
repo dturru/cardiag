@@ -21,9 +21,23 @@
   switches ITSELF off (twice on 2026-10-08: ~16 min and ~1 h 40 min of lost
   polls), and after hours on it can stop passing mDNS multicast between its
   clients while unicast keeps working (10-08 overnight). Every -Every seconds:
-  if it is Off, start it; if -Probe names a host and that name has failed to
-  resolve -ProbeFails checks in a row while the hotspot is On, restart it
+  if it is Off, start it; if -Probe names a host and the logger has not
+  answered -ProbeFails checks in a row while the hotspot is On, restart it
   (stop, 5 s, start). One log line per action, nothing while healthy.
+
+  The probe is an HTTP GET of http://<Probe><ProbePath>, the same request
+  the poller makes, so the name goes through the same resolver (.NET /
+  getaddrinfo, where Windows does mDNS). It used to call Resolve-DnsName,
+  which reported cardiag.local unresolved while Invoke-RestMethod on the
+  same name kept working, and restarted a healthy hotspot. If the name does
+  not answer, the probe retries the logger's last known IPv4 address (learned
+  from the name on each good pass, or seeded by -ProbeIp); a logger that
+  answers by IP counts as reachable. A miss is "neither answers".
+
+  Restarts back off: the gap between restarts in one outage doubles
+  (-ProbeFails, 2x, 4x ... up to 60 checks) and resets once the logger
+  answers. After -MaxRestarts probe restarts in a run, probe failures are
+  only logged; Off -> start keeps working.
 
 .PARAMETER Every
   watch: seconds between checks (default 60).
@@ -31,8 +45,19 @@
 .PARAMETER Probe
   watch: an mDNS name a client advertises (e.g. cardiag.local). Optional.
 
+.PARAMETER ProbePath
+  watch: path the probe GETs (default /api/v1/session, what the poller reads).
+
+.PARAMETER ProbeIp
+  watch: IPv4 address to try when -Probe does not answer by name, until one
+  is learned from the name. Optional; never required (the bench address
+  moves, see CLAUDE.md).
+
 .PARAMETER ProbeFails
-  watch: consecutive probe failures before a restart (default 5).
+  watch: consecutive probe failures before the first restart (default 5).
+
+.PARAMETER MaxRestarts
+  watch: probe-triggered restarts allowed in one run (default 6).
 
 .PARAMETER Log
   watch: append actions here as well as to the console.
@@ -48,7 +73,10 @@ param(
   [string]$Action = 'state',
   [int]$Every = 60,
   [string]$Probe = '',
+  [string]$ProbePath = '/api/v1/session',
+  [string]$ProbeIp = '',
   [int]$ProbeFails = 5,
+  [int]$MaxRestarts = 6,
   [string]$Log = ''
 )
 
@@ -87,14 +115,28 @@ if ($Action -eq 'watch') {
     Write-Output $line
     if ($Log) { Add-Content -Path $Log -Value $line -Encoding utf8 }
   }
-  function Resolves($name) {
+  # The poller's path, not Resolve-DnsName (see .DESCRIPTION). An HTTP error
+  # status still means the logger answered.
+  function Answers($target) {
     try {
-      $r = Resolve-DnsName $name -Type A -ErrorAction Stop | Where-Object Type -eq 'A'
-      return [bool]$r
-    } catch { return $false }
+      Invoke-WebRequest -Uri "http://$target$ProbePath" -UseBasicParsing -TimeoutSec 5 | Out-Null
+      return $true
+    } catch {
+      return ($null -ne $_.Exception.Response)
+    }
   }
-  Say "watch: every ${Every}s$(if ($Probe) { ", probe $Probe, restart after $ProbeFails misses" })"
-  $misses = 0; $lastState = ''
+  function Ipv4Of($name) {
+    try {
+      $a = [System.Net.Dns]::GetHostAddresses($name) |
+        Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1
+      if ($a) { return $a.IPAddressToString }
+    } catch {}
+    return $null
+  }
+  $gapCap = [Math]::Max($ProbeFails, 60)
+  Say "watch: every ${Every}s$(if ($Probe) { ", probe http://$Probe$ProbePath$(if ($ProbeIp) { " (fallback $ProbeIp)" }), restart after $ProbeFails misses, max $MaxRestarts" })"
+  $misses = 0; $lastState = ''; $knownIp = $ProbeIp; $via = 'name'
+  $gap = $ProbeFails; $nextAt = $ProbeFails; $restarts = 0
   while ($true) {
     try {
       $m = Get-Manager    # every pass: the internet profile changes when Wi-Fi rejoins
@@ -108,16 +150,36 @@ if ($Action -eq 'watch') {
           Say "hotspot was Off -> start: $($r.Status)"
           $misses = 0
         } elseif ($st -eq 'On' -and $Probe) {
-          if (Resolves $Probe) {
-            if ($misses -ge $ProbeFails) { Say "$Probe resolves again" }
-            $misses = 0
+          $now = $null
+          if (Answers $Probe) {
+            $now = 'name'
+            $ip = Ipv4Of $Probe
+            if ($ip) { $knownIp = $ip }
+          } elseif ($knownIp -and (Answers $knownIp)) {
+            $now = 'ip'
+          }
+          if ($now) {
+            if ($misses -gt 0) { Say "logger answers again (by $now) after $misses misses" }
+            elseif ($now -ne $via) {
+              if ($now -eq 'ip') { Say "$Probe does not answer by name, $knownIp does -> no restart (mDNS?)" }
+              else { Say "$Probe answers by name again" }
+            }
+            $via = $now; $misses = 0; $gap = $ProbeFails; $nextAt = $ProbeFails
           } else {
             $misses++
-            if ($misses % $ProbeFails -eq 0) {   # again every $ProbeFails misses, not every pass
-              $a = Await ($m.StopTetheringAsync()) $resultType
-              Start-Sleep 5
-              $b = Await ($m.StartTetheringAsync()) $resultType
-              Say "$Probe unresolved $misses checks in a row -> restart: stop $($a.Status), start $($b.Status)"
+            if ($misses -ge $nextAt) {
+              if ($restarts -ge $MaxRestarts) {
+                if ($restarts -eq $MaxRestarts) { Say "logger unreachable $misses checks; $MaxRestarts restarts used, not restarting again this run" }
+                $restarts++   # one log line, then quiet
+              } else {
+                $a = Await ($m.StopTetheringAsync()) $resultType
+                Start-Sleep 5
+                $b = Await ($m.StartTetheringAsync()) $resultType
+                $restarts++
+                $gap = [Math]::Min($gap * 2, $gapCap)
+                Say "logger unreachable $misses checks in a row (name$(if ($knownIp) { " and $knownIp" })) -> restart $restarts/${MaxRestarts}: stop $($a.Status), start $($b.Status); next after $gap more"
+              }
+              $nextAt = $misses + $gap
             }
           }
         }
