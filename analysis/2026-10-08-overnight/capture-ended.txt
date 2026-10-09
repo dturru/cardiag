@@ -1,0 +1,2 @@
+capture serial ended 2026-10-08T11:32:06 exit=-1
+capture serial stopped by hand 2026-10-08T11:32:06: stalled since 01:21:50 (3754554 B)
